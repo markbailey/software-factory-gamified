@@ -1,0 +1,25 @@
+"""Tester: commit lockfiles that the dependency install created or changed.
+
+Only lockfiles are committed, so nothing else the tests produced ends up in the PR.
+"""
+import shutil
+import subprocess
+import sys
+
+LOCKFILES = ["pnpm-lock.yaml", "package-lock.json", "yarn.lock", "uv.lock", "poetry.lock"]
+IDENTITY = ["-c", "user.name=Software Factory", "-c", "user.email=factory@localhost"]
+
+git = shutil.which("git")
+if not git:
+    print("git is not installed or not on PATH", flush=True)
+    sys.exit(1)
+
+status = subprocess.run([git, "status", "--porcelain", "--", *LOCKFILES], capture_output=True, text=True)
+changed = [line[3:].strip() for line in status.stdout.splitlines() if line.strip()]
+if not changed:
+    print("No lockfile changes.", flush=True)
+    sys.exit(0)
+
+subprocess.run([git, "add", "--", *changed], check=True)
+subprocess.run([git, *IDENTITY, "commit", "-q", "-m", "Update lockfile"], check=True)
+print(f"Committed {', '.join(changed)}.", flush=True)

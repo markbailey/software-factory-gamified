@@ -31,14 +31,32 @@ You need Python 3.10+.
 3. Type a spec in the top bar and press Enter, for example "Add a greet(name) function".
    The crate travels down the line:
    - **Coder** fetches, makes branch `crate/<n>` in its own worktree under
-     `workspace/worktrees/crate-<n>`, runs `claude -p` on the spec (prompt on stdin; it can
-     read and edit files, but not run commands), and commits.
-   - **Tester** runs the project's tests (`backend/scripts/run_tests.py`: unittest, or pytest
-     if installed). No tests counts as a pass.
-   - **Packager** pushes the branch and opens a pull request with `gh pr create`.
+     `workspace/worktrees/crate-<n>`, runs `claude -p` on the spec (it can read and edit
+     files, but not run commands), and commits.
+   - **Tester** installs dependencies and runs the project's tests
+     (`backend/scripts/run_tests.py`: `pnpm test` / npm / yarn, plus unittest or pytest), then
+     commits the lockfile if the install changed it. No tests counts as a pass.
+   - **Packager** pushes the branch and opens a pull request (or reuses the branch's open one).
+   - **Reviewer** has Claude review the diff, posts the review on the PR, then **waits for you**.
+     The machine shows how many crates are waiting; they line up underneath it in yellow.
+   - **CI monitor** waits for the PR's checks to pass (it passes after 30s if there are none).
+   - **Merger** squash-merges the PR, then deletes the branch and worktree.
 
    A failure at any step sends the crate to the scrap bin with the full log. Several crates
-   can be in the line at once, one per machine.
+   can be in the line at once, one per machine (the Reviewer and CI monitor take any number).
+
+4. **Steer crates.** Click a crate, and buttons appear above its log:
+   - **Approve** / **Reject** at the Reviewer. Reject closes the PR and scraps the crate, and
+     your note is saved.
+   - **Retry** a scrapped crate. It starts again at the Coder from a fresh branch, and your
+     note is given to Claude ("Notes from the last attempt").
+   - **Open PR** opens the crate's pull request in your browser.
+
+   Crates waiting for approval stay waiting if you restart the backend.
+
+A janitor in the backend tidies `workspace/` every 10 minutes (and at startup): it removes the
+worktrees and local branches of shipped crates, of crates scrapped over a day ago, and of
+crates the factory doesn't know about. Settings are under `[cleanup]` in `factory.toml`.
 
 ### First-time setup for GitHub
 
@@ -62,11 +80,20 @@ the game reconnects and redraws from the backend's state.
 
 ## Changing the line
 
-The line is the list of `[[machines]]` in `backend/factory.toml`, in order; the game draws
-whatever is there. Each machine is a list of steps. Each step is a command, a working
-folder and optionally text sent on stdin; placeholders such as `{text}`, `{branch}` and
-`{worktree}` are listed in that file. Only executables in `[security] allowed_commands` can
-run, and only in folders inside `workspace/`. The prompt Claude gets is the Coder's `prompt`.
+Press **Build line** in the top bar. The crates hide and a panel lists the machines in order:
+- **Add** a machine type from the drop-down (it goes after the selected one), **Up** / **Down**
+  to reorder, **Remove** to take one out.
+- Click a machine on the floor or in the list to rename it, tick **Wait for my approval after
+  this machine** to make it a gate, or edit Claude's prompt (Coder and Reviewer).
+- The floor previews your draft as you go. **Save line** sends it to the backend, which checks
+  it (for example the Packager needs a Coder before it) and only accepts it when no crates are
+  in the line. **Cancel** throws the draft away.
+
+The saved line is `backend/line.json`; delete it to go back to the default line. The machine
+types and their steps live in `backend/machines.toml`. Each step is a command, a working folder
+and optionally text sent on stdin; placeholders such as `{text}`, `{branch}` and `{worktree}`
+are listed at the top of that file. Only executables in `[security] allowed_commands` (in
+`factory.toml`) can run, and only in folders inside `workspace/`.
 
 If you delete `backend/factory.db` to start fresh, also delete `workspace/` so crate
 numbers and branch names don't collide.

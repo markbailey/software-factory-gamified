@@ -6,12 +6,15 @@ code moves them, and every move is an event the game renders.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from . import formats, runner
+from . import config, formats, janitor, runner
 from .config import Config, MachineConfig, StepConfig
 from .hub import Hub
 from .store import Store
@@ -19,8 +22,10 @@ from .store import Store
 PROGRESS_RE = re.compile(r"^PROGRESS\s+([0-9]*\.?[0-9]+)\s*$")
 PR_URL_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
 PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+REVIEW_POLL_SECONDS = 20
 
-# Called when a crate reaches a milestone: (item, event, detail). event is "pr_opened" or "scrapped".
+# Called when a crate reaches a milestone: (item, event, detail).
+# event is "pr_opened", "awaiting_approval", "scrapped" or "shipped".
 Notifier = Callable[[dict, str, str], Awaitable[None]]
 
 
@@ -37,6 +42,7 @@ class Factory:
         self.locks = {m.id: asyncio.Lock() for m in cfg.machines}  # one crate per machine at a time
         self.tasks: set[asyncio.Task] = set()
         self.notifiers: list[Notifier] = []
+        self.decisions: dict[int, asyncio.Future] = {}  # crates waiting at a gate
 
     # Public ----------------------------------------------------------------
     def snapshot(self) -> dict:
@@ -50,9 +56,8 @@ class Factory:
             "seq": self.store.last_seq(),
             "layout": {
                 "locations": locations,
-                "machines": [
-                    {"id": m.id, "name": m.name, "steps": [s.name for s in m.steps]} for m in machines
-                ],
+                "machines": [m.summary() for m in machines],
+                "catalog": [m.summary() for m in self.cfg.catalog.values()],
                 "belt_seconds": self.cfg.travel_seconds,
             },
             "items": self.store.list_items(),
@@ -61,10 +66,67 @@ class Factory:
     async def submit(self, text: str, source: str = "game", source_ref: str = "", source_url: str = "") -> dict:
         item = self.store.create_item(text, source, source_ref, source_url)
         await self.hub.emit({"type": "item_created", "item": item})
-        task = asyncio.create_task(self._process(item["id"]))
+        self._spawn(self._process(item["id"]))
+        return item
+
+    def busy(self) -> list[int]:
+        """Crates still somewhere in the line (including waiting for you)."""
+        return [i["id"] for i in self.store.list_items() if i["state"] not in ("shipped", "scrapped")]
+
+    async def set_line(self, entries: list) -> str | None:
+        """Replace the line with one built in the game. Returns an error message, or None."""
+        error = config.validate_line(self.cfg.catalog, entries)
+        if error:
+            return error
+        busy = self.busy()
+        if busy:
+            ids = ", ".join(f"#{i}" for i in busy[:5])
+            return f"wait until the line is empty before changing it (still working on {ids})"
+        clean = [{k: e[k] for k in ("type", "id", "name", "gate", "prompt") if k in e} for e in entries]
+        self.cfg.machines = config.build_line(self.cfg.catalog, clean)
+        self.locks = {m.id: asyncio.Lock() for m in self.cfg.machines}
+        config.write_line(clean)
+        await self.hub.broadcast(self.snapshot())
+        return None
+
+    def resume_waiting(self) -> int:
+        """After a restart, put crates that were waiting at a gate back in front of it."""
+        index = {m.id: i for i, m in enumerate(self.cfg.machines)}
+        count = 0
+        for item in self.store.list_items():
+            if item["state"] == "awaiting_approval" and item["location"] in index:
+                self._spawn(self._process(item["id"], start=index[item["location"]], resume_gate=True))
+                count += 1
+        return count
+
+    async def decide(self, item_id: int, decision: str, note: str = "") -> str | None:
+        """Approve or reject a crate waiting at a gate. Returns an error message, or None."""
+        future = self.decisions.get(item_id)
+        if future is None or future.done():
+            return f"crate #{item_id} is not waiting for approval"
+        if note:
+            self.store.update_item(item_id, notes=note)
+        future.set_result(decision)
+        return None
+
+    async def retry(self, item_id: int, note: str = "") -> str | None:
+        """Send a scrapped crate back to the start of the line. Returns an error message, or None."""
+        try:
+            item = self.store.get_item(item_id)
+        except TypeError:
+            return f"no crate #{item_id}"
+        if item["state"] != "scrapped":
+            return f"crate #{item_id} is not in the scrap bin"
+        self.store.update_item(item_id, notes=note, review="", state="queued")
+        await self._log(item_id, "factory", "== Retry ==" + (f" Notes: {note}" if note else ""))
+        await self._cleanup_branch(item_id)
+        self._spawn(self._process(item_id))
+        return None
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
-        return item
 
     # Pipeline --------------------------------------------------------------
     async def _move(self, item_id: int, to: str, duration: float = 0.0, state: str | None = None,
@@ -84,25 +146,144 @@ class Factory:
         self.store.append_log(item_id, line)
         await self.hub.emit({"type": "job_log", "item_id": item_id, "machine": machine, "line": line})
 
-    async def _process(self, item_id: int) -> None:
+    async def _process(self, item_id: int, start: int = 0, resume_gate: bool = False) -> None:
         travel = self.cfg.travel_seconds
         machines = self.cfg.machines
-        await self._move(item_id, belt(0), travel, state="waiting")
+        if start == 0 and not resume_gate:
+            await self._move(item_id, belt(0), travel, state="waiting")
 
-        for i, machine in enumerate(machines):
-            async with self.locks[machine.id]:
-                await self._move(item_id, machine.id, 0.3, state="running")
-                ok, failed_step = await self._run_machine(item_id, machine)
-                if not ok:
-                    await self._move(item_id, "scrap", 0.6, state="scrapped")
-                    await self._notify(item_id, "scrapped", f"{machine.name}: {failed_step}")
-                    return
-                # Leave the machine before releasing it, so the next crate can enter.
-                last = i == len(machines) - 1
-                await self._move(item_id, belt(i + 1), travel, state="moving" if last else "waiting", wait=False)
-            await asyncio.sleep(travel)
+        for i in range(start, len(machines)):
+            machine = machines[i]
+            last = i == len(machines) - 1
+            next_state = "moving" if last else "waiting"
+            if not (resume_gate and i == start):
+                lock = contextlib.nullcontext() if machine.parallel else self.locks[machine.id]
+                async with lock:
+                    await self._move(item_id, machine.id, 0.3, state="running")
+                    ok, failed_step = await self._run_machine(item_id, machine)
+                    if not ok:
+                        await self._scrap(item_id, f"{machine.name}: {failed_step}")
+                        return
+                    if not machine.gate:
+                        # Leave the machine before releasing it, so the next crate can enter.
+                        await self._move(item_id, belt(i + 1), travel, state=next_state, wait=False)
+                if not machine.gate:
+                    await asyncio.sleep(travel)
+                    continue
+
+            # Gate: the crate waits here (without blocking the machine) until you decide.
+            decision = await self._await_decision(item_id, machine)
+            if decision != "approve":
+                await self._reject(item_id, machine)
+                return
+            await self._log(item_id, machine.id, f"[factory] approved at {machine.name}")
+            await self._move(item_id, belt(i + 1), travel, state=next_state)
 
         await self._move(item_id, "dock", 0.3, state="shipped")
+        await self._notify(item_id, "shipped", "")
+
+    async def _await_decision(self, item_id: int, machine: MachineConfig) -> str:
+        future = asyncio.get_running_loop().create_future()
+        self.decisions[item_id] = future
+        await self._move(item_id, machine.id, 0.0, state="awaiting_approval")
+        where = "in the game" + (" or with a review on the PR" if machine.github_review else "")
+        await self._log(item_id, machine.id, f"[factory] waiting at {machine.name} for you to approve or reject {where}")
+        await self._notify(item_id, "awaiting_approval", machine.name)
+        watcher = asyncio.create_task(self._watch_pr_review(item_id, machine, future)) if machine.github_review else None
+        try:
+            return await future
+        finally:
+            self.decisions.pop(item_id, None)
+            if watcher:
+                watcher.cancel()
+
+    async def _watch_pr_review(self, item_id: int, machine: MachineConfig, future: asyncio.Future) -> None:
+        """Poll the crate's PR; an approving review approves the crate, "request changes" rejects it."""
+        reported_error = False
+        while not future.done():
+            url = self.store.get_item(item_id).get("pr_url", "")
+            if url:
+                try:
+                    reviews = await asyncio.to_thread(self._pr_reviews, url)
+                    reported_error = False
+                except Exception as exc:
+                    if not reported_error:
+                        await self._log(item_id, machine.id, f"[factory] could not read PR reviews: {exc}")
+                        reported_error = True
+                    reviews = []
+                changes = [r for r in reviews if r.get("state") == "CHANGES_REQUESTED"]
+                approved = [r for r in reviews if r.get("state") == "APPROVED"]
+                if not future.done() and (changes or approved):
+                    review = (changes or approved)[-1]
+                    who = (review.get("author") or {}).get("login", "someone")
+                    if changes:
+                        note = (review.get("body") or "").strip()
+                        self.store.update_item(item_id, notes=note)
+                        await self._log(item_id, machine.id, f"[factory] {who} requested changes on GitHub")
+                        future.set_result("reject")
+                    else:
+                        await self._log(item_id, machine.id, f"[factory] {who} approved the PR on GitHub")
+                        future.set_result("approve")
+                    return
+            await asyncio.sleep(REVIEW_POLL_SECONDS)
+
+    def _pr_reviews(self, url: str) -> list[dict]:
+        argv = runner.resolve(["gh", "pr", "view", url, "--json", "latestReviews"], self.cfg.allowed_commands)
+        r = subprocess.run(argv, cwd=self.cfg.repo, capture_output=True, text=True, encoding="utf-8", timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip())
+        return json.loads(r.stdout or "{}").get("latestReviews", []) or []
+
+    async def _reject(self, item_id: int, machine: MachineConfig) -> None:
+        item = self.store.get_item(item_id)
+        note = item.get("notes", "")
+        await self._log(item_id, machine.id, f"[factory] rejected at {machine.name}" + (f": {note}" if note else ""))
+        if item.get("pr_url"):
+            comment = "Rejected in the Software Factory." + (f"\n\n{note}" if note else "")
+            await self._command(item_id, machine.id, ["gh", "pr", "close", item["pr_url"], "--comment", comment],
+                                self.cfg.repo)
+        await self._scrap(item_id, f"{machine.name}: rejected")
+
+    async def _scrap(self, item_id: int, reason: str) -> None:
+        await self._move(item_id, "scrap", 0.6, state="scrapped")
+        await self._notify(item_id, "scrapped", reason)
+
+    async def _cleanup_branch(self, item_id: int) -> None:
+        """Remove a crate's old worktree and local branch so the Coder can start fresh."""
+        worktree = self.cfg.worktrees / f"crate-{item_id}"
+        branch = f"crate/{item_id}"
+        if worktree.exists():
+            await self._command(item_id, "factory", ["git", "worktree", "remove", "--force", str(worktree)],
+                                self.cfg.repo)
+        if worktree.exists():
+            # git can leave a half-deleted folder on Windows (read-only files in node_modules).
+            await self._log(item_id, "factory", f"[factory] deleting leftover folder {worktree}")
+            try:
+                await asyncio.to_thread(janitor.force_remove, worktree)
+            except OSError as exc:
+                await self._log(item_id, "factory", f"[factory] could not delete it: {exc}")
+        await self._command(item_id, "factory", ["git", "worktree", "prune"], self.cfg.repo)
+        await self._command(item_id, "factory", ["git", "branch", "-D", branch], self.cfg.repo, quiet_fail=True)
+
+    async def _command(self, item_id: int, machine: str, argv: list[str], cwd: Path, quiet_fail: bool = False) -> int:
+        """Run one allowlisted command outside a machine's steps, logging its output."""
+        log = lambda line: self._log(item_id, machine, line)  # noqa: E731
+        try:
+            resolved = runner.resolve(argv, self.cfg.allowed_commands)
+        except (runner.CommandNotAllowed, FileNotFoundError) as exc:
+            await log(f"[factory] refused: {exc}")
+            return -1
+        lines: list[str] = []
+
+        async def collect(line: str) -> None:
+            lines.append(line)
+
+        await log("$ " + " ".join(argv))
+        code = await runner.run(resolved, cwd, collect, timeout=120)
+        if code == 0 or not quiet_fail:
+            for line in lines:
+                await log(line)
+        return code
 
     async def _run_machine(self, item_id: int, machine: MachineConfig) -> tuple[bool, str]:
         steps = machine.steps
@@ -113,6 +294,9 @@ class Factory:
             await self.hub.emit({"type": "job_progress", "item_id": item_id, "machine": machine.id,
                                  "progress": index / len(steps), "step": step.name})
             code = await self._run_step(item_id, machine, index, step, values)
+            if code != 0 and step.allow_failure:
+                await self._log(item_id, machine.id, f"[factory] '{step.name}' failed but is allowed to; carrying on")
+                code = 0
             if code != 0:
                 await self.hub.emit({"type": "job_failed", "item_id": item_id, "machine": machine.id,
                                      "exit_code": code, "step": step.name})
@@ -152,13 +336,18 @@ class Factory:
                                      "progress": (index + inner) / total, "step": step.name})
                 return
             pr_urls.extend(PR_URL_RE.findall(line))
+            if step.log_format == "claude-stream-json" and '"type":"result"' in line.replace(" ", ""):
+                with contextlib.suppress(ValueError):
+                    values["agent_result"] = str(json.loads(line).get("result", "")).strip()
+                    self.store.update_item(item_id, review=values["agent_result"])
             for out in fmt(line):
                 await log(out)
 
         code = await runner.run(resolved, cwd, on_line, stdin_text=stdin_text, timeout=step.timeout_seconds)
         if code != 0:
             await log(f"[factory] step '{step.name}' failed with exit code {code}")
-        elif pr_urls:
+        elif pr_urls and pr_urls[-1] != values.get("pr_url"):
+            values["pr_url"] = pr_urls[-1]
             self.store.update_item(item_id, pr_url=pr_urls[-1])
             await self.hub.emit({"type": "pr_opened", "item_id": item_id, "url": pr_urls[-1]})
             await self._notify(item_id, "pr_opened", pr_urls[-1])
@@ -188,6 +377,10 @@ class Factory:
             "base_ref": f"origin/{base}" if self.cfg.remote else base,
             "pr_title": f"Crate #{item_id}: {summary}",
             "pr_body": _pr_body(item),
+            "pr_url": item.get("pr_url", ""),
+            "notes": (f"Notes from the last attempt (address these):\n{item['notes']}"
+                      if item.get("notes") else ""),
+            "agent_result": item.get("review", ""),
             "python": sys.executable,
             "scripts": str(self.cfg.scripts_dir),
         }

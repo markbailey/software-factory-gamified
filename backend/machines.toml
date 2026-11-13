@@ -1,0 +1,215 @@
+# Software Factory machine catalogue
+#
+# Every machine type you can place on the line in the game's build mode. The line itself
+# (which machines, in what order, with your names, gates and prompts) is saved by the game
+# in line.json; delete that file to go back to default_line below.
+#
+#   needs / provides  what a machine relies on earlier machines for: "worktree" (a branch
+#                     with the crate's code) and "pr" (an open pull request). The game
+#                     won't save a line where a machine comes before what it needs.
+#   unique = true     at most one of this machine on the line
+#   gate = true       after its steps, the crate waits for you to approve or reject it
+#   github_review     a gate that also listens to PR reviews on GitHub
+#   parallel = true   the machine takes any number of crates at once (for waiting)
+#
+# Placeholders you can use in commands, cwd and stdin:
+#   {id}        crate number              {text}      the spec as typed or imported
+#   {summary}   first line of the spec    {prompt}    this machine's prompt
+#   {repo}      the test project folder   {worktree}  this crate's worktree folder
+#   {branch}    this crate's branch       {base}      base branch (main)
+#   {base_ref}  what branches start from (origin/main when there is a remote)
+#   {pr_title}  PR title                  {pr_body}   PR body, with "Closes #n" for issues
+#   {pr_url}    the crate's PR, once open {notes}     your notes from a reject or retry
+#   {agent_result}  Claude's final reply from the last Claude step
+#   {python}    the backend's Python      {scripts}   backend/scripts
+
+default_line = ["coder", "tester", "packager", "reviewer", "ci", "merger"]
+
+[[types]]
+id = "coder"
+name = "Coder"
+description = "Has Claude write the change on a fresh branch and commits it."
+sprite = "coder"
+provides = ["worktree"]
+unique = true
+prompt = """
+You are the Coder machine in a software factory. Implement the spec below in the
+current folder. Keep the change small and focused, and only touch files in this folder.
+Follow the project's existing structure and tooling. For a pnpm/turbo monorepo, put apps in
+apps/ and shared code in packages/, give each new package a "test" script in its
+package.json so `pnpm test` at the root runs it, and add any dependencies to package.json
+files (you cannot run installs; the Tester installs them). If the project has no tooling
+yet, use Python with tests in tests/test_*.py using the built-in unittest.
+Add or update tests for every change.
+Do not run git commands; the factory commits your work for you.
+When you are done, reply with a two or three line summary of what you changed.
+
+Spec:
+{text}
+
+{notes}
+"""
+
+[[types.steps]]
+name = "Sync"
+cwd = "{repo}"
+command = ["git", "fetch", "--all", "--prune"]
+
+[[types.steps]]
+name = "Make branch"
+cwd = "{repo}"
+command = ["git", "worktree", "add", "-b", "{branch}", "{worktree}", "{base_ref}"]
+
+[[types.steps]]
+name = "Write code"
+cwd = "{worktree}"
+# The prompt goes in on stdin, which avoids Windows quoting problems.
+stdin = "{prompt}"
+command = [
+    "claude", "-p",
+    "--output-format", "stream-json", "--verbose",
+    "--permission-mode", "acceptEdits",
+    "--allowedTools", "Read,Edit,Write,Glob,Grep",
+]
+log_format = "claude-stream-json"
+timeout_seconds = 900
+
+[[types.steps]]
+name = "Stage changes"
+cwd = "{worktree}"
+command = ["git", "add", "-A"]
+
+[[types.steps]]
+name = "Commit"
+cwd = "{worktree}"
+command = ["git", "-c", "user.name=Software Factory", "-c", "user.email=factory@localhost",
+           "commit", "-m", "Crate #{id}: {summary}"]
+
+[[types]]
+id = "tester"
+name = "Tester"
+description = "Installs dependencies, runs the tests, and commits the lockfile."
+sprite = "tester"
+needs = ["worktree"]
+
+[[types.steps]]
+name = "Run tests"
+cwd = "{worktree}"
+# Finds and runs the project's tests (unittest or pytest). Passes if there are none.
+command = ["{python}", "{scripts}/run_tests.py"]
+timeout_seconds = 600
+
+[[types.steps]]
+name = "Commit lockfile"
+cwd = "{worktree}"
+command = ["{python}", "{scripts}/commit_lockfiles.py"]
+
+[[types]]
+id = "packager"
+name = "Packager"
+description = "Pushes the branch and opens a pull request."
+sprite = "packager"
+needs = ["worktree"]
+provides = ["pr"]
+unique = true
+
+[[types.steps]]
+name = "Push branch"
+cwd = "{worktree}"
+# --force: a retried crate rebuilds its branch from scratch, and the branch belongs to the factory.
+command = ["git", "push", "-u", "--force", "origin", "{branch}"]
+
+[[types.steps]]
+name = "Open PR"
+cwd = "{worktree}"
+stdin = "{pr_body}"
+# Opens a PR, or reuses the branch's open PR when a crate is retried.
+command = ["{python}", "{scripts}/open_pr.py", "{base}", "{branch}", "{pr_title}"]
+
+[[types]]
+id = "reviewer"
+name = "Reviewer"
+description = "Has Claude review the PR, then waits for your approval."
+sprite = "reviewer"
+needs = ["worktree", "pr"]
+gate = true
+# Also accept a decision made on GitHub: approve the PR to let the crate carry on, or
+# "request changes" to reject it (the review text becomes the note for a retry).
+github_review = true
+prompt = """
+You are the Reviewer machine in a software factory. Review the change on this branch.
+Run `git diff {base_ref}...HEAD` to see it. Check that it does what the spec asks, has
+tests, follows the project's structure, and has no obvious bugs. Do not edit any files.
+Reply in Markdown: first line "Verdict: Looks good" or "Verdict: Needs changes", then at
+most five short bullet points.
+
+Spec:
+{text}
+"""
+
+[[types.steps]]
+name = "Review"
+cwd = "{worktree}"
+stdin = "{prompt}"
+command = [
+    "claude", "-p",
+    "--output-format", "stream-json", "--verbose",
+    "--allowedTools", "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*)",
+]
+log_format = "claude-stream-json"
+timeout_seconds = 600
+
+[[types.steps]]
+name = "Post review"
+cwd = "{worktree}"
+stdin = """**Software Factory review**
+
+{agent_result}
+"""
+command = ["gh", "pr", "comment", "{pr_url}", "--body-file", "-"]
+
+[[types]]
+id = "ci"
+name = "CI monitor"
+description = "Waits for the pull request's checks to pass."
+sprite = "ci_monitor"
+needs = ["pr"]
+parallel = true
+
+[[types.steps]]
+name = "Wait for checks"
+cwd = "{worktree}"
+command = ["{python}", "{scripts}/wait_for_checks.py", "{pr_url}", "1800"]
+timeout_seconds = 1900
+
+[[types]]
+id = "merger"
+name = "Merger"
+description = "Squash-merges the pull request and cleans up the branch."
+sprite = "merger"
+needs = ["pr"]
+unique = true
+
+[[types.steps]]
+name = "Merge PR"
+cwd = "{repo}"
+command = ["gh", "pr", "merge", "{pr_url}", "--squash"]
+
+[[types.steps]]
+name = "Delete branch"
+cwd = "{repo}"
+# GitHub may already have deleted it if the repo auto-deletes merged branches.
+allow_failure = true
+command = ["git", "push", "origin", "--delete", "{branch}"]
+
+[[types.steps]]
+name = "Remove worktree"
+cwd = "{repo}"
+allow_failure = true
+command = ["git", "worktree", "remove", "--force", "{worktree}"]
+
+[[types.steps]]
+name = "Delete local branch"
+cwd = "{repo}"
+allow_failure = true
+command = ["git", "branch", "-D", "{branch}"]

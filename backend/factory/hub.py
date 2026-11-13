@@ -18,7 +18,10 @@ class Hub:
         self.clients.discard(ws)
 
     async def emit(self, event: dict) -> None:
-        event = {**event, "seq": self.store.append_event(event)}
+        await self.broadcast({**event, "seq": self.store.append_event(event)})
+
+    async def broadcast(self, event: dict) -> None:
+        """Send to every client without logging it (used for fresh snapshots)."""
         dead = []
         for ws in list(self.clients):
             try:

@@ -62,11 +62,8 @@ class GitHubIntake:
     async def notify(self, item: dict, event: str, detail: str) -> None:
         if item.get("source") != self.source or not item.get("source_ref"):
             return
-        if event == "pr_opened":
-            body = f"The Software Factory opened a pull request for this issue: {detail}"
-        elif event == "scrapped":
-            body = f"The Software Factory could not finish this issue: crate #{item['id']} failed at {detail}."
-        else:
+        body = _message(item, event, detail)
+        if not body:
             return
         await asyncio.to_thread(
             self._gh, "issue", "comment", item["source_ref"], "--repo", self.cfg.repo, "--body-file", "-",
@@ -119,15 +116,23 @@ class JiraIntake:
     async def notify(self, item: dict, event: str, detail: str) -> None:
         if item.get("source") != self.source or not item.get("source_ref"):
             return
-        if event == "pr_opened":
-            text = f"The Software Factory opened a pull request for this issue: {detail}"
-        elif event == "scrapped":
-            text = f"The Software Factory could not finish this issue: crate #{item['id']} failed at {detail}."
-        else:
+        text = _message(item, event, detail)
+        if not text:
             return
         body = {"body": {"type": "doc", "version": 1, "content": [
             {"type": "paragraph", "content": [{"type": "text", "text": text}]}]}}
         await asyncio.to_thread(self._request, "POST", f"/rest/api/3/issue/{item['source_ref']}/comment", body)
+
+
+def _message(item: dict, event: str, detail: str) -> str:
+    """The comment posted on the issue for each milestone, or "" for none."""
+    if event == "pr_opened":
+        return f"The Software Factory opened a pull request for this issue: {detail}"
+    if event == "scrapped":
+        return f"The Software Factory could not finish this issue: crate #{item['id']} stopped at {detail}."
+    if event == "shipped":
+        return f"The Software Factory merged the pull request for this issue: {item.get('pr_url', '')}"
+    return ""
 
 
 def _adf_text(node) -> str:

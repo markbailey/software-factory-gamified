@@ -8,6 +8,8 @@ from pathlib import Path
 
 MAX_LOG_LINES = 500
 TERMINAL_STATES = ("shipped", "scrapped")
+# States that survive a backend restart: finished crates, and crates waiting for you at a gate.
+RESUMABLE_STATES = TERMINAL_STATES + ("awaiting_approval",)
 
 
 class Store:
@@ -37,9 +39,9 @@ class Store:
             );
             """
         )
-        # Columns added after slice 2: add them to older databases.
+        # Columns added in later slices: add them to older databases.
         have = {r["name"] for r in self.db.execute("PRAGMA table_info(items)")}
-        for col in ("source", "source_ref", "source_url", "pr_url"):
+        for col in ("source", "source_ref", "source_url", "pr_url", "notes", "review"):
             if col not in have:
                 self.db.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         self.db.commit()
@@ -76,8 +78,8 @@ class Store:
     def scrap_interrupted(self) -> list[int]:
         """Items left mid-pipeline by a previous run can't resume yet, so scrap them."""
         rows = self.db.execute(
-            f"SELECT id FROM items WHERE state NOT IN ({','.join('?' * len(TERMINAL_STATES))})",
-            TERMINAL_STATES,
+            f"SELECT id FROM items WHERE state NOT IN ({','.join('?' * len(RESUMABLE_STATES))})",
+            RESUMABLE_STATES,
         ).fetchall()
         ids = [r["id"] for r in rows]
         for item_id in ids:

@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 import asyncio
 
-from . import config, intake, workspace
+from . import config, intake, janitor, workspace
 from .engine import Factory
 from .hub import Hub
 from .store import Store
@@ -40,9 +40,14 @@ async def lifespan(app: FastAPI):
     if cfg.jira.enabled:
         adapters.append((intake.JiraIntake(cfg.jira, factory), cfg.jira.poll_seconds))
         print(f"[intake] watching Jira: {cfg.jira.jql}")
+    pollers.append(asyncio.create_task(
+        janitor.run(cfg, store, cfg.cleanup_interval_minutes, cfg.keep_scrapped_hours)))
     for adapter, seconds in adapters:
         factory.notifiers.append(adapter.notify)
         pollers.append(asyncio.create_task(intake.run_poller(adapter, seconds)))
+    waiting = factory.resume_waiting()
+    if waiting:
+        print(f"[factory] {waiting} crate(s) still waiting for your approval")
     print(f"[factory] game should connect to ws://{cfg.host}:{cfg.port}/ws")
     yield
     for task in pollers:
@@ -66,14 +71,31 @@ async def ws_endpoint(ws: WebSocket) -> None:
         while True:
             msg = await ws.receive_json()
             kind = msg.get("type") if isinstance(msg, dict) else None
+            error = None
             if kind == "submit_work":
                 text = str(msg.get("text", "")).strip()[:MAX_SPEC_CHARS]
                 if text:
                     await factory.submit(text)
                 else:
-                    await ws.send_json({"type": "error", "message": "submit_work needs some text"})
+                    error = "submit_work needs some text"
+            elif kind == "save_line":
+                error = await factory.set_line(msg.get("machines"))
+            elif kind in ("approve", "reject", "retry"):
+                try:
+                    item_id = int(msg.get("item_id"))
+                except (TypeError, ValueError):
+                    item_id = None
+                note = str(msg.get("note", "")).strip()[:MAX_SPEC_CHARS]
+                if item_id is None:
+                    error = f"{kind} needs an item_id"
+                elif kind == "retry":
+                    error = await factory.retry(item_id, note)
+                else:
+                    error = await factory.decide(item_id, kind, note)
             else:
-                await ws.send_json({"type": "error", "message": f"unknown command: {kind}"})
+                error = f"unknown command: {kind}"
+            if error:
+                await ws.send_json({"type": "error", "message": error})
     except WebSocketDisconnect:
         pass
     finally:

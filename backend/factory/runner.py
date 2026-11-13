@@ -49,7 +49,8 @@ async def run(
     """Run argv in cwd, awaiting on_line for each output line. Returns the exit code."""
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    # PYTHONUTF8: our scripts read and write UTF-8 (Windows would otherwise use cp1252).
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
 
     def emit(kind: str, value) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, (kind, value))

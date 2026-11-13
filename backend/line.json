@@ -1,0 +1,46 @@
+{
+  "machines": [
+    {
+      "type": "coder",
+      "id": "coder",
+      "name": "Coder",
+      "gate": false,
+      "prompt": "You are the Coder machine in a software factory. Implement the spec below in the\ncurrent folder. Keep the change small and focused, and only touch files in this folder.\nFollow the project's existing structure and tooling. For a pnpm/turbo monorepo, put apps in\napps/ and shared code in packages/, give each new package a \"test\" script in its\npackage.json so `pnpm test` at the root runs it, and add any dependencies to package.json\nfiles (you cannot run installs; the Tester installs them). If the project has no tooling\nyet, use Python with tests in tests/test_*.py using the built-in unittest.\nAdd or update tests for every change.\nDo not run git commands; the factory commits your work for you.\nWhen you are done, reply with a two or three line summary of what you changed.\n\nSpec:\n{text}\n\n{notes}\n"
+    },
+    {
+      "type": "tester",
+      "id": "tester",
+      "name": "Tester",
+      "gate": false,
+      "prompt": ""
+    },
+    {
+      "type": "packager",
+      "id": "packager",
+      "name": "Packager",
+      "gate": false,
+      "prompt": ""
+    },
+    {
+      "type": "ci",
+      "id": "ci",
+      "name": "CI monitor",
+      "gate": false,
+      "prompt": ""
+    },
+    {
+      "type": "reviewer",
+      "id": "reviewer",
+      "name": "Reviewer",
+      "gate": true,
+      "prompt": "You are the Reviewer machine in a software factory. Review the change on this branch.\nRun `git diff {base_ref}...HEAD` to see it. Check that it does what the spec asks, has\ntests, follows the project's structure, and has no obvious bugs. Do not edit any files.\nReply in Markdown: first line \"Verdict: Looks good\" or \"Verdict: Needs changes\", then at\nmost five short bullet points.\n\nSpec:\n{text}\n"
+    },
+    {
+      "type": "merger",
+      "id": "merger",
+      "name": "Merger",
+      "gate": false,
+      "prompt": ""
+    }
+  ]
+}

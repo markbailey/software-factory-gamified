@@ -1,0 +1,14 @@
+# Godot 4+ specific ignores
+.godot/
+game/.godot/
+game/android/
+
+# Python
+__pycache__/
+*.pyc
+backend/.venv/
+backend/factory.db
+backend/uv.lock
+
+# The throwaway test project machines run in
+workspace/

@@ -1,0 +1,135 @@
+# Software Factory backend configuration (slice 3: a straight line to a PR)
+
+[server]
+host = "127.0.0.1"
+port = 8765
+
+[workspace]
+# Everything the machines touch lives under this folder (relative to this file).
+path = "../workspace"
+# The throwaway test project, a clone of `remote`. Created on first start if missing.
+repo = "test-project"
+remote = "https://github.com/markbailey/test-project.git"
+# Each crate gets its own git worktree and branch here, so crates never clash.
+worktrees = "worktrees"
+base_branch = "main"
+
+[security]
+# Executables a machine may launch. Version suffixes and .exe/.cmd are ignored.
+# Anything else is refused and the crate is scrapped.
+allowed_commands = ["python", "git", "gh", "claude"]
+
+[belts]
+travel_seconds = 1.5
+
+# ---------------------------------------------------------------------------
+# Intake: where work comes from besides typing a spec in the game.
+# ---------------------------------------------------------------------------
+[intake.github]
+# Open issues with this label become crates. The PR says "Closes #n", and the
+# factory comments on the issue when the PR opens or the crate is scrapped.
+enabled = true
+repo = "markbailey/test-project"
+label = "factory"
+poll_seconds = 60
+
+[intake.jira]
+# Jira Cloud. Put an API token in the JIRA_API_TOKEN environment variable
+# (https://id.atlassian.com/manage-profile/security/api-tokens).
+enabled = false
+base_url = "https://your-site.atlassian.net"
+email = "you@example.com"
+token_env = "JIRA_API_TOKEN"
+jql = "labels = factory AND statusCategory != Done"
+poll_seconds = 60
+
+# ---------------------------------------------------------------------------
+# Machines, in the order crates visit them. Each runs its steps in order and
+# scraps the crate at the first failing step.
+#
+# Placeholders you can use in commands, cwd and stdin:
+#   {id}        crate number              {text}      the spec as typed or imported
+#   {summary}   first line of the spec    {prompt}    this machine's prompt
+#   {repo}      the test project folder   {worktree}  this crate's worktree folder
+#   {branch}    this crate's branch       {base}      base branch (main)
+#   {base_ref}  what branches start from (origin/main when there is a remote)
+#   {pr_title}  PR title                  {pr_body}   PR body, with "Closes #n" for issues
+#   {python}    the backend's Python      {scripts}   backend/scripts
+# ---------------------------------------------------------------------------
+
+[[machines]]
+id = "coder"
+name = "Coder"
+prompt = """
+You are the Coder machine in a software factory. Implement the spec below in the
+current folder. Keep the change small and focused, and only touch files in this folder.
+Use Python unless the project already uses something else. Add or update tests using
+Python's built-in unittest, in a tests/ folder with files named test_*.py.
+Do not run git commands; the factory commits your work for you.
+When you are done, reply with a two or three line summary of what you changed.
+
+Spec:
+{text}
+"""
+
+[[machines.steps]]
+name = "Sync"
+cwd = "{repo}"
+command = ["git", "fetch", "--all", "--prune"]
+
+[[machines.steps]]
+name = "Make branch"
+cwd = "{repo}"
+command = ["git", "worktree", "add", "-b", "{branch}", "{worktree}", "{base_ref}"]
+
+[[machines.steps]]
+name = "Write code"
+cwd = "{worktree}"
+# The prompt goes in on stdin, which avoids Windows quoting problems.
+stdin = "{prompt}"
+command = [
+    "claude", "-p",
+    "--output-format", "stream-json", "--verbose",
+    "--permission-mode", "acceptEdits",
+    "--allowedTools", "Read,Edit,Write,Glob,Grep",
+]
+log_format = "claude-stream-json"
+timeout_seconds = 900
+
+[[machines.steps]]
+name = "Stage changes"
+cwd = "{worktree}"
+command = ["git", "add", "-A"]
+
+[[machines.steps]]
+name = "Commit"
+cwd = "{worktree}"
+command = ["git", "-c", "user.name=Software Factory", "-c", "user.email=factory@localhost",
+           "commit", "-m", "Crate #{id}: {summary}"]
+
+[[machines]]
+id = "tester"
+name = "Tester"
+
+[[machines.steps]]
+name = "Run tests"
+cwd = "{worktree}"
+# Finds and runs the project's tests (unittest or pytest). Passes if there are none.
+command = ["{python}", "{scripts}/run_tests.py"]
+timeout_seconds = 600
+
+[[machines]]
+id = "packager"
+name = "Packager"
+
+[[machines.steps]]
+name = "Push branch"
+cwd = "{worktree}"
+command = ["git", "push", "-u", "origin", "{branch}"]
+
+[[machines.steps]]
+name = "Open PR"
+cwd = "{worktree}"
+stdin = "{pr_body}"
+command = ["gh", "pr", "create", "--base", "{base}", "--head", "{branch}",
+           "--title", "{pr_title}", "--body-file", "-"]

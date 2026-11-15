@@ -1,6 +1,7 @@
 """Tester: commit lockfiles that the dependency install created or changed.
 
 Only lockfiles are committed, so nothing else the tests produced ends up in the PR.
+Usage: commit_lockfiles.py [attribution line for the end of the commit message]
 """
 import shutil
 import subprocess
@@ -21,5 +22,7 @@ if not changed:
     sys.exit(0)
 
 subprocess.run([git, "add", "--", *changed], check=True)
-subprocess.run([git, *IDENTITY, "commit", "-q", "-m", "Update lockfile"], check=True)
+attribution = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+message = "Update lockfile" + (f"\n\n{attribution}" if attribution else "")
+subprocess.run([git, *IDENTITY, "commit", "-q", "-m", message], check=True)
 print(f"Committed {', '.join(changed)}.", flush=True)

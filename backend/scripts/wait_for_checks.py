@@ -2,9 +2,11 @@
 
 Usage: wait_for_checks.py <pr-url> [timeout-seconds]
 Exit 0 when every check passed or was skipped, or when the repo has no checks at all.
-Exit 1 as soon as a check fails, or on timeout.
+Exit 1 as soon as a check fails, or on timeout. A failed GitHub Actions job prints the end of
+its log, so the Coder can see what broke when the crate is sent back.
 """
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -13,6 +15,8 @@ import time
 url = sys.argv[1]
 timeout = float(sys.argv[2]) if len(sys.argv) > 2 else 1800
 POLL = 20
+LOG_LINES = 80
+JOB_RE = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
 # Checks can take a few seconds to register after a push.
 GRACE = 30
 
@@ -21,10 +25,24 @@ if not gh:
     print("gh is not installed or not on PATH", flush=True)
     sys.exit(1)
 
+def print_failed_log(check: dict) -> None:
+    """Print the end of a failed GitHub Actions job's log (other CI systems just get the link)."""
+    m = JOB_RE.search(check.get("link", "") or "")
+    if not m:
+        return
+    r = subprocess.run([gh, "run", "view", "--job", m.group(2), "--log-failed"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    lines = (r.stdout or r.stderr).splitlines()
+    if lines:
+        print(f"--- last {min(len(lines), LOG_LINES)} lines of the failed log ---", flush=True)
+        for line in lines[-LOG_LINES:]:
+            print(line, flush=True)
+
+
 start = time.monotonic()
 last_summary = ""
 while True:
-    r = subprocess.run([gh, "pr", "checks", url, "--json", "name,bucket"], capture_output=True, text=True)
+    r = subprocess.run([gh, "pr", "checks", url, "--json", "name,bucket,link"], capture_output=True, text=True)
     checks = []
     if r.stdout.strip().startswith("["):
         checks = json.loads(r.stdout)
@@ -44,8 +62,11 @@ while True:
             print(summary, flush=True)
             last_summary = summary
         print(f"PROGRESS {sum(b in ('pass', 'skipping') for b in buckets) / len(buckets):.2f}", flush=True)
-        if any(b in ("fail", "cancel") for b in buckets):
-            print("A check failed.", flush=True)
+        failed = [c for c in checks if c.get("bucket") in ("fail", "cancel")]
+        if failed:
+            for check in failed:
+                print(f"Check failed: {check['name']} {check.get('link', '')}", flush=True)
+                print_failed_log(check)
             sys.exit(1)
         if all(b in ("pass", "skipping") for b in buckets):
             print("All checks passed.", flush=True)

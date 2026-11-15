@@ -41,17 +41,28 @@ class Store:
         )
         # Columns added in later slices: add them to older databases.
         have = {r["name"] for r in self.db.execute("PRAGMA table_info(items)")}
-        for col in ("source", "source_ref", "source_url", "pr_url", "notes", "review"):
+        for col in ("source", "source_ref", "source_url", "pr_url", "notes", "review", "pipeline",
+                    "head_sha", "risk", "risk_reason", "outcome", "scrap_kind", "waiting_for", "spec", "route"):
             if col not in have:
                 self.db.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        if "loops" not in have:  # how many times the crate has been sent back for rework
+            self.db.execute("ALTER TABLE items ADD COLUMN loops INTEGER NOT NULL DEFAULT 0")
+        # Before pipelines, there was one line and places had no pipeline prefix.
+        self.db.execute("UPDATE items SET pipeline = 'build' WHERE pipeline = ''")
+        self.db.execute(
+            "UPDATE items SET location = 'build:' || location WHERE location NOT LIKE '%:%' AND"
+            " (location IN ('intake', 'dock', 'scrap') OR location LIKE 'belt\\_%' ESCAPE '\\'"
+            " OR location LIKE 'return\\_%' ESCAPE '\\')")
         self.db.commit()
 
     # Items -----------------------------------------------------------------
-    def create_item(self, text: str, source: str = "game", source_ref: str = "", source_url: str = "") -> dict:
+    def create_item(self, text: str, source: str = "game", source_ref: str = "", source_url: str = "",
+                    pipeline: str = "build", location: str = "", pr_url: str = "", head_sha: str = "") -> dict:
         cur = self.db.execute(
-            "INSERT INTO items (text, state, location, created_at, source, source_ref, source_url)"
-            " VALUES (?, 'queued', 'intake', ?, ?, ?, ?)",
-            (text, time.time(), source, source_ref, source_url),
+            "INSERT INTO items (text, state, location, created_at, source, source_ref, source_url,"
+            " pipeline, pr_url, head_sha) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (text, location or f"{pipeline}:intake", time.time(), source, source_ref, source_url,
+             pipeline, pr_url, head_sha),
         )
         self.db.commit()
         return self.get_item(cur.lastrowid)
@@ -78,19 +89,30 @@ class Store:
     def scrap_interrupted(self) -> list[int]:
         """Items left mid-pipeline by a previous run can't resume yet, so scrap them."""
         rows = self.db.execute(
-            f"SELECT id FROM items WHERE state NOT IN ({','.join('?' * len(RESUMABLE_STATES))})",
+            f"SELECT id, pipeline FROM items WHERE state NOT IN ({','.join('?' * len(RESUMABLE_STATES))})",
             RESUMABLE_STATES,
         ).fetchall()
         ids = [r["id"] for r in rows]
-        for item_id in ids:
-            self.append_log(item_id, "[factory] backend restarted while this crate was in flight; scrapped")
-            self.update_item(item_id, state="scrapped", location="scrap")
+        for r in rows:
+            self.append_log(r["id"], "[factory] backend restarted while this crate was in flight; scrapped")
+            self.update_item(r["id"], state="scrapped", location=f"{r['pipeline'] or 'build'}:scrap")
         return ids
 
     # Intake ----------------------------------------------------------------
     def seen(self, source: str, ref: str) -> bool:
         row = self.db.execute("SELECT 1 FROM intake_seen WHERE source = ? AND ref = ?", (source, ref)).fetchone()
         return row is not None
+
+    def seen_item(self, source: str, ref: str) -> int | None:
+        """The crate an intake made for this issue or PR, if it made one."""
+        row = self.db.execute("SELECT item_id FROM intake_seen WHERE source = ? AND ref = ?",
+                              (source, ref)).fetchone()
+        return int(row["item_id"]) if row is not None and row["item_id"] is not None else None
+
+    def forget_seen(self, source: str, ref: str) -> None:
+        """Let an intake take this issue again (after it was handed back to its author)."""
+        self.db.execute("DELETE FROM intake_seen WHERE source = ? AND ref = ?", (source, ref))
+        self.db.commit()
 
     def mark_seen(self, source: str, ref: str, item_id: int) -> None:
         self.db.execute("INSERT OR REPLACE INTO intake_seen (source, ref, item_id) VALUES (?, ?, ?)",

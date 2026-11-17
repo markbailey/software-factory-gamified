@@ -36,22 +36,29 @@ You need Python 3.10+.
    - **Tester** installs dependencies and runs the project's tests
      (`backend/scripts/run_tests.py`: `pnpm test` / npm / yarn, plus unittest or pytest), then
      commits the lockfile if the install changed it. No tests counts as a pass.
-   - **Packager** pushes the branch and opens a pull request (or reuses the branch's open one).
-   - **Reviewer** has Claude review the diff, posts the review on the PR, then **waits for you**.
-     The machine shows how many crates are waiting; they line up underneath it in yellow.
-   - **CI monitor** waits for the PR's checks to pass (it passes after 30s if there are none).
-   - **Merger** squash-merges the PR, then deletes the branch and worktree.
+   - **Document writer** has Claude write the pull request's title and description (filling in
+     the repo's PR template if it has one).
+   - **Packager** pushes the branch and opens a pull request (or reuses the branch's open one),
+     using that title and description. It runs no AI itself.
+   - **Risk analyser** has Claude rate the change low, medium or high risk and stamps the crate.
+   - **Reviewer** has Claude review the diff and posts the review on the PR. It only reviews and
+     comments: a review asking for changes leaves by its red port.
+   - **Approver** **waits for you** (or for a review on GitHub, or lets low-risk changes through
+     by itself). The machine shows how many crates are waiting; they line up underneath it in yellow.
+   - **CI** waits for the PR's checks to pass (it passes after 30s if there are none).
+   - **Merger** merges the PR (squash by default), then deletes the branch and worktree.
 
-   **Rework loops:** when the Tester, Reviewer or CI monitor fails, the crate rides the return
-   belt back to the Coder. It keeps its branch and PR, and Claude gets what went wrong (the test
-   output, the review, or the failing CI log) and fixes it on top of its earlier work. The
-   Reviewer sends a crate back on its own when Claude's verdict is "Needs changes". After
-   `max_rework` trips (3, in `backend/machines.toml`) the crate goes to the scrap bin.
-   Any other failure sends the crate to the scrap bin with the full log. Several crates
-   can be in the line at once, one per machine (the Reviewer and CI monitor take any number).
+   **Red belts:** a crate that fails leaves by the machine's red port and goes wherever its belt
+   goes. On the default line the Tester, Reviewer, Approver and CI red belts run back to the
+   Coder: the crate keeps its branch and PR, and Claude gets what went wrong (the test output,
+   the review, or the failing CI log) and fixes it on top of its earlier work. After
+   `max_rework` trips (3, in `backend/machines.toml`) the crate goes to the scrap bin. A red
+   belt can also lead on to any other machine or dock, or into a scrap bin; with no red belt,
+   a failed crate waits at the machine for you. Several crates can be in the line at once, one
+   per machine (the Approver and CI take any number).
 
 4. **Steer crates.** Click a crate, and buttons appear above its log:
-   - **Approve** / **Send back** / **Scrap** at the Reviewer. Send back returns the crate to the
+   - **Approve** / **Send back** / **Scrap** at the Approver. Send back returns the crate to the
      Coder with your note; a "Request changes" review on GitHub does the same. Scrap closes the
      PR and throws the crate away. (At a gate with nowhere to send crates back, the button says
      Reject and scraps.)
@@ -65,7 +72,20 @@ A janitor in the backend tidies `workspace/` every 10 minutes (and at startup): 
 worktrees and local branches of shipped crates, of crates scrapped over a day ago, and of
 crates the factory doesn't know about. Settings are under `[cleanup]` in `factory.toml`.
 
-### First-time setup for GitHub
+## Tests
+
+The backend has tests that run a real factory in a temporary folder, with stand-ins for
+`claude` and `gh` (so they cost nothing and touch no GitHub repo). Install pytest once, then run
+them from `backend`:
+```
+.venv\Scripts\python -m pip install -e .[test]
+.venv\Scripts\python -m pytest
+```
+They take about a minute. They check that crates ship, survive the backend being killed or
+stopped mid-step, wait at paused machines, cope with a layout saved while they run, follow a red
+belt laid after they were held, and that parallel crates don't clash in git.
+
+## First-time setup for GitHub
 
 - `gh auth login`, then `gh auth setup-git` so `git push` uses the same sign-in.
 - The test project is `workspace/test-project`, connected to the `remote` in
@@ -126,11 +146,12 @@ in any repo you can see (`gh search prs --review-requested=@me`), every two minu
 becomes a crate on the review line:
 - **CI check** waits for the PR's checks to go green. Red checks send the crate to the scrap bin.
 - **PR reviewer** saves the PR's description and diff (no checkout) and has Claude review them
-  with read-only tools. Then it **waits for you**: click the crate, read the draft in its log,
+  with read-only tools. It posts nothing itself.
+- **Approve review** (an Approver) **waits for you**: click the crate, read the draft in its log,
   and press **Approve** to post it, or **Reject** to throw it away without posting anything.
   A note you type before Approve goes at the top of the review. Start the note with
   `Verdict: Comment` to post it as a comment instead of an approval or a request for changes.
-- **Review poster** posts the review as you on GitHub, pinned to the commit Claude read.
+- **Review poster** (a Document writer) posts the review as you on GitHub, pinned to the commit Claude read.
   Claude's first line picks the kind: `Verdict: Approve`, `Verdict: Request changes` or
   `Verdict: Comment`. If new commits arrived in the meantime it posts nothing.
 
@@ -202,7 +223,7 @@ crate failing. When a check passes the banner goes and everything carries on by 
 ### Risk analyser and approving low-risk changes by themselves
 
 Put a **Risk analyser** after the Packager (it reads the PR's diff, so it needs a PR) and
-before the Reviewer. Claude rates the change **low**, **medium** or **high** risk by its blast
+before the Approver. Claude rates the change **low**, **medium** or **high** risk by its blast
 radius: how much could break, for how many people, and how hard it would be to notice and
 undo. Docs and tests are low; a shared helper or a new dependency is medium; auth, security,
 data migrations, public APIs or CI/deploy config are high, and so is anything it can't rate.
@@ -211,15 +232,15 @@ bottom-left corner) and shown in the crate's tooltip, log title and the machine 
 The Reviewer is told the rating too. A crate sent back for rework loses its stamp and is
 rated again on its next pass.
 
-In build mode, a Reviewer that waits for your approval has **Approve by itself when the review
-looks good and the risk is**: *Never: always ask me* (the default), *Low*, or *Low or medium*.
-With *Low*, a crate whose review says "Looks good" and whose stamp is low goes straight on to
-CI; anything higher, or with no stamp, still waits for you, and its log says why. Approving
-this way needs a Risk analyser earlier on the line, and Save says so if there isn't one.
-The PR reviewer on the review line never approves by itself, because its review is posted
-under your name.
+In build mode, an Approver has **Approve by itself when the crate's risk is**: *Never: always
+ask me* (the default), *Low*, or *Low or medium*. With *Low*, a crate whose stamp is low goes
+straight on to CI; anything higher, or with no stamp, still waits for you, and its log says
+why. (A review asking for changes has already left by the Reviewer's red port.) Approving this
+way needs a Risk analyser earlier on the line, and Save says so if there isn't one. The
+Approve review machine on the review line never approves by itself, because its review is
+posted under your name.
 
-Click an **intake** to see what is waiting to come in from each of its sources: the open
+Click an **intake** (or one of its storages) to see what is waiting to come in from each of its sources: the open
 GitHub issues in the repo, the Jira issues your JQL finds, and the pull requests waiting for
 your review. Each row says whether it is already a crate (and where that crate is; **Crate #n**
 opens its log), will come in by itself on the next check (labelled issues, Jira issues and
@@ -253,6 +274,85 @@ the whole factory in view.
 Click any crate to see its log. Stop and restart the backend while the game is running:
 the game reconnects and redraws from the backend's state.
 
+## Belt speed
+
+Crates ride the belts at the belts' own speed, so a longer belt takes longer. Set how fast every
+belt runs with **Belt speed** in the build panel (0.5 to 6 cells a second; it changes straight
+away, no Save needed). The belt animation runs to match.
+
+## Retries
+
+A machine can try a failed crate again by itself: in build mode, click it and set **Retries
+when it fails** (up to 5). The crate goes round the same machine again with why it failed as
+its notes (a Coder sees the error and fixes it), and only when the retries are used up does it
+take its red belt or wait for you. A red belt back to an earlier machine is used instead of
+retries. Run again on a held crate gives it its retries back.
+
+## Crates sent to the wrong machine
+
+Every Claude machine is told what the other kinds of machine do. If a crate isn't its kind of
+work (a Coder given a pull request that only needs merging, say), it changes nothing and says
+which machine it needs. If the line has one, a worker carries the crate straight to it. If it
+doesn't (or the crate has been passed round three times), the crate is rolled back into the
+scrap bin as **Not for this line**, with a rollback label:
+
+- an issue goes back to the to-do list (Jira: the handback transition, usually To Do),
+  unassigned and labelled `needs <machine>` (Jira: `needs-merger`), and is never closed,
+  even by a bin that closes issues;
+- a pull request stays open and gets the same `needs <machine>` label, so a line that has
+  that machine can pick it up with a storage search such as `label:"needs merger"`.
+
+Picking the issue up again takes the old `needs ...` label off.
+
+## Limit crates per line
+
+To stop a line jamming, set **Most crates on the line at once** in its intake's settings (build
+mode, click the intake). When that many crates are on the line (on belts, in machines or waiting
+at a gate for you), new ones wait at the intake and its storages bring nothing new in until one
+leaves. Crates held for you don't count. 0 means no limit.
+
+## Stats, Claude cost and budgets
+
+The chart button in the top bar (next to pause) opens **Factory stats**: crates shipped and
+scrapped, the typical time from intake to dock, how many shipped only after rework, and what
+Claude cost, per day, per line and per machine (runs, time per run, how often it fails and at
+which step). Pick Today, 7 or 30 days at the top. A crate's log shows what Claude has cost on it
+so far. Costs are what Claude Code reports for each run; on a subscription that's what the
+same use would cost on the API, not a bill.
+
+To cap spending, set these in `backend/factory.toml` (0 means no limit) and restart the backend:
+```
+[budget]
+crate_usd = 2      # a crate that has cost this is held before its next Claude machine
+daily_usd = 20     # after this much today, crates wait in front of Claude machines until midnight
+```
+A held crate's Run again lets it carry on past its budget.
+
+## Alerts when the game is closed
+
+The backend can tell you when a crate waits for your approval, is held or scrapped, when
+Claude goes away, or when the day's budget is spent. Add to `backend/factory.toml`:
+```
+[alerts]
+desktop = true                             # a Windows notification on this PC
+webhook = "https://ntfy.sh/some-long-random-topic"   # optional: to your phone (ntfy app)
+on = ["approval", "held", "scrapped", "claude_down", "budget"]   # add "shipped" for every PR
+```
+The webhook can also be a Discord or Slack incoming-webhook URL. Anyone who knows an ntfy topic
+name can read it, so pick a long random one.
+
+## Pausing, and stopping the backend
+
+- **Pause** a machine from its window (click it), a line from its intake's window, or the whole
+  factory with **Pause factory** in the top bar. A crate already in a machine finishes it; the
+  others wait on the belt in front of the next paused machine, and a paused line or factory
+  brings nothing new in from its storages. Paused things are dimmed with a blue pause sign.
+  What's paused is kept in `backend/paused.json`, so it stays paused after a restart.
+- **Closing the game or stopping the backend** doesn't scrap anything any more: when the backend
+  starts again, each crate it left on a belt or in a machine carries on from that machine
+  (which runs again from its first step). Crates waiting for you or held stay where they were.
+  A crate whose line can't run any more waits, held, until the line is back (or you scrap it).
+
 ## Building your own pipelines
 
 Press **Build** in the top bar. The crates hide, a grid appears on the floor and the build
@@ -261,25 +361,79 @@ add. Click anything on the floor to open its own settings window on the left. Yo
 several lines (pipelines), each with its own intake, shipping dock and scrap bin.
 - **Place a machine:** click its button under **Add a machine**, then click an empty spot on
   the floor (Esc stops).
-- **Move** anything (machines, the intake, dock and scrap bin) by dragging it.
+- **Move** anything (machines, the intake, dock and scrap bin) by dragging it. Shift+drag
+  moves its whole line.
+- **Pick several:** Shift+click machines (again to take one out), or hold Shift and drag a box
+  on empty floor. A box also picks the room blocks inside it (walls, windows, doors, belt ports,
+  floor, signs, footbridges and worker doors). Picked things are outlined in blue; drag any of
+  them to move them all, with belts between picked machines keeping their shape, or press
+  Delete to remove them. One Undo puts machines and blocks back together. Esc lets go.
+- **Undo:** Ctrl+Z or the **Undo** button steps back one change at a time: moves, new and
+  removed machines, belts, settings and room pieces, in the order you made them.
 - **Lay a belt:** every machine has two outputs on its right side. Drag from the **green**
-  port (it passed) to the next machine or the dock. Drag from the **red** port (it failed)
-  back to an earlier machine to send failures there for rework, keeping the branch and PR.
-  A machine with no red belt fails into the scrap bin. Belts find their own way round
-  machines; a second rework belt into the same machine joins the first.
-- **Machine settings:** rename it, make it wait for your approval, pick where its failures go,
-  set a time limit for each step, or edit Claude's prompt (Coder and Reviewer). It also lists
-  the machine's steps.
-- **Intake settings:** the line's name and where its crates come from. Tick any of specs typed
-  in the game, GitHub issues, Jira issues and PRs waiting for your review. Each source feeds
-  one line (a source another line takes is greyed out). GitHub and Jira issues go to the line
-  that takes typed specs if no line ticks them. The sources show under each intake.
+  port (it passed) to the next machine or the dock. Drag from the **red** port (it failed) to
+  wherever failed crates should go: back to an earlier machine for rework (keeping the branch
+  and PR), on to any machine or dock, or into a scrap bin. A machine with no red belt holds
+  failed crates for you. Belts find their own way round machines; a second rework belt into
+  the same machine joins the first.
+- **Lay a belt by hand:** turn on **Conveyor belt** at the top of the machine list, then drag
+  from an output across the floor, cell by cell, into where it goes (go back over a cell to take
+  it up; Esc stops). Crates ride the path you laid, at the belt speed, and footbridges you place
+  on its straight parts work like on any belt. If the way is blocked, or you later move something onto
+  it, the belt finds its own way instead. Click a hand-laid belt and press **Let it find its own
+  way** to hand it back to the router. Dragging from a port without Conveyor belt on still links
+  machines the usual way.
+- **Free conveyors and loops:** with **Conveyor belt** on, drag anywhere on open floor. A drag
+  that doesn't run from an output into an input stays where you laid it as a free conveyor; bring
+  it back round to the cell you started on (4 cells or more) to close a loop. Drag on from a free
+  conveyor's end to make it longer; once one run goes from an output into an input it becomes a
+  link and crates ride it. Free conveyors run with the other belts but carry no crates. Click one
+  and press Delete to take it up.
+- **Place first, link later:** machines, docks and bins can go down before there's any line. They
+  sit on a line with no intake (saved, paused until it has one). Place an Intake while that line
+  is picked and it becomes its intake; or belt into one of its machines from another line and it
+  joins that line, along with the machines its belts lead on to.
+- **Splitter and Belt merger:** from the machine list. A Splitter sends crates out of its two
+  east outputs in turn (one each way, then round again). A Belt merger takes belts into either of
+  its two inputs, from any machines or lines, and every crate carries straight on out of its one
+  output. Neither does any work on the crates.
+- **Joining belts:** end a hand-laid belt on the side of another and it runs into it (a merge).
+  From a machine's output into a belt that carries crates, it's a link to wherever that belt goes,
+  and crates run on along it. Conveyors join conveyors the same way. A belt can't branch off
+  another one: use a Splitter for that.
+- **Conveyor bridges:** lay a belt straight over a straight stretch of another and it bridges
+  over it; crates on both carry on through. A bend, a join or a cell already bridged can't be
+  crossed.
+- **More docks and bins:** place **Shipping dock** or **Scrap bin** again from the machine list
+  to add another to the line you're on. Crates ship into whichever dock their line's last belt
+  runs into, and are scrapped (or rolled back) into whichever bin the machine's red belt runs
+  into. Each bin has its own rules (close issues, close PRs, Jira status). Select an extra one
+  and press Delete to remove it.
+- **Machine settings:** rename it, make it wait for your approval (where that's a choice),
+  set a time limit for each step, or edit Claude's prompt. The panel says where the red belt
+  sends failed crates, and lists the machine's steps.
+- **Storages:** issues and PRs come in from **Storage** machines. Place one, pick what it holds
+  (Jira issues, GitHub issues, open PRs, PRs waiting for your review, or PRDs) and give it a
+  filter (a JQL for Jira, a GitHub search for the others; blank uses the default shown). Then
+  drag from its port into an intake: that line takes what's in it. GitHub storages (issues,
+  open PRs, PRDs) can read from their own repo; left blank they read the line's. The line's
+  repo, set on its intake, is where it codes, unless a storage names its own repo: then that
+  storage's crates are coded, branched and PR'd in its repo, so one line can serve several
+  repos. One intake can take several storages of the same source when they differ by repo or
+  filter. Click a
+  storage outside build mode to see what's in it; the number on it is how many aren't crates yet.
+  Layouts saved before storages get one storage per ticked source when they load.
+- **Intake settings:** the line's name, its repo, and whether it also takes specs typed in the
+  game. The sources show under each intake.
 - **Remove:** select a machine or a belt and press Delete (or the Remove button). Removing a
   machine joins the machine before it to the one after it.
 - **Save** sends everything to the backend, which checks it (every machine on one path from
-  the intake to the dock, a Coder before the Packager, rework belts going back, and so on) and
-  only accepts it when the factory is empty. If it refuses, the panel says why. **Cancel**
-  throws the draft away.
+  the intake to the dock, a Coder before the Packager, rework belts going back, and so on). If
+  it refuses, the panel says why. You can save while crates are on the line: a crate inside a
+  machine finishes it, then each carries on at the next machine it was heading for. If that
+  machine is gone it goes to the next one along its old way that's still there (or back to the
+  start of the line), and if its whole line is gone it waits, held, until the line is back or
+  you scrap it. **Cancel** throws the draft away.
 
 The saved layout is `backend/pipelines.json`; delete it to go back to the default (the build
 line from `default_line` in `machines.toml`, or `line.json` if you saved one with an older

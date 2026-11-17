@@ -19,6 +19,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = BACKEND_DIR / "factory.toml"
 CATALOG_FILE = BACKEND_DIR / "machines.toml"
 LINE_FILE = BACKEND_DIR / "line.json"
+MAX_RETRIES = 5  # most times a machine runs a failed crate again by itself
 # Why a crate is scrapped (the same kinds as triage.KINDS).
 SCRAP_KINDS = ("needs_info", "already_done", "blocked", "work_failed", "rejected")
 
@@ -70,11 +71,17 @@ class MachineConfig:
     prompt: str = "{text}"
     # After its steps, a gate machine holds the crate until you approve or reject it.
     gate: bool = False
+    # Whether you choose that in the game: "choice" (the "wait for my approval" tick), "always"
+    # (the Approver: it's what the machine is for) or "never" (the Reviewer only reviews).
+    gate_setting: str = "choice"
     # A parallel machine works on any number of crates at once (for waiting, like CI).
     parallel: bool = False
     # Failures and your send-backs run this same machine again (with why as {notes}), with no
     # belt needed: for a machine whose work is its own reply, like the Planner.
     rework_here: bool = False
+    # Set in the game: when it fails, run the crate through this machine again (with why it
+    # failed as {notes}) up to this many times before its red belt, a bin or holding it.
+    retries: int = 0
     # A gate that also takes its decision from GitHub: an approving PR review lets the crate
     # carry on, and a "request changes" review rejects it with the review as the note.
     github_review: bool = False
@@ -108,11 +115,15 @@ class MachineConfig:
     # matches ([{"port": "out_1", "when": "risk", "value": "high"}, ...]; see graph.RULE_KINDS).
     sorter: bool = False
     rules: list[dict] = field(default_factory=list)
+    # kind = "splitter": a sorter with no rules that sends crates out of its outputs in turn.
+    # kind = "merger": runs no steps; crates from every belt into it carry straight on out.
+    kind: str = ""
 
     def summary(self) -> dict:
         """What the game needs to know about this machine."""
         return {"id": self.id, "type": self.type, "name": self.name, "description": self.description,
                 "sprite": self.sprite, "steps": [s.name for s in self.steps], "gate": self.gate,
+                "gate_setting": self.gate_setting,
                 "prompt": self.prompt if self.has_prompt() else "", "has_prompt": self.has_prompt(),
                 "needs": self.needs, "provides": self.provides, "unique": self.unique,
                 "on_fail": self.on_fail, "uses_agent": self.uses_agent(), "parallel": self.parallel,
@@ -120,7 +131,7 @@ class MachineConfig:
                 "auto_approve": self.auto_approve, "can_auto_approve": self.can_auto_approve,
                 "scrap_bin": self.scrap_bin, "scrap_when": self.scrap_when,
                 "option_specs": self.option_specs, "options": self.options,
-                "sorter": self.sorter, "rules": self.rules}
+                "sorter": self.sorter, "rules": self.rules, "kind": self.kind}
 
     def uses_agent(self) -> bool:
         """True if one of its steps runs Claude (so it pauses while Claude is unavailable)."""
@@ -219,6 +230,13 @@ class Config:
     prd: GitHubIntakeConfig | None = None
     # The repo in [workspace]: lines that don't name their own repo work on it.
     default_repo: RepoConfig | None = None
+    # [budget]: what Claude may cost (as Claude Code reports it), 0 for no limit. A crate over
+    # crate_usd is held before its next Claude machine; once the day's total reaches daily_usd,
+    # crates wait in front of Claude machines until midnight.
+    crate_budget_usd: float = 0.0
+    daily_budget_usd: float = 0.0
+    # [alerts]: tell you outside the game when a crate needs you, is held or scrapped, or ships (alerts.py).
+    alerts: dict = field(default_factory=dict)
 
 
 def resolve_repo(cfg: Config, raw) -> RepoConfig:
@@ -267,7 +285,8 @@ def _machine(raw: dict) -> MachineConfig:
         name=raw["name"],
         steps=[_step(s) for s in raw.get("steps", [])],
         prompt=raw.get("prompt", "{text}"),
-        gate=bool(raw.get("gate", False)),
+        gate=bool(raw.get("gate", False)) if raw.get("gate_setting") != "never" else False,
+        gate_setting=raw.get("gate_setting") if raw.get("gate_setting") in ("always", "never") else "choice",
         parallel=bool(raw.get("parallel", False)),
         rework_here=bool(raw.get("rework_here", False)),
         github_review=bool(raw.get("github_review", False)),
@@ -282,7 +301,8 @@ def _machine(raw: dict) -> MachineConfig:
         auto_approve=_risk_level(raw.get("auto_approve", "")),
         option_specs=[_option_spec(o) for o in raw.get("options", [])],
         options={s["id"]: s["default"] for s in (_option_spec(o) for o in raw.get("options", []))},
-        sorter=str(raw.get("kind", "")) == "sorter",
+        sorter=str(raw.get("kind", "")) in ("sorter", "splitter"),
+        kind=str(raw.get("kind", "")),
     )
 
 
@@ -366,7 +386,7 @@ def build_line(catalog: dict[str, MachineConfig], entries: list[dict]) -> list[M
         m = copy.deepcopy(catalog[entry["type"]])
         m.id = str(entry.get("id") or m.type)
         m.name = str(entry.get("name") or m.name)[:40]
-        if "gate" in entry:
+        if "gate" in entry and m.gate_setting == "choice":
             m.gate = bool(entry["gate"])
             m.github_review = m.github_review and m.gate
         if entry.get("prompt") and m.has_prompt():
@@ -395,11 +415,16 @@ def build_line(catalog: dict[str, MachineConfig], entries: list[dict]) -> list[M
                        for r in entry["rules"] if isinstance(r, dict)]
         if isinstance(entry.get("scrap_when"), list):
             m.scrap_when = [k for k in SCRAP_KINDS if k in entry["scrap_when"]]
+        try:
+            m.retries = max(0, min(MAX_RETRIES, int(entry.get("retries") or 0))) if not m.sorter and m.steps else 0
+        except (TypeError, ValueError):
+            m.retries = 0
         if entry.get("timeout_seconds"):
             for st in m.steps:  # one limit for each of the machine's steps, set in the game
                 st.timeout_seconds = float(entry["timeout_seconds"])
-        if m.on_fail not in {x.id for x in machines}:
+        if "on_fail" not in entry and m.on_fail not in {x.id for x in machines}:
             m.on_fail = ""  # the catalogue's default target isn't earlier in this line
+        # (a red belt you laid can lead anywhere: back for rework, or on to another machine or dock)
         machines.append(m)
     return machines
 
@@ -463,6 +488,9 @@ def load(path: Path = DEFAULT_CONFIG) -> Config:
         ),
         db_path=base / "factory.db",
         scripts_dir=BACKEND_DIR / "scripts",
+        crate_budget_usd=float(raw.get("budget", {}).get("crate_usd", 0) or 0),
+        daily_budget_usd=float(raw.get("budget", {}).get("daily_usd", 0) or 0),
+        alerts=dict(raw.get("alerts", {})),
     )
     remote = str(ws.get("remote", ""))
     cfg.default_repo = RepoConfig(github=github_name(remote) or github_name(cfg.github.repo), path=cfg.repo,

@@ -10,6 +10,8 @@ class Hub:
     def __init__(self, store: Store):
         self.store = store
         self.clients: set[WebSocket] = set()
+        # Called with every event (alerts outside the game listen here). Must not block.
+        self.listeners: list = []
 
     def add(self, ws: WebSocket) -> None:
         self.clients.add(ws)
@@ -22,6 +24,11 @@ class Hub:
 
     async def broadcast(self, event: dict) -> None:
         """Send to every client without logging it (used for fresh snapshots)."""
+        for listen in self.listeners:
+            try:
+                listen(event)
+            except Exception as exc:  # an alert going wrong must not stop the factory
+                print(f"[alerts] {exc}", flush=True)
         dead = []
         for ws in list(self.clients):
             try:

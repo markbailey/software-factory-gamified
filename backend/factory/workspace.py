@@ -7,6 +7,7 @@ never pushes to its base branch.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,11 +23,20 @@ Each crate gets its own branch (crate/<n>) and a pull request.
 """
 
 
+GIT_SECONDS = 90
+
+
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     git = shutil.which("git")
     if not git:
         raise RuntimeError("git is not installed or not on PATH")
-    result = subprocess.run([git, *args], cwd=cwd, capture_output=True, text=True)
+    # Never wait on a sign-in prompt nobody can see: fail instead, and say so.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        result = subprocess.run([git, *args], cwd=cwd, capture_output=True, text=True, env=env,
+                                stdin=subprocess.DEVNULL, timeout=GIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git {' '.join(args)} took over {GIT_SECONDS}s (is it waiting for a sign-in?)")
     if check and result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {(result.stderr or result.stdout).strip()}")
     return result

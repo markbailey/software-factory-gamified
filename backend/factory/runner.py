@@ -15,6 +15,42 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 TIMEOUT_EXIT_CODE = -9
+STOPPED_EXIT_CODE = -15  # stopped because the backend is shutting down
+
+# Running processes, so the backend can stop them all when it shuts down. Each runs in its own
+# process group: Ctrl+C in the backend's window doesn't reach it (and fail its step); the
+# backend stops it itself, and the crate carries on from that machine when it starts again.
+_live: set[subprocess.Popen] = set()
+_live_lock = threading.Lock()
+_stopping = threading.Event()
+_GROUP = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+          else {"start_new_session": True})
+
+
+def stop_all() -> None:
+    """Stop every running command (and what it started) for a shutdown."""
+    _stopping.set()
+    with _live_lock:
+        procs = list(_live)
+    for proc in procs:
+        _kill_tree(proc)
+
+
+def stopping() -> bool:
+    return _stopping.is_set()
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":  # claude.cmd starts node: take the whole tree
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=15)
+        else:
+            os.killpg(proc.pid, 9)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 class CommandNotAllowed(Exception):
@@ -70,12 +106,15 @@ async def run(
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                **_GROUP,
             )
+            with _live_lock:
+                _live.add(proc)
             timed_out = threading.Event()
             if timeout:
                 def kill() -> None:
                     timed_out.set()
-                    proc.kill()
+                    _kill_tree(proc)
                 timer = threading.Timer(timeout, kill)
                 timer.start()
             if stdin_text is not None:
@@ -88,7 +127,11 @@ async def run(
             for line in proc.stdout:
                 emit("line", line.rstrip("\r\n"))
             code = proc.wait()
-            if timed_out.is_set():
+            with _live_lock:
+                _live.discard(proc)
+            if _stopping.is_set():
+                code = STOPPED_EXIT_CODE
+            elif timed_out.is_set():
                 emit("line", f"[runner] timed out after {timeout:.0f}s and was stopped")
                 code = TIMEOUT_EXIT_CODE
         except Exception as exc:  # report launch failures as log lines

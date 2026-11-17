@@ -27,6 +27,11 @@ if staged.returncode == 0:  # nothing staged
     if reply:
         print(reply, flush=True)
     sys.exit(1)
+markers = subprocess.run([git, "diff", "--cached", "-G", r"^(<<<<<<<|>>>>>>>) ", "--name-only"],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.split()
+if markers:
+    print(f"Merge conflict markers are still in: {', '.join(markers)}. The Coder must resolve them.", flush=True)
+    sys.exit(1)
 files = subprocess.run([git, "diff", "--cached", "--name-only"], capture_output=True, text=True,
                        encoding="utf-8", errors="replace").stdout.split()
 print(f"{len(files)} file(s) changed.", flush=True)

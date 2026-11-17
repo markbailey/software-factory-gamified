@@ -1,12 +1,14 @@
 """Verifier: is the crate's issue still open, still wanted, and free to work on?
 
-    verify_issue.py SOURCE REF GITHUB_REPO [JIRA_URL JIRA_EMAIL JIRA_TOKEN_ENV]
+    verify_issue.py SOURCE REF GITHUB_REPO [JIRA_URL JIRA_EMAIL JIRA_TOKEN_ENV [STALE_DAYS]]
 
-Looks the issue up again at its source (it may have changed since it came in):
+Looks the issue (or PR) up again at its source (it may have changed since it came in):
   GitHub  closed (as done, not planned or a duplicate), labelled duplicate / wontfix / invalid
           / blocked / needs info, or "depends on #n" / "blocked by #n" an issue that's still open.
   Jira    in a Done status, resolved, or linked "is blocked by" an issue that isn't done.
-Crates typed in the game or PRs have nothing to look up, so they pass.
+  PR      (source github_pr) merged or closed, every issue it closes already closed, labelled
+          as above, or untouched for STALE_DAYS days (0 or empty: never stale).
+Crates typed in the game or PRs sent for review have nothing to look up, so they pass.
 
 Passing prints what it checked and exits 0. Otherwise prints OUTCOME <needs_info |
 already_done | blocked>, NO_REWORK and why, and exits 1: the crate leaves by the red port and
@@ -15,6 +17,7 @@ its issue is handed back with the reason.
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import json
 import os
 import re
@@ -94,6 +97,48 @@ def check_github(ref: str, repo: str) -> None:
     print("Open, not labelled as blocked or a duplicate, and nothing it depends on is still open.", flush=True)
 
 
+def check_pr(ref: str, repo: str, stale_days: str) -> None:
+    number = ref.lstrip("#")
+    fields = "number,title,state,isDraft,labels,updatedAt,closingIssuesReferences,url"
+    pr = gh_json("pr", "view", number, "--repo", repo, "--json", fields)
+    print(f"GitHub PR #{number}: {pr.get('title', '')}", flush=True)
+    state = str(pr.get("state", "")).upper()
+    if state == "MERGED":
+        fail("already_done", "it's merged")
+    if state == "CLOSED":
+        fail("already_done", "it's closed")
+    for label in pr.get("labels", []) or []:
+        hit = LABEL_OUTCOMES.get(label_key(str(label.get("name", ""))))
+        if hit:
+            fail(*hit)
+    fixes = pr.get("closingIssuesReferences") or []
+    if fixes:
+        still_open = []
+        for issue in fixes:
+            owner = ((issue.get("repository") or {}).get("owner") or {}).get("login", "")
+            name = (issue.get("repository") or {}).get("name", "")
+            where = f"{owner}/{name}" if owner and name else repo
+            other = gh_json("issue", "view", str(issue.get("number")), "--repo", where, "--json", "state,title")
+            done = str(other.get("state", "")).upper() == "CLOSED"
+            print(f"  closes #{issue.get('number')} ({other.get('title', '')}): {'closed' if done else 'open'}",
+                  flush=True)
+            if not done:
+                still_open.append(issue)
+        if not still_open:
+            fail("already_done", "every issue it was going to close is closed already, so it isn't needed")
+    days = int(stale_days) if str(stale_days).strip().isdigit() else 0
+    updated = str(pr.get("updatedAt") or "")
+    if days and updated:
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        except ValueError:
+            age = None
+        if age is not None and age.days >= days:
+            fail("already_done", f"nobody has touched it for {age.days} days (stale after {days})")
+    print("Open, not labelled as blocked or a duplicate, its issues still open"
+          + (f", and touched in the last {days} days." if days else "."), flush=True)
+
+
 def check_jira(key: str, base_url: str, email: str, token_env: str) -> None:
     token = os.environ.get(token_env or "JIRA_API_TOKEN", "")
     if not base_url or not token:
@@ -138,9 +183,14 @@ def check_jira(key: str, base_url: str, email: str, token_env: str) -> None:
 
 
 def main() -> None:
-    args = sys.argv[1:] + [""] * 6
-    source, ref, repo, jira_url, jira_email, jira_token_env = args[:6]
-    if source == "github" and ref:
+    args = sys.argv[1:] + [""] * 7
+    source, ref, repo, jira_url, jira_email, jira_token_env, stale_days = args[:7]
+    if source == "github_pr" and ref:
+        if not repo:
+            print("No GitHub repo for this line; nothing to check at the source.", flush=True)
+            return
+        check_pr(ref, repo, stale_days)
+    elif source == "github" and ref:
         if not repo:
             print("No GitHub repo for this line; nothing to check at the source.", flush=True)
             return

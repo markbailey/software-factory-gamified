@@ -13,19 +13,25 @@ A pipeline is a small graph saved in pipelines.json:
     }]}
 
 Every machine has a "pass" output and an optional "fail" output. Following pass belts from
-the intake gives the order crates travel in, and must end at the dock. Failed crates leave
-by the fail belt: back to an earlier machine on that path (rework), or into the scrap bin.
-Only a machine whose fail belt runs to the bin ever scraps a crate, and only for the reasons
-in its "scrap_when" (all of them unless set). A crate it can't send on (no fail belt, a
-reason it doesn't scrap for, or rework used up) waits at the machine until you run it again
-or scrap it yourself.
+the intake gives the order crates travel in, and must end at a dock or a scrap bin. Failed
+crates leave by the fail belt, wherever it runs: back to an earlier machine on that path
+(rework), into a scrap bin, or on to any other machine or dock (a branch, like a sorter's:
+the crate carries on along that machine's belts, and its route records "<machine>=fail").
+Only a machine whose fail belt runs to the bin scraps a crate there, and only for the
+reasons in its "scrap_when" (all of them unless set). A crate it can't send on (no fail
+belt, a reason it doesn't scrap for, or rework used up) waits at the machine until you run
+it again or scrap it yourself. A crate whose belts end in a bin is scrapped there.
 "path" is the belt's cells as the game laid them out; the backend only stores it.
 
-sources says where a pipeline's crates come from (its intake's settings): any of "game"
-(typed in the game), "github", "jira", "pr_review" and "prd". Each source feeds at most one
-pipeline, except that GitHub issues and PRDs come from the pipeline's own repo, so pipelines
-on different repos can each take them. Older files have a single "source" instead;
-sources_of() reads both.
+"storages" are the places issues and PRs come in from: each holds one source ("github",
+"jira", "pr_review", "prd" or "github_pr", open PRs to check are still needed) with its own
+filter ("query": a JQL or a GitHub search), and has a belt from its "out" port into the
+pipeline's intake. "sources" holds only "game" (specs typed in the game), when the intake
+takes those. sources_of() gives both together. Each source feeds at most one pipeline,
+except that one with its own filter can feed as many as have different filters, and GitHub
+issues and PRDs come from the pipeline's own repo, so pipelines on different repos can each
+take them. Files saved before storages (version < 5) list every source in "sources" (or a
+single "source"), with the searches in "queries"; they're moved into storages on load.
 
 "repo" is the repo the pipeline works on: {"github": "owner/name", "path": "folder",
 "base_branch": "main"}, each optional (config.resolve_repo). Left out, it's the repo in
@@ -40,13 +46,13 @@ from pathlib import Path
 from .config import BACKEND_DIR, SCRAP_KINDS, MachineConfig, github_name, missing_needs, need_words
 
 PIPELINES_FILE = BACKEND_DIR / "pipelines.json"
-SOURCES = ("game", "github", "jira", "pr_review", "prd")
+SOURCES = ("game", "github", "jira", "pr_review", "prd", "github_pr")
 # What a crate already has when it enters from this source (a PR to review comes with its PR).
-SOURCE_PROVIDES = {"pr_review": ("pr",)}
+SOURCE_PROVIDES = {"pr_review": ("pr",), "github_pr": ("pr",)}
 # Sources that read the pipeline's own repo (its issues), so one per repo rather than one in all.
-REPO_SOURCES = ("github", "prd")
+REPO_SOURCES = ("github", "prd", "github_pr")
 SOURCE_WORDS = {"game": "typed specs", "github": "GitHub issues", "jira": "Jira issues",
-                "pr_review": "PRs to review", "prd": "PRDs"}
+                "pr_review": "PRs to review", "prd": "PRDs", "github_pr": "open PRs"}
 
 
 def repo_settings(p: dict) -> dict:
@@ -75,7 +81,56 @@ def repo_key(p: dict) -> str:
     raw = repo_settings(p)
     return (github_name(raw.get("github", "")) or raw.get("path", "")).lower()
 STATIONS = ("intake", "dock", "scrap")
-RESERVED_PREFIXES = ("belt_", "return_", "rework_in_", "scrap_")
+RESERVED_PREFIXES = ("belt_", "return_", "rework_in_", "scrap_", "store_")
+# Storages: "storages": [{"id": "store_1", "source": "jira", "query": "...", "pos": [x, y]}, ...],
+# each with one belt from its "out" port into its own pipeline's intake. A storage watches one
+# source (with its own search) and its intake takes crates from it. Ids are unique in the factory.
+STORE_ID = re.compile(r"^store_\d+$")
+STORE_SOURCES = ("github", "jira", "github_pr", "pr_review", "prd")
+# Storages whose own repo ("repo") is where their crates are worked on: the GitHub ones read
+# from it too; a Jira storage's crates are coded in it.
+WORK_REPO_SOURCES = ("github", "prd", "github_pr", "jira")
+
+
+def storages_of(p: dict) -> list[dict]:
+    """A pipeline's storages (each a dict with id, source, query and pos)."""
+    raw = p.get("storages")
+    return [s for s in raw if isinstance(s, dict)] if isinstance(raw, list) else []
+
+
+def storage_repo(p: dict, source: str) -> str:
+    """The GitHub repo (owner/name) the storage of this source belted into p's intake reads,
+    when it has its own; "" means the line's repo."""
+    for st in fed_storages(p):
+        if st.get("source") == source and str(st.get("repo") or "").strip():
+            return github_name(str(st["repo"])) or ""
+    return ""
+
+
+def source_keys(p: dict) -> list[tuple[str, str]]:
+    """(source, key) for each source a pipeline takes, where the key says what one pipeline at
+    a time can take: GitHub issues, PRDs and open PRs per repo, and per filter for a source with
+    its own filter. A line with storages has one per storage (several storages of a source can
+    feed it, each from its own repo or with its own filter)."""
+    def key(source: str, repo: str, query: str) -> str:
+        k = f"{source}@{repo.lower()}" if source in REPO_SOURCES else source
+        return k + ("?" + " ".join(query.split()).lower() if query.strip() else "")
+    if "storages" not in p:
+        queries = queries_of(p)
+        return [(s, key(s, repo_key(p), queries.get(s, ""))) for s in sources_of(p)]
+    out = [("game", "game")] if "game" in sources_of(p) else []
+    for st in fed_storages(p):
+        source = str(st.get("source", ""))
+        repo = (github_name(str(st.get("repo") or "")) or repo_key(p)) if source in REPO_SOURCES else ""
+        out.append((source, key(source, repo, str(st.get("query") or "") if source in QUERY_SOURCES else "")))
+    return out
+
+
+def fed_storages(p: dict) -> list[dict]:
+    """The storages whose belt runs into this pipeline's intake."""
+    into = {str(b.get("from", "")) for b in p.get("belts", [])
+            if isinstance(b, dict) and b.get("port") == "out" and str(b.get("to", "")) in ("intake", f"{p.get('id')}:intake")}
+    return [s for s in storages_of(p) if str(s.get("id", "")) in into]
 # Extra scrap bins you place in build mode: "bins": [{"id": "scrap_2", "pos": [x, y]}, ...].
 # Red belts can run into any of a pipeline's bins ("scrap" or one of these).
 BIN_ID = re.compile(r"^scrap_\d+$")
@@ -84,30 +139,78 @@ BIN_ID = re.compile(r"^scrap_\d+$")
 def bins_of(p: dict) -> list[str]:
     """The ids of a pipeline's scrap bins: "scrap" and any extra ones."""
     return ["scrap"] + [str(b.get("id", "")) for b in p.get("bins", []) if isinstance(b, dict)]
+
+
+# Extra shipping docks, the same way: "docks": [{"id": "dock_2", "pos": [x, y]}, ...]. A line's
+# crates ship into whichever dock its last belt runs into.
+DOCK_ID = re.compile(r"^dock_\d+$")
+
+
+def docks_of(p: dict) -> list[str]:
+    """The ids of a pipeline's shipping docks: "dock" and any extra ones."""
+    return ["dock"] + [str(d.get("id", "")) for d in p.get("docks", []) if isinstance(d, dict)]
+
+
+def is_dock_node(node: str) -> bool:
+    place = node.rsplit(":", 1)[-1]
+    return place == "dock" or bool(DOCK_ID.match(place))
 ROW = 3  # the row the default layout puts the line on
 STRIDE = 4  # cells per belt (2) + machine (2) in the default layout
 
 
+QUERY_SOURCES = ("github", "jira", "github_pr", "pr_review")  # sources a storage can search with its own filter
+
+
+def queries_of(p: dict) -> dict[str, str]:
+    """The intake's own searches: {"jira": JQL, "github": a GitHub issue search, "github_pr": a
+    GitHub PR search (default author:@me)}. Set, the line
+    takes the issues that match instead of the factory-wide JQL or the `factory` label."""
+    if "storages" in p:  # a storage's filter
+        raw = {str(s.get("source", "")): s.get("query", "") for s in fed_storages(p)}
+    else:
+        raw = p.get("queries") if isinstance(p.get("queries"), dict) else {}
+    return {k: " ".join(str(raw.get(k) or "").split())[:1000] for k in QUERY_SOURCES if str(raw.get(k) or "").strip()}
+
+
+def max_crates(p: dict) -> int:
+    """At most this many crates on the line at once (0: no limit). More wait at the intake, and
+    its storages bring nothing new in while it's full."""
+    try:
+        return max(0, int(p.get("max_crates") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def check_only(p: dict) -> bool:
+    """The intake's "only check these issues" tick: crates are checked and labelled (a Verifier,
+    a Labeller), never worked on, so nothing is assigned or moved to In Progress."""
+    return bool(p.get("check_only"))
+
+
 def sources_of(p: dict) -> list[str]:
-    """The sources a pipeline's intake takes crates from."""
+    """The sources a pipeline's intake takes crates from: specs typed in the game if it's
+    ticked, and the source of each storage belted into it."""
     raw = p.get("sources")
-    if isinstance(raw, list):
-        return [str(s) for s in raw]
-    return [str(p.get("source", "game"))]
+    own = [str(s) for s in raw] if isinstance(raw, list) else [str(p.get("source", "game"))]
+    if "storages" not in p:  # saved before storages: the intake's ticks say it all
+        return own
+    return [s for s in own if s == "game"] + [str(s.get("source", "")) for s in fed_storages(p)]
 
 
 # Machine types that were merged into another: old saved layouts load as the new type, with
 # these settings so they keep working the way they did.
 RENAMED_TYPES = {
     "pr_checks": ("ci", {}),  # CI check and CI monitor are one CI machine now
-    "pr_reviewer": ("reviewer", {"fail_on_changes": False, "comment_on_pr": False, "github_review": False}),
+    "pr_reviewer": ("reviewer", {"fail_on_changes": False, "comment_on_pr": False}),
     "pr_poster": ("doc_writer", {}),  # the Review poster and Issue maker are one Document writer
     "issue_maker": ("doc_writer", {}),
 }
 REVIEW_LINE_OPTIONS = RENAMED_TYPES["pr_reviewer"][1]
 
 
-FILE_VERSION = 2  # 2: scrapping needs a fail belt to the scrap bin
+FILE_VERSION = 5  # 2: scrapping needs a fail belt to the scrap bin; 3: the Approver waits, not the Reviewer;
+# 4: a Document writer writes the PR's title and description, not the Packager; 5: issues and PRs
+# come from storages belted into the intake, not from its ticks
 
 
 def read(path: Path = PIPELINES_FILE) -> list[dict] | None:
@@ -126,7 +229,193 @@ def read(path: Path = PIPELINES_FILE) -> list[dict] | None:
                 mid = m.get("id") if isinstance(m, dict) else None
                 if mid and not any(b.get("from") == mid and b.get("port") == "fail" for b in belts):
                     belts.append({"from": mid, "port": "fail", "to": "scrap"})
+    if int(data.get("version", 1) or 1) < 3 and isinstance(pipelines, list):
+        add_approvers(pipelines)
+    if int(data.get("version", 1) or 1) < 4 and isinstance(pipelines, list):
+        add_pr_writers(pipelines)
+    if int(data.get("version", 1) or 1) < 5 and isinstance(pipelines, list):
+        add_storages(pipelines)
     return pipelines
+
+
+def _taken_cells(pipelines: list[dict]) -> set:
+    """Every cell a machine, station, bin or laid belt covers, in the whole factory."""
+    taken = set()
+    for q in pipelines:
+        if not isinstance(q, dict):
+            continue
+        for place in [q.get(s) for s in STATIONS] + list(q.get("machines", [])) + list(q.get("bins", [])) \
+                + list(q.get("docks", [])) + storages_of(q):
+            if isinstance(place, dict):
+                taken.update(_footprint(place.get("pos")))
+        for b in q.get("belts", []):
+            for cell in b.get("path", []) if isinstance(b, dict) else []:
+                if isinstance(cell, (list, tuple)) and len(cell) == 2:
+                    taken.add((int(cell[0]), int(cell[1])))
+        for conv in conveyors_of(q):
+            taken.update(tuple(c) for c in conv["cells"])
+    return taken
+
+
+def conveyors_of(p: dict) -> list[dict]:
+    """Conveyors laid by hand that link nothing: [{id, cells: [[x, y], ...], loop?}]. Only drawn;
+    no crate rides them. Cells that don't follow on from the one before are cut off."""
+    out = []
+    raw = p.get("conveyors") if isinstance(p, dict) else None
+    for i, conv in enumerate(raw if isinstance(raw, list) else []):
+        if not isinstance(conv, dict) or not isinstance(conv.get("cells"), list):
+            continue
+        cells = []
+        for c in conv["cells"][:2000]:
+            if not (isinstance(c, (list, tuple)) and len(c) == 2):
+                break
+            try:
+                cell = [int(c[0]), int(c[1])]
+            except (TypeError, ValueError):
+                break
+            if cells and abs(cell[0] - cells[-1][0]) + abs(cell[1] - cells[-1][1]) != 1:
+                break
+            cells.append(cell)
+        if not cells:
+            continue
+        item = {"id": str(conv.get("id") or f"conv_{i + 1}")[:40], "cells": cells}
+        if conv.get("loop") and len(cells) >= 4:
+            item["loop"] = True
+        if conv.get("join") and not item.get("loop"):
+            item["join"] = True  # runs into another conveyor's side
+        out.append(item)
+    return out
+
+
+def add_storages(pipelines: list[dict]) -> None:
+    """Saved when the intake's ticks picked its sources: a storage for each ticked source but
+    typed specs (with the intake's search for it), left of the intake and belted into it."""
+    taken = _taken_cells(pipelines)
+    n = 1
+    for p in pipelines:
+        if not isinstance(p, dict):
+            continue
+        raw = p.get("sources")
+        ticked = [str(s) for s in raw] if isinstance(raw, list) else [str(p.get("source", "game"))]
+        queries = p.get("queries") if isinstance(p.get("queries"), dict) else {}
+        stores: list[dict] = []
+        intake = _pos((p.get("intake") or {}).get("pos")) if isinstance(p.get("intake"), dict) else ()
+        for source in ticked:
+            if source not in STORE_SOURCES:
+                continue
+            pos = _spot_left_of(intake, taken)
+            taken.update(_footprint(pos))
+            sid = f"store_{n}"
+            n += 1
+            store = {"id": sid, "source": source, "pos": list(pos)}
+            if str(queries.get(source) or "").strip():
+                store["query"] = str(queries[source]).strip()
+            stores.append(store)
+            p.setdefault("belts", []).append({"from": sid, "port": "out", "to": "intake"})
+        p["storages"] = stores
+        p["sources"] = [s for s in ticked if s == "game"]
+        p.pop("queries", None)
+        p.pop("source", None)
+
+
+def _spot_left_of(near: tuple[int, ...], taken: set) -> tuple[int, int]:
+    """A free 2x2 place left of near (an intake's top-left cell), above or below if that's taken."""
+    x0, y0 = (near + (0, 0))[:2] if len(near) >= 2 else (0, 0)
+    for dx in (-4, -7, -10, -13):
+        for dy in (0, 3, -3, 6, -6):
+            x, y = x0 + dx, y0 + dy
+            room = {(x + i, y + j) for i in range(-1, 3) for j in range(-1, 3)}
+            if not room & taken:
+                return (x, y)
+    return (x0 - 16, y0)
+
+
+def add_pr_writers(pipelines: list[dict]) -> None:
+    """Saved when the Packager wrote the PR's description itself: put a Document writer in front
+    of each Packager (on the belts that ran into it), so PRs keep their filled-in template."""
+    taken = _taken_cells(pipelines)
+    ids = {str(m.get("id")) for q in pipelines if isinstance(q, dict) for m in q.get("machines", []) if isinstance(m, dict)}
+    for p in pipelines:
+        if not isinstance(p, dict):
+            continue
+        belts = p.setdefault("belts", [])
+        for m in list(p.get("machines", [])):
+            if not isinstance(m, dict) or m.get("type") != "packager":
+                continue
+            mid = str(m["id"])
+            wid, n = f"{mid}_writer", 2
+            while wid in ids:
+                wid, n = f"{mid}_writer_{n}", n + 1
+            ids.add(wid)
+            pos = _free_spot(_pos(m.get("pos")), taken)
+            taken.update(_footprint(pos))
+            p["machines"].append({"id": wid, "type": "doc_writer", "name": "PR writer", "pos": list(pos)})
+            for q in pipelines:  # belts from any line can run into it
+                for b in q.get("belts", []) if isinstance(q, dict) else []:
+                    if isinstance(b, dict) and b.get("to") == mid and b.get("port") != "fail":
+                        b["to"] = wid
+                        b.pop("path", None)
+            belts.append({"from": wid, "port": "pass", "to": mid})
+
+
+def add_approvers(pipelines: list[dict]) -> None:
+    """Saved when the Reviewer waited for your approval itself: put an Approver after each
+    Reviewer that did, with its auto-approve and GitHub review settings, on its green belt
+    (the Approver's red belt goes where the Reviewer's does). The Reviewer then only reviews."""
+    taken = _taken_cells(pipelines)
+    ids = {str(m.get("id")) for q in pipelines if isinstance(q, dict) for m in q.get("machines", []) if isinstance(m, dict)}
+    for p in pipelines:
+        if not isinstance(p, dict):
+            continue
+        belts = p.setdefault("belts", [])
+        for m in list(p.get("machines", [])):
+            if not isinstance(m, dict) or m.get("type") != "reviewer":
+                continue
+            options = m.get("options") if isinstance(m.get("options"), dict) else {}
+            github = options.pop("github_review", True)
+            waited = m.pop("gate", None) is not False  # unset meant the Reviewer's default: wait
+            auto = m.pop("auto_approve", None)
+            if not waited:
+                continue
+            mid = str(m["id"])
+            aid = f"{mid}_approver"
+            n = 2
+            while aid in ids:
+                aid, n = f"{mid}_approver_{n}", n + 1
+            ids.add(aid)
+            pos = _free_spot(_pos(m.get("pos")), taken)
+            taken.update(_footprint(pos))
+            approver = {"id": aid, "type": "approver", "name": "Approver", "pos": list(pos),
+                        "options": {"github_review": bool(github)}}
+            if auto:
+                approver["auto_approve"] = auto
+            if m.get("scrap_when") is not None:
+                approver["scrap_when"] = m["scrap_when"]
+            p["machines"].append(approver)
+            for b in belts:
+                if isinstance(b, dict) and b.get("from") == mid and b.get("port") == "pass":
+                    belts.append({"from": aid, "port": "pass", "to": b["to"]})
+                    b["to"] = aid
+                    b.pop("path", None)
+                    break
+            fail = next((b for b in belts if isinstance(b, dict) and b.get("from") == mid and b.get("port") == "fail"), None)
+            if fail is not None:
+                belts.append({"from": aid, "port": "fail", "to": fail["to"]})
+
+
+def _free_spot(near: tuple[int, ...], taken: set) -> tuple[int, int]:
+    """The nearest 2x2 place to near (a machine's top-left cell) that nothing covers, with a
+    cell of room around it for belts."""
+    x0, y0 = (near + (0, 0))[:2] if len(near) >= 2 else (0, 0)
+    for r in range(3, 40):
+        for dx, dy in [(0, r), (r, 0), (0, -r), (-r, 0), (r, r), (-r, r), (r, -r), (-r, -r)]:
+            x, y = x0 + dx, y0 + dy
+            if x < 0 or y < 0:
+                continue
+            room = {(x + i, y + j) for i in range(-1, 3) for j in range(-1, 3)}
+            if not room & taken:
+                return (x, y)
+    return (x0, y0 + 40)
 
 
 def migrate(pipelines):
@@ -183,9 +472,12 @@ def review_line(catalog: dict) -> dict | None:
     if not all(k in catalog for k in kinds):
         return None
     # The build line has the "ci" and "reviewer" ids; ids are unique across lines. The
-    # Reviewer here only drafts a review for you to approve: the Review poster posts it.
+    # Reviewer here only drafts a review; you approve it at the Approver, and the Review poster
+    # posts it.
     entries = [{"type": "ci", "id": "pr_checks"},
                {"type": "reviewer", "id": "pr_reviewer", "name": "PR reviewer", "options": dict(REVIEW_LINE_OPTIONS)},
+               *([{"type": "approver", "id": "pr_approver", "name": "Approve review",
+                   "options": {"github_review": False}}] if "approver" in catalog else []),
                {"type": "doc_writer", "id": "pr_poster"}]
     return from_line(entries, "review", "Review line", "pr_review", row=ROW + 8)
 
@@ -198,7 +490,7 @@ def plan_line(catalog: dict, pipelines: list[dict]) -> dict | None:
         return None
     rows = [ROW]
     for p in pipelines:
-        for place in [p.get(s, {}) for s in STATIONS] + list(p.get("machines", [])) + list(p.get("bins", [])):
+        for place in [p.get(s, {}) for s in STATIONS] + list(p.get("machines", [])) + list(p.get("bins", [])) + list(p.get("docks", [])):
             pos = place.get("pos") if isinstance(place, dict) else None
             if isinstance(pos, (list, tuple)) and len(pos) == 2:
                 rows.append(int(pos[1]))
@@ -208,7 +500,7 @@ def plan_line(catalog: dict, pipelines: list[dict]) -> dict | None:
 def is_station(node: str) -> bool:
     """intake, dock or a scrap bin ("scrap", "scrap_2"), bare or as "<pipeline>:<station>"."""
     place = node.rsplit(":", 1)[-1]
-    return place in STATIONS or bool(BIN_ID.match(place))
+    return place in STATIONS or bool(BIN_ID.match(place)) or bool(DOCK_ID.match(place))
 
 
 def is_bin_node(node: str) -> bool:
@@ -221,6 +513,50 @@ def qualify(pid: str, node: str) -> str:
     without its pipeline ("dock") belongs to the belt's own pipeline ("build:dock")."""
     node = str(node or "")
     return f"{pid}:{node}" if is_station(node) and ":" not in node else node
+
+
+def rehome(pipelines) -> list[str]:
+    """Put each machine on the line that runs crates through it. A machine placed while
+    another line was picked in the build panel belongs to that line, though only this line's
+    belts reach it; it would pause its line ("isn't on the path from the intake to the dock").
+    A machine that no way from its own intake reaches, but that exactly one other line's ways
+    do, moves to that line with the belts that leave it. Returns the machines it moved."""
+    if not isinstance(pipelines, list):
+        return []
+    ps = [p for p in pipelines if isinstance(p, dict) and isinstance(p.get("machines", []), list)
+          and isinstance(p.get("belts", []), list)]
+    reach: dict[str, set] = {}
+    for p in ps:
+        try:
+            reach[str(p.get("id", ""))] = {mid for way in paths(p, ps) for mid in way["order"]}
+        except (KeyError, TypeError, AttributeError, ValueError):
+            return []  # not a layout we can follow: check() will say what's wrong
+    moved = []
+    for q in ps:
+        qid = str(q.get("id", ""))
+        for m in list(q.get("machines", [])):
+            mid = m.get("id") if isinstance(m, dict) else None
+            if not mid or mid in reach.get(qid, set()):
+                continue
+            homes = [p for p in ps if mid in reach.get(str(p.get("id", "")), set())]
+            if len(homes) != 1 or homes[0] is q:
+                continue
+            to = homes[0]
+            tid = str(to.get("id", ""))
+            q["machines"].remove(m)
+            to.setdefault("machines", []).append(m)
+            keep = []
+            for b in q.get("belts", []):
+                if not isinstance(b, dict) or b.get("from") != mid:
+                    keep.append(b)
+                    continue
+                end = qualify(qid, str(b.get("to", "")))
+                if end.startswith(tid + ":"):
+                    end = end[len(tid) + 1:]
+                to.setdefault("belts", []).append({**b, "to": end})
+            q["belts"] = keep
+            moved.append(mid)
+    return moved
 
 
 def all_outputs(pipelines: list[dict]) -> dict[tuple[str, str], str]:
@@ -248,16 +584,23 @@ RULE_NEEDS = {"risk": "risk", "files": "worktree", "size": "worktree"}
 RULE_WORDS = {"risk": "risk", "files": "the files it changes", "size": "the size of its change"}
 
 
+SPLITTER = "splitter"  # a sorter with no rules: crates go out of its outputs in turn
+
+
 def is_sorter(m: dict | None) -> bool:
-    return isinstance(m, dict) and m.get("type") == SORTER
+    return isinstance(m, dict) and m.get("type") in (SORTER, SPLITTER)
+
+
+FAIL = "fail"  # in a route: the crate left this machine by its red belt, onward (not for rework)
 
 
 def parse_route(text: str) -> dict[str, str]:
-    """A crate's choices at sorters, as saved ("sort_1=out_2,sort_2=out_5"): {sorter: port}."""
+    """A crate's choices at sorters, and the red belts it took onward, as saved
+    ("sort_1=out_2,tester=fail"): {machine: port}."""
     route = {}
     for part in str(text or "").split(","):
         sorter, _, port = part.partition("=")
-        if sorter.strip() and port.strip() in SORTER_PORTS:
+        if sorter.strip() and (port.strip() in SORTER_PORTS or port.strip() == FAIL):
             route[sorter.strip()] = port.strip()
     return route
 
@@ -267,7 +610,10 @@ def route_text(route: dict[str, str]) -> str:
 
 
 def _next(out: dict, m: dict, route: dict[str, str] | None) -> str | None:
-    """Where a crate leaving machine m goes: its pass belt, or a sorter's chosen output."""
+    """Where a crate leaving machine m goes: its pass belt, a sorter's chosen output, or its red
+    belt if it failed and the red belt leads on."""
+    if (route or {}).get(str(m["id"])) == FAIL:
+        return out.get((str(m["id"]), FAIL))
     if is_sorter(m):
         port = (route or {}).get(str(m["id"]))
         return out.get((str(m["id"]), port)) if port else None
@@ -291,19 +637,21 @@ def chain(pipeline: dict, pipelines: list[dict] | None = None, route: dict[str, 
 
 
 def end_of(pipeline: dict, pipelines: list[dict] | None = None, route: dict[str, str] | None = None) -> str:
-    """Where this pipeline's crates ship: the dock its pass belts end at ("build:dock")."""
+    """Where this pipeline's crates end up: the dock its belts end at ("build:dock"), or a scrap
+    bin (they're scrapped there)."""
     pipelines = pipelines if pipelines is not None else [pipeline]
     out = all_outputs(pipelines)
     last = chain(pipeline, pipelines, route)
     at = (_next(out, last[-1], route) if last else out.get((f"{pipeline['id']}:intake", "out"))) or ""
-    return at if at.endswith(":dock") else f"{pipeline['id']}:dock"
+    return at if is_dock_node(at) or is_bin_node(at) else f"{pipeline['id']}:dock"
 
 
 def paths(pipeline: dict, pipelines: list[dict] | None = None, limit: int = 64) -> list[dict]:
-    """Every way through the pipeline from its intake, branching at sorters: [{"order": [machine
-    ids], "end": the node it stops at ("build:dock", or "" if a belt is missing), "route":
-    {sorter: port}, "stop": "" (reached a dock), "none" (nothing on an output), "loop" or
-    "lost" (a belt into something that isn't a machine or dock)}]."""
+    """Every way through the pipeline from its intake, branching at sorters and at red belts that
+    lead on (not back for rework, not into a bin): [{"order": [machine ids], "end": the node it
+    stops at ("build:dock", a bin, or "" if a belt is missing), "route": {machine: port},
+    "stop": "" (reached a dock or bin), "none" (nothing on an output), "loop" or "lost" (a belt
+    into something that isn't a machine, dock or bin)}]."""
     pipelines = pipelines if pipelines is not None else [pipeline]
     by_id = all_machines(pipelines)
     out = all_outputs(pipelines)
@@ -314,7 +662,7 @@ def paths(pipeline: dict, pipelines: list[dict] | None = None, limit: int = 64) 
             if at is None:
                 found.append({"order": order, "end": "", "route": route, "stop": "none"})
                 return
-            if at.endswith(":dock"):
+            if is_dock_node(at) or is_bin_node(at):
                 found.append({"order": order, "end": at, "route": route, "stop": ""})
                 return
             if at not in by_id:
@@ -331,6 +679,9 @@ def paths(pipeline: dict, pipelines: list[dict] | None = None, limit: int = 64) 
                 for port in ports:
                     walk(out[(at, port)], order, {**route, at: port})
                 return
+            onward = out.get((at, FAIL))
+            if onward is not None and not is_bin_node(onward) and onward not in order:
+                walk(onward, order, {**route, at: FAIL})  # its red belt leads on: a branch
             at = out.get((at, "pass"))
 
     walk(out.get((f"{pipeline['id']}:intake", "out")), [], {})
@@ -349,7 +700,8 @@ def to_line(pipeline: dict, pipelines: list[dict] | None = None, route: dict[str
         to_bin = is_bin_node(fail_to) if fail_to else False
         entry = {"type": m["type"], "id": m["id"], "on_fail": "" if to_bin else fail_to,
                  "scrap_bin": to_bin, "scrap_to": fail_to if to_bin else ""}
-        for key in ("name", "gate", "prompt", "timeout_seconds", "auto_approve", "scrap_when", "options", "rules"):
+        for key in ("name", "gate", "prompt", "timeout_seconds", "auto_approve", "scrap_when", "options", "rules",
+                    "retries"):
             if m.get(key) not in (None, ""):
                 entry[key] = m[key]
         if is_sorter(m):  # only the outputs that have a belt can be chosen
@@ -419,6 +771,15 @@ def check(catalog: dict[str, MachineConfig], pipelines: list) -> tuple[str | Non
                     or ":" in mid:
                 return f"{pname}: machine id {mid!r} is missing, used twice or reserved", {}
             seen_machines.add(mid)
+        for st in storages_of(p):
+            sid = str(st.get("id", ""))
+            if not STORE_ID.match(sid) or sid in seen_machines:
+                return f"{pname}: storage id {sid!r} is missing or used twice", {}
+            seen_machines.add(sid)
+            if st.get("source") not in STORE_SOURCES:
+                return f"{pname}: a storage has an unknown source {st.get('source')!r}", {}
+            if str(st.get("repo") or "").strip() and not github_name(str(st["repo"])):
+                return f"{pname}: a storage's repo {st['repo']!r} isn't a GitHub repo; write it as owner/name", {}
 
     problems: dict[str, str] = {}
     seen_sources: dict[str, str] = {}
@@ -429,18 +790,19 @@ def check(catalog: dict[str, MachineConfig], pipelines: list) -> tuple[str | Non
         error = f"{pname}: {error}" if error else _validate_pipeline(catalog, p, pname, set(), pipelines)
         if error is None:
             mine: dict[str, str] = {}
-            for source in sources_of(p):
+            for source, key in source_keys(p):
                 if source not in SOURCES:
                     error = f"{pname}: unknown intake source {source!r}"
                     break
-                key = f"{source}@{repo_key(p)}" if source in REPO_SOURCES else source
                 if key in mine:
-                    error = f"{pname}: its intake lists {source} twice"
+                    error = (f"{pname}: two storages of {SOURCE_WORDS.get(source, source)} feed its intake with the "
+                             "same repo and filter; remove one")
                     break
                 if key in seen_sources:
                     where = " from the same repo" if source in REPO_SOURCES else ""
                     error = (f"{pname} and {seen_sources[key]} both take {SOURCE_WORDS.get(source, source)}"
-                             f"{where}; untick it on one of them")
+                             f"{where}" + ("; give their storages different filters, or remove one"
+                                           if "storages" in p else "; untick it on one of them"))
                     break
                 mine[key] = pname
             if error is None:
@@ -479,7 +841,7 @@ def _validate_pipeline(catalog: dict[str, MachineConfig], p: dict, pname: str,
         if station != "intake" and p.get(station) is None:
             continue  # a line can ship into, and scrap into, another line's dock and bin
         if not isinstance(p.get(station), dict) or len(_pos(p[station].get("pos"))) != 2:
-            return f"{pname} needs a {station} placed on the floor"
+            return f"{pname} needs {'an' if station == 'intake' else 'a'} {station} placed on the floor"
         for cell in _footprint(p[station]["pos"]):
             if cell in cells:
                 return f"{pname}: the {station} overlaps {cells[cell]}"
@@ -494,6 +856,25 @@ def _validate_pipeline(catalog: dict[str, MachineConfig], p: dict, pname: str,
             if cell in cells:
                 return f"{pname}: a scrap bin overlaps {cells[cell]}"
             cells[cell] = "a scrap bin"
+    docks = docks_of(p) if p.get("dock") is not None else [d for d in docks_of(p) if d != "dock"]
+    if not isinstance(p.get("docks", []), list) or len(set(docks)) != len(docks):
+        return f"{pname}: its extra shipping docks are muddled (an id is used twice)"
+    for d in p.get("docks", []):
+        if not isinstance(d, dict) or not DOCK_ID.match(str(d.get("id", ""))) or len(_pos(d.get("pos"))) != 2:
+            return f"{pname}: a shipping dock is missing its id or place"
+        for cell in _footprint(d["pos"]):
+            if cell in cells:
+                return f"{pname}: a shipping dock overlaps {cells[cell]}"
+            cells[cell] = "a shipping dock"
+    store_ids = set()
+    for st in storages_of(p):
+        if len(_pos(st.get("pos"))) != 2:
+            return f"{pname}: a storage is missing its place"
+        store_ids.add(str(st.get("id", "")))
+        for cell in _footprint(st["pos"]):
+            if cell in cells:
+                return f"{pname}: a storage overlaps {cells[cell]}"
+            cells[cell] = "a storage"
 
     # Belts: each output port drives at most one belt. A belt belongs to the pipeline its
     # source is in, and may run into another pipeline's machine, dock or bin.
@@ -502,22 +883,27 @@ def _validate_pipeline(catalog: dict[str, MachineConfig], p: dict, pname: str,
                 if isinstance(q.get(st), dict)}
     stations |= {qualify(str(q.get("id", "")), str(b.get("id", ""))) for q in pipelines
                  for b in q.get("bins", []) if isinstance(b, dict)}
+    stations |= {qualify(str(q.get("id", "")), str(d.get("id", ""))) for q in pipelines
+                 for d in q.get("docks", []) if isinstance(d, dict)}
     seen_ports: set[tuple[str, str]] = set()
     for b in p.get("belts", []):
         src, port, dst = str(b.get("from", "")), b.get("port"), qualify(pid, str(b.get("to", "")))
+        if src in store_ids:
+            if port != "out" or dst != f"{pid}:intake":
+                return f"{pname}: a storage's belt must run into its own line's intake"
+            if (src, port) in seen_ports:
+                return f"{pname}: a storage has two belts out"
+            seen_ports.add((src, port))
+            continue
         valid_src = src == "intake" or src in names
         valid_dst = dst in everywhere or dst in stations
         if not valid_src or not valid_dst:
             return f"{pname}: a belt joins something that isn't there ({src} to {b.get('to')})"
-        if is_bin_node(dst) and port != "fail":
-            return f"{pname}: only a red (fail) belt can lead to the scrap bin"
         expected = ("out",) if src == "intake" else SORTER_PORTS if is_sorter(everywhere.get(src)) else ("pass", "fail")
         if port not in expected:
             return f"{pname}: a belt leaves {names.get(src, src)} from an unknown port {port!r}"
         if (src, port) in seen_ports:
             return f"{pname}: {names.get(src, 'the intake')} has two belts on its {port} output"
-        if port == "fail" and dst.endswith(":dock"):
-            return f"{pname}: failures from {names[src]} can't go to the dock"
         seen_ports.add((src, port))
     out = all_outputs(pipelines)
 
@@ -546,28 +932,29 @@ def _validate_pipeline(catalog: dict[str, MachineConfig], p: dict, pname: str,
             last = order[-1]
             if is_sorter(everywhere[last]):
                 return f"{pname}: {label(last)} has no belts out; connect at least one of its outputs"
-            return (f"{pname}: {label(last)} has nothing on its output; connect it to the next machine or "
-                    "the shipping dock")
+            return (f"{pname}: {label(last)} has nothing on its output; connect it to the next machine, "
+                    "the shipping dock or a scrap bin")
     visited = {mid for way in routes for mid in way["order"]}
     missing = [names[mid] for mid in names if mid not in visited]
     if missing:
         return f"{pname}: {', '.join(missing)} isn't on the path from the intake to the dock"
     for way in routes:
-        error = _check_path(catalog, p, pname, way["order"], everywhere, out, label)
+        error = _check_path(catalog, p, pname, way["order"], everywhere, out, label, way["route"])
         if error:
             return error
     return None
 
 
 def _check_path(catalog: dict[str, MachineConfig], p: dict, pname: str, order: list[str],
-                everywhere: dict[str, dict], out: dict, label) -> str | None:
-    """Machine rules along one way through: needs/provides, unique types, and rework belts go back.
-    A crate arrives with what every one of the intake's sources gives it."""
+                everywhere: dict[str, dict], out: dict, label, route: dict[str, str] | None = None) -> str | None:
+    """Machine rules along one way through: needs/provides and unique types. A crate arrives
+    with what every one of the intake's sources gives it; a machine it left by its red belt
+    gave it nothing."""
     provided = [set(SOURCE_PROVIDES.get(s, ())) for s in sources_of(p)]
     have: set[str] = set.intersection(*provided) if provided else set()
     seen_types: set[str] = set()
     names = {mid: label(mid) for mid in order}
-    for i, mid in enumerate(order):
+    for mid in order:
         m = everywhere[mid]
         base = catalog[m["type"]]
         if base.unique and m["type"] in seen_types:
@@ -576,12 +963,20 @@ def _check_path(catalog: dict[str, MachineConfig], p: dict, pname: str, order: l
         missing = missing_needs(base.needs, have)
         if missing:
             # Some of the intake's sources may bring it (PRs to review come with their PR) and
-            # others not: say which to untick.
+            # others not: say which to take away.
             without = [SOURCE_WORDS.get(s, s) for s in sources_of(p)
                        if missing_needs(base.needs, set(SOURCE_PROVIDES.get(s, ())) | have)]
             if provided and len(without) < len(sources_of(p)):
                 return (f"{pname}: {names[mid]} needs {', '.join(need_words(n) for n in missing)} before it, "
-                        f"and {' and '.join(without)} don't come with that: untick them in the intake's settings")
+                        f"and {' and '.join(without)} don't come with that: "
+                        + ("remove their storage from the intake" if "storages" in p else "untick them in the intake's settings"))
+            # A machine before it that would give it that, but the crate left it by its red belt.
+            for prev in order[:order.index(mid)]:
+                prev_base = catalog[everywhere[prev]["type"]]
+                if (route or {}).get(prev) == FAIL and any(alt in prev_base.provides for n in missing for alt in n.split("|")):
+                    return (f"{pname}: the {names[prev]}'s red belt runs into the {names[mid]}, but a crate that "
+                            f"fails at the {names[prev]} doesn't have what the {names[mid]} needs. Delete that red "
+                            f"belt, or run it back to an earlier machine or into a bin")
             return f"{pname}: {names[mid]} needs {', '.join(need_words(n) for n in missing)} before it"
         if is_sorter(m):
             for r in m.get("rules", []) or []:
@@ -589,14 +984,12 @@ def _check_path(catalog: dict[str, MachineConfig], p: dict, pname: str, order: l
                 if need and (mid, r.get("port")) in out and need not in have:
                     return (f"{pname}: {names[mid]} sorts by {RULE_WORDS[r['when']]}, so it needs "
                             f"{need_words(need)} before it")
-        gate = base.gate if m.get("gate") is None else bool(m.get("gate"))
+        gate = base.gate if m.get("gate") is None or base.gate_setting != "choice" else bool(m.get("gate"))
         if m.get("auto_approve") and base.can_auto_approve and gate and "risk" not in have:
             return (f"{pname}: {names[mid]} approves by risk, so it needs a Risk analyser before it "
                     f"(or set it to always ask you)")
-        have.update(base.provides)
-        target = out.get((mid, "fail"))
-        if target is not None and not is_bin_node(target) and target not in order[:i]:
-            return f"{pname}: failures from {names[mid]} can only go back to a machine before it or to the scrap bin"
+        if (route or {}).get(mid) != FAIL:
+            have.update(base.provides)
     return None
 
 

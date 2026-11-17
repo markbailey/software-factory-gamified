@@ -10,21 +10,29 @@
 #                     won't save a line where a machine comes before what it needs.
 #   unique = true     at most one of this machine on the line
 #   gate = true       after its steps, the crate waits for you to approve or reject it
+#   gate_setting      "always" (always a gate: the Approver) or "never" (never one: the
+#                     Reviewer); left out, you choose with the "wait for my approval" tick
 #   github_review     a gate that also listens to PR reviews on GitHub
 #   parallel = true   the machine takes any number of crates at once (for waiting)
-#   can_auto_approve  a gate that may approve by itself: when its steps pass and the crate's
+#   can_auto_approve  a gate that may approve by itself: when the crate's
 #                     risk (from a Risk analyser earlier on the line) is at most the level you
 #                     pick in the game ("low" or "medium"). Off until you pick one.
-#   on_fail = "coder" when the machine fails, send the crate back along the return belt to
-#                     that machine (by id) with the failure as its {notes}. It keeps its
-#                     branch and PR. Leave it out to send failures to the scrap bin.
+#   on_fail = "coder" the red belt a new line lays from this machine: failed crates go back
+#                     along it to that machine (by id) with the failure as its {notes},
+#                     keeping their branch and PR. In the game the red belt can go anywhere
+#                     (back, on to another machine or dock, or into a scrap bin); with no red
+#                     belt, failed crates wait at the machine for you.
 #   rework_here       failures and your send-backs run this machine again (the Planner)
+#   kind = "splitter" a sorter with no rules: crates go out of its outputs in turn
+#   kind = "merger"   runs no steps: crates from every belt into it carry straight on out
 #   kind = "sorter"   runs no steps: sends each crate out of one of its six outputs, by the
 #                     rules you set on it in the game (risk, source, words in the spec,
 #                     files changed, size of the change, or "everything else")
 #   first_pass_only   (on a step) skip the step when a crate comes back for rework
 #   save_result_as    (on a Claude step) "spec": its reply becomes {spec} for later machines;
-#                     "pr_body": its reply (a filled-in PR template) becomes {pr_body}
+#                     "pr_body": its reply (a filled-in PR template) becomes {pr_body};
+#                     "pr_text": its reply ("Title: ..." then the description) becomes
+#                     {pr_title} and {pr_body}
 #   when              run the step only while this is on: one of the machine's options
 #                     (ticked), or a placeholder (not empty), e.g. "pr_template"
 #
@@ -39,6 +47,8 @@
 #   {branch}    this crate's branch       {base}      the pipeline's base branch (main)
 #   {base_ref}  what branches start from (origin/main when there is a remote)
 #   {pr_title}  PR title                  {pr_body}   PR body, with "Closes #n" for issues
+#   {pr_draft}  set while the crate has code but no PR yet (the Document writer writes the PR text)
+#   {has_worktree}  set when the crate has a branch with its code
 #   {commit_message}  "Crate #<id>: <summary>" plus your commit attribution line
 #   {commit_attribution}  the "attribution.commit" text from Claude Code's settings (see
 #               factory/attribution.py; the PR body gets "attribution.pr" the same way)
@@ -51,7 +61,7 @@
 #   {source} {source_ref}  where the crate came from (github 12, jira PROJ-3, game)
 #   {jira_url} {jira_email} {jira_token_env}  [intake.jira] settings, for looking issues up
 
-default_line = ["refiner", "coder", "tester", "packager", "risk_analyser", "reviewer", "ci", "merger"]
+default_line = ["refiner", "coder", "tester", "packager", "risk_analyser", "reviewer", "approver", "ci", "merger"]
 
 # How many times a crate can be sent back for rework before it goes to the scrap bin.
 max_rework = 3
@@ -59,7 +69,7 @@ max_rework = 3
 [[types]]
 id = "verifier"
 name = "Verifier"
-description = "Checks an issue is still worth doing before anyone works on it: still open at its source (GitHub or Jira), not closed, resolved or labelled a duplicate, and not waiting on another issue that's still open. Then Claude reads it against the repo to see if it's already done, a duplicate of another open issue, or too vague to start. Ready crates go out of the green port; the rest leave by the red port with the reason, and their issue is handed back."
+description = "Checks an issue is still worth doing before anyone works on it: still open at its source (GitHub or Jira), not closed, resolved or labelled a duplicate, and not waiting on another issue that's still open. Then Claude reads it against the repo to see if it's already done, a duplicate of another open issue, or too vague to start. Ready crates go out of the green port; the rest leave by the red port with the reason, and their issue is handed back (or closed, if the bin says so). On a line that takes open PRs, it checks each PR is still needed: not merged or closed, its issue still open, not superseded and not stale; scrapped, the PR is closed."
 sprite = "verifier"
 unique = true
 prompt = """
@@ -73,12 +83,18 @@ Check, reading the repository and (for a GitHub issue) the repo's other issues:
 - Is there enough detail to start: what to change and how to tell it's done?
 - Does it depend on something that isn't there yet (another feature, a decision, access)?
 
+If the source is github_pr, it is an open pull request (#{source_ref}), not an issue. Decide
+whether it is still needed: is what it changes already on the base branch, is it superseded by
+another open or merged PR (gh pr list --state all), or is the issue it fixes closed? Read it
+with gh pr view {source_ref} and gh pr diff {source_ref}. If it is still worth merging, it is Ready.
+
 The first line of your reply must be exactly one of:
 Ready: <one sentence on why it's good to go>
 Outcome: already done  (then where the code already does it)
 Outcome: duplicate     (then which issue or PR it duplicates, as #n)
 Outcome: needs info    (then your questions, as a short numbered list)
 Outcome: blocked       (then what it waits on)
+Outcome: not needed    (a PR only: then why, e.g. superseded by #n)
 
 Be practical: a short issue that is clear enough for a developer to start is Ready.
 
@@ -88,8 +104,15 @@ Issue ({source} {source_ref}):
 
 [[types.options]]
 id = "check_source"
-label = "Check the issue at its source (still open, not a duplicate, nothing it depends on still open)"
+label = "Check the issue or PR at its source (still open, not a duplicate, nothing it depends on still open)"
 default = true
+
+[[types.options]]
+id = "stale_days"
+type = "text"
+label = "Open PRs untouched for this many days aren't needed (empty: never)"
+placeholder = "e.g. 30"
+default = "30"
 
 [[types.options]]
 id = "ask_claude"
@@ -101,7 +124,7 @@ name = "Check the issue"
 cwd = "{workspace}"
 when = "check_source"
 command = ["{python}", "{scripts}/verify_issue.py", "{source}", "{source_ref}", "{issue_repo}",
-           "{jira_url}", "{jira_email}", "{jira_token_env}"]
+           "{jira_url}", "{jira_email}", "{jira_token_env}", "{stale_days}"]
 timeout_seconds = 120
 
 [[types.steps]]
@@ -113,7 +136,7 @@ stdin = "{prompt}"
 command = [
     "claude", "-p",
     "--output-format", "stream-json", "--verbose",
-    "--allowedTools", "Read,Glob,Grep,Bash(git log:*),Bash(git ls-files:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh pr list:*)",
+    "--allowedTools", "Read,Glob,Grep,Bash(git log:*),Bash(git ls-files:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh pr diff:*)",
 ]
 log_format = "claude-stream-json"
 timeout_seconds = 600
@@ -124,6 +147,34 @@ cwd = "{workspace}"
 when = "ask_claude"
 stdin = "{agent_result}"
 command = ["{python}", "{scripts}/check_ready.py"]
+
+[[types]]
+id = "labeller"
+name = "Labeller"
+description = "Adds and removes labels on the crate's issue or pull request, on GitHub or in Jira (set them in its settings). For example, after a Verifier on a line that checks your backlog, add `factory` so the build line picks the issue up. Crates typed in the game have nothing to label and pass straight through."
+sprite = "labeller"
+parallel = true
+
+[[types.options]]
+id = "add_labels"
+type = "text"
+label = "Labels to add (comma-separated)"
+placeholder = "e.g. factory, ready"
+default = ""
+
+[[types.options]]
+id = "remove_labels"
+type = "text"
+label = "Labels to take off (comma-separated)"
+placeholder = "e.g. needs triage"
+default = ""
+
+[[types.steps]]
+name = "Label the issue"
+cwd = "{workspace}"
+command = ["{python}", "{scripts}/label_issue.py", "{source}", "{source_ref}", "{issue_repo}",
+           "{add_labels}", "{remove_labels}", "{jira_url}", "{jira_email}", "{jira_token_env}"]
+timeout_seconds = 120
 
 [[types]]
 id = "refiner"
@@ -197,6 +248,8 @@ files (you cannot run installs; the Tester installs them). If the project has no
 yet, use Python with tests in tests/test_*.py using the built-in unittest.
 Add or update tests for every change.
 Do not run git commands; the factory commits your work for you.
+If any file has merge conflict markers (<<<<<<<, =======, >>>>>>>), the base branch was just
+merged in: resolve them first, keeping what both sides meant, and remove every marker.
 When you are done, reply with a two or three line summary of what you changed.
 If you decide not to change anything, the first line of your reply must be one of:
 Outcome: needs info    (the spec is unclear or missing something; list your questions)
@@ -219,7 +272,15 @@ command = ["git", "fetch", "--all", "--prune"]
 name = "Make branch"
 cwd = "{repo}"
 first_pass_only = true
-command = ["git", "worktree", "add", "-b", "{branch}", "{worktree}", "{base_ref}"]
+# Picks up the crate's branch and worktree if it has them already (after a restart).
+command = ["{python}", "{scripts}/make_branch.py", "{branch}", "{worktree}", "{base_ref}"]
+
+[[types.steps]]
+name = "Bring in the base branch"
+cwd = "{worktree}"
+# Nothing on a fresh branch. Back for merge conflicts: merges the base in, leaving conflict
+# markers for Claude to resolve.
+command = ["{python}", "{scripts}/merge_base.py", "{base_ref}"]
 
 [[types.steps]]
 name = "Write code"
@@ -276,27 +337,11 @@ command = ["{python}", "{scripts}/commit_lockfiles.py", "{commit_attribution}"]
 [[types]]
 id = "packager"
 name = "Packager"
-description = "Pushes the branch and opens a pull request. If the repo has a pull request template, Claude fills it in for the PR description; your attribution line from Claude Code's settings goes at the end."
+description = "Pushes the branch and opens a pull request (or reuses the branch's open one). It runs no AI: the title and description come from a Document writer before it, or are the plain ones (\"Crate #n: summary\", the spec and the issue link). Your attribution line from Claude Code's settings goes at the end."
 sprite = "packager"
 needs = ["worktree"]
 provides = ["pr"]
 unique = true
-prompt = """
-You are the Packager machine in a software factory, writing the description of a pull request.
-Fill in this repository's pull request template for the change on this branch. Run
-`git diff {base_ref}...HEAD` and `git log {base_ref}..HEAD` to see it. Do not edit any files.
-
-Keep the template's headings and their order. Fill each section briefly and truthfully from
-the change and the spec. Tick a checkbox only when it's true; write "N/A" where a section
-doesn't apply. Drop the template's instructions in HTML comments. Don't add a link to the
-issue or a sign-off: the factory adds those. Reply with only the filled-in template.
-
-Spec:
-{spec}
-
-The template:
-{pr_template}
-"""
 
 # Settings in the game for this machine.
 [[types.options]]
@@ -313,21 +358,6 @@ cwd = "{worktree}"
 command = ["git", "push", "-u", "--force", "origin", "{branch}"]
 
 [[types.steps]]
-name = "Write description"
-# Only when the repo has a pull request template; otherwise the factory's own body is used.
-when = "pr_template"
-cwd = "{worktree}"
-stdin = "{prompt}"
-command = [
-    "claude", "-p",
-    "--output-format", "stream-json", "--verbose",
-    "--allowedTools", "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*)",
-]
-log_format = "claude-stream-json"
-save_result_as = "pr_body"
-timeout_seconds = 600
-
-[[types.steps]]
 name = "Open PR"
 cwd = "{worktree}"
 stdin = "{pr_body}"
@@ -337,7 +367,7 @@ command = ["{python}", "{scripts}/open_pr.py", "{base}", "{branch}", "{pr_title}
 [[types]]
 id = "risk_analyser"
 name = "Risk analyser"
-description = "Has Claude read the PR's diff and rate the change low, medium or high risk by its blast radius, and stamps that on the crate. A Reviewer after it can use the stamp to approve low-risk changes by itself."
+description = "Has Claude read the PR's diff and rate the change low, medium or high risk by its blast radius, and stamps that on the crate. An Approver after it can use the stamp to let low-risk changes through by itself."
 sprite = "risk_analyser"
 needs = ["pr"]
 provides = ["risk"]
@@ -398,15 +428,13 @@ command = ["{python}", "{scripts}/stamp_risk.py"]
 [[types]]
 id = "reviewer"
 name = "Reviewer"
-description = "Has Claude review a pull request from its diff (read-only, no checkout): the factory's own PRs on the build line, or other people's on the review line. With no PR yet (straight after a Coder), it reviews the branch's diff instead. A review asking for changes leaves by the red port (back to the Coder, say); otherwise it waits for your approval, or goes on by itself if you let it approve low-risk changes. Tick boxes in its settings choose whether it comments on the PR and lets GitHub reviews decide."
+description = "Has Claude review a pull request from its diff (read-only, no checkout): the factory's own PRs on the build line, or other people's on the review line. With no PR yet (straight after a Coder), it reviews the branch's diff instead. It only reviews and comments: a review asking for changes leaves by the red port (back to the Coder, say), anything else goes on out of the green port. To wait for your OK, put an Approver after it."
 sprite = "reviewer"
 # A PR to review (from a Packager, or PRs to review from the intake), or a Coder's branch.
 needs = ["pr|worktree"]
 on_fail = "coder"
-gate = true
-# Pick "Approve automatically" in the game to let a good review of a low-risk change through
-# without you (needs a Risk analyser before the Reviewer).
-can_auto_approve = true
+# It reviews; the Approver after it waits for your decision.
+gate_setting = "never"
 prompt = """
 You are the Reviewer machine in a software factory, reviewing a code change (a pull request,
 or a branch that isn't one yet). This folder holds two files:
@@ -440,11 +468,6 @@ default = true
 [[types.options]]
 id = "comment_on_pr"
 label = "Post the review on the PR as a comment straight away"
-default = true
-
-[[types.options]]
-id = "github_review"
-label = "Let a review on GitHub decide at the gate (approve, or request changes)"
 default = true
 
 [[types.steps]]
@@ -494,6 +517,23 @@ stdin = "{agent_result}"
 command = ["{python}", "{scripts}/check_verdict.py"]
 
 [[types]]
+id = "approver"
+name = "Approver"
+description = "Holds each crate until it's approved: by you in the game, by a review on its pull request on GitHub (an approval lets it on, \"request changes\" sends it back with the review), or by itself for changes no riskier than you allow (needs a Risk analyser before it). Rejected crates leave by the red port with your note and the last review: back to the Coder, say. Runs nothing itself, and holds any number of crates at once."
+sprite = "approver"
+gate = true
+gate_setting = "always"
+on_fail = "coder"
+# Pick "Approve automatically" in the game to let low-risk changes through without you.
+can_auto_approve = true
+parallel = true
+
+[[types.options]]
+id = "github_review"
+label = "Let a review on GitHub decide (an approval lets it on, \"request changes\" sends it back)"
+default = true
+
+[[types]]
 id = "sorter"
 name = "Sorter"
 kind = "sorter"
@@ -502,9 +542,25 @@ sprite = "sorter"
 parallel = true
 
 [[types]]
+id = "splitter"
+name = "Splitter"
+kind = "splitter"
+description = "Splits one belt into two: crates take turns going out of its top and bottom outputs on the east side (one each way, then round again). With only one belt out, everything goes that way."
+sprite = "splitter"
+parallel = true
+
+[[types]]
+id = "joiner"
+name = "Belt merger"
+kind = "merger"
+description = "Joins belts into one: run belts into either of its inputs (from any machines, or other lines), and every crate carries straight on out of its one output. Does no work on the crates."
+sprite = "merger"
+parallel = true
+
+[[types]]
 id = "ci"
 name = "CI"
-description = "Waits for the pull request's checks to go green. What red checks do depends on its belts: with a red belt back to the Coder, the crate goes there with the failure logs; otherwise it goes to the scrap bin (if joined to it), so on the review line the author's next push brings the PR back. Works on many PRs at once."
+description = "Waits for the pull request's checks to go green. Red checks send the crate out of the red port with the failure logs, wherever its belt goes: back to the Coder to fix them, say, or into a scrap bin, so on the review line the author's next push brings the PR back. With no red belt it waits here for you. Works on many PRs at once."
 sprite = "ci_monitor"
 needs = ["pr"]
 on_fail = "coder"
@@ -647,11 +703,49 @@ command = ["{python}", "{scripts}/check_plan.py"]
 [[types]]
 id = "doc_writer"
 name = "Document writer"
-description = "Writes up what the machine before it produced, as the right document on GitHub: a plan you approved becomes a tracking issue plus one issue per task (ready ones get the factory label; the rest follow as their dependencies ship), and a review you approved is posted as your review on the PR (an approval, a request for changes or a comment, following its verdict line; your note goes on top). Anything else leaves by the red port."
+description = "Writes up what the machine before it produced, as the right document: in front of a Packager (the crate has its code but no PR yet), Claude writes the pull request's title and description, filling in the repo's PR template if it has one. On GitHub, a plan you approved becomes a tracking issue plus one issue per task (ready ones get the factory label; the rest follow as their dependencies ship), and a review you approved is posted as your review on the PR (an approval, a request for changes or a comment, following its verdict line; your note goes on top). Anything else leaves by the red port."
 sprite = "doc_writer"
+prompt = """
+You are the Document writer in a software factory, writing the title and description of the
+pull request for the change on this branch. Run `git diff {base_ref}...HEAD` and
+`git log {base_ref}..HEAD` to see it. Do not edit any files.
+
+The first line of your reply must be exactly:
+Title: <a short, specific title in the imperative, under 70 characters>
+Then the description, in Markdown. If the repository has a pull request template (below), fill
+it in: keep its headings and their order, fill each section briefly and truthfully, tick a
+checkbox only when it's true, write "N/A" where a section doesn't apply, and drop its
+instructions in HTML comments. With no template, write "## Summary" (what and why, a few
+sentences), "## Changes" (short bullets) and "## Testing" (how it was checked). Don't add a link
+to the issue or a sign-off: the factory adds those.
+
+Spec:
+{spec}
+
+The template (empty if the repo has none):
+{pr_template}
+"""
+
+[[types.steps]]
+name = "Write PR description"
+# Only for a crate with its code and no PR yet: in front of the Packager.
+when = "pr_draft"
+cwd = "{worktree}"
+stdin = "{prompt}"
+command = [
+    "claude", "-p",
+    "--output-format", "stream-json", "--verbose",
+    "--allowedTools", "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*)",
+]
+log_format = "claude-stream-json"
+save_result_as = "pr_text"
+timeout_seconds = 600
 
 [[types.steps]]
 name = "Write document"
+# Not for a crate with code of its own (the build line): back for rework after its PR opened,
+# it just goes on (the PR keeps its description).
+when = "!has_worktree"
 cwd = "{workspace}"
 # Your note from the gate goes on top of a review. Start it with "Verdict: Comment" to post
 # without approving. Issues it already made (recorded under workspace/plans) aren't made twice.

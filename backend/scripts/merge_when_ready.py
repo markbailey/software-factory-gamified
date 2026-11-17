@@ -122,8 +122,9 @@ while True:
     if state == "CLOSED":
         stop("The pull request was closed without merging, so there is nothing to merge.", rework=False)
     if pr.get("mergeable") == "CONFLICTING" or status == "DIRTY":
-        stop("The pull request has merge conflicts with its base branch. Merge the base branch "
-             "into this branch and fix the conflicts.")
+        stop("The pull request has merge conflicts with its base branch. The factory merges the base "
+             "branch into this branch before you start (don't run git yourself): resolve the conflict "
+             "markers it leaves, keeping what both sides meant, and make sure the tests still pass.")
     reviewer_waiting = False
     if pr.get("reviewDecision") == "CHANGES_REQUESTED":
         text, fresh = change_requests()

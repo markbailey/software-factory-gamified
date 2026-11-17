@@ -15,6 +15,8 @@ Two questions, asked when a step fails:
      blocked       Claude changed nothing: something outside the repo stops it
      work_failed   tests, CI, a review or a step kept failing
      rejected      you scrapped or rejected it at a gate
+     wrong_line    a machine said it needs another kind of machine, and its line has none
+                   (rolled back: the issue goes back to To Do, a PR is labelled "needs <machine>")
 """
 from __future__ import annotations
 
@@ -22,9 +24,17 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-KINDS = ("needs_info", "already_done", "blocked", "work_failed", "rejected")
+KINDS = ("needs_info", "already_done", "blocked", "work_failed", "rejected", "wrong_line")
 KIND_WORDS = {"needs_info": "Needs info", "already_done": "Already done", "blocked": "Blocked",
-              "work_failed": "Work failed", "rejected": "Rejected"}
+              "work_failed": "Work failed", "rejected": "Rejected", "wrong_line": "Not for this line"}
+
+# A Claude machine's reply when the crate needs another kind of machine (see engine.WRONG_MACHINE_HINT).
+WRONG_MACHINE_RE = re.compile(r"^\W*outcome\W*\s*wrong[ _-]?machine\W*\s*([a-z_][a-z0-9_ -]*)", re.I | re.M)
+
+
+def needed_type(outcome: str) -> str:
+    """The machine type a rolled-back crate needs, from its outcome ("wrong_machine:merger")."""
+    return outcome.split(":", 1)[1] if outcome.startswith("wrong_machine:") else ""
 
 # Printed by scripts/check_changes.py when Claude changed nothing.
 OUTCOME_RE = re.compile(r"^OUTCOME\s+(needs_info|already_done|blocked)\s*$")

@@ -5,7 +5,8 @@ Each tracker has one small adapter with two jobs:
 - notify() posts a comment when the crate's PR opens or the crate is scrapped.
 
 ReviewRequestIntake is different: it brings in other people's PRs for you to review, and
-never comments on them itself.
+never comments on them itself. GitHubPrIntake brings in open PRs (yours by default) for a
+Verifier to check they're still needed; scrapped, the factory closes them.
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover
     import tomli as tomllib
 
-from . import plans
+from . import graph, plans
 from .config import DEFAULT_CONFIG, GitHubIntakeConfig, JiraIntakeConfig
 from .engine import Factory
 
@@ -54,14 +55,22 @@ class GitHubIntake:
     """Labelled issues in one pipeline's repo (cfg.repo) become crates on that pipeline. With no
     pipeline, crates go wherever "github" crates go (the first pipeline that takes them)."""
     source = "github"
+    storage = ""  # the storage this feed is (its id), set by main.sync_feeds
 
-    def __init__(self, cfg: GitHubIntakeConfig, factory: Factory, pipeline: str = "", default: bool = True):
+    def __init__(self, cfg: GitHubIntakeConfig, factory: Factory, pipeline: str = "", default: bool = True,
+                 query: str = "", check_only: bool = False):
         self.cfg = cfg
         self.factory = factory
         self.pipeline = pipeline
+        # The line's own search (instead of the factory label), and its "only check" tick.
+        self.query = query
+        self.check_only = check_only
         # Issues already taken are remembered by number; ones from other repos than the
-        # default one by owner/name#number, so #3 here and #3 there are different issues.
+        # default one by owner/name#number, so #3 here and #3 there are different issues. A
+        # line that only checks issues remembers its own, so a working line can still take them.
         self.seen_prefix = "" if default else f"{cfg.repo}#"
+        if check_only:
+            self.seen_prefix = f"check:{pipeline}:{cfg.repo}#"
 
     def _key(self, ref: str) -> str:
         return self.seen_prefix + ref
@@ -70,6 +79,8 @@ class GitHubIntake:
         """Is this crate one of this repo's issues?"""
         if item.get("source") != self.source or not item.get("source_ref"):
             return False
+        if self.pipeline and item.get("pipeline") and item.get("pipeline") != self.pipeline:
+            return False  # another line's crate (maybe the same repo, with its own search)
         url = str(item.get("source_url") or "").lower()
         if url:
             return f"github.com/{self.cfg.repo.lower()}/" in url
@@ -85,8 +96,9 @@ class GitHubIntake:
         return r.stdout
 
     async def poll(self) -> int:
+        which = ["--search", self.query] if self.query else ["--label", self.cfg.label]
         out = await asyncio.to_thread(
-            self._gh, "issue", "list", "--repo", self.cfg.repo, "--label", self.cfg.label,
+            self._gh, "issue", "list", "--repo", self.cfg.repo, *which,
             "--state", "open", "--limit", "50", "--json", "number,title,body,url",
         )
         new = 0
@@ -97,6 +109,7 @@ class GitHubIntake:
             item = await self.factory.submit(
                 _spec(issue["title"], issue.get("body", ""), f"{self.cfg.repo}#{ref}"),
                 source=self.source, source_ref=ref, source_url=issue["url"], pipeline=self.pipeline,
+                repo=self.cfg.repo, storage=self.storage,
             )
             if item is None:
                 break  # no pipeline takes them now
@@ -108,6 +121,12 @@ class GitHubIntake:
         if not self.mine(item):
             return
         ref = item["source_ref"]
+        if self.check_only and event != "scrapped":
+            return  # only checked: not ours to assign, label as in progress or comment on
+        rollback = event == "scrapped" and item.get("scrap_kind") == "wrong_line"
+        if event == "scrapped" and not rollback and self.factory.bin_rules(item.get("location", "")).get("close_issues"):
+            await self._close(item, ref, detail)
+            return
         body = _message(item, event, detail, self._resubmit_hint())
         if body:
             await asyncio.to_thread(
@@ -115,13 +134,16 @@ class GitHubIntake:
         if event == "picked":
             # A resubmitted issue still carries the label that said why it came back last time.
             on = await asyncio.to_thread(self._labels_on, ref)
-            old = [l for l in self.cfg.handback_labels.values() if l and l in on]
+            old = [l for l in set(self.cfg.handback_labels.values()) | self.factory.rollback_labels() if l and l in on]
             await self._edit(ref, add_labels=[self.cfg.in_progress_label], remove_labels=old,
                              assign=self.cfg.assign)
         elif event == "scrapped":
             # Hand it back: take it off the factory's list, say why with a label, unassign.
             kind = item.get("scrap_kind") or "work_failed"
-            failed = await self._edit(ref, add_labels=[self.cfg.handback_labels.get(kind, "")],
+            # Rolled back (no machine on this line can do it): back to the to-do list, labelled
+            # with the machine it needs so a line that has one can take it.
+            label = self.factory.rollback_label(item) if rollback else self.cfg.handback_labels.get(kind, "")
+            failed = await self._edit(ref, add_labels=[label],
                                       remove_labels=[self.cfg.label, self.cfg.in_progress_label],
                                       unassign=self.cfg.assign)
             # Only once the factory label is off, or the next check would pick it straight back up.
@@ -131,6 +153,20 @@ class GitHubIntake:
         elif event == "shipped":
             await self._edit(ref, remove_labels=[self.cfg.in_progress_label])
             await self._release_planned(int(ref) if ref.isdigit() else 0)
+
+    async def _close(self, item: dict, ref: str, detail: str) -> None:
+        """Scrapped into a bin that closes issues: say why, then close it as not planned."""
+        body = _message(item, "scrapped", detail, "Reopen it to send it to the factory again.", closing=True)
+        await asyncio.to_thread(
+            self._gh, "issue", "comment", ref, "--repo", self.cfg.repo, "--body-file", "-", stdin=body)
+        await self._edit(ref, remove_labels=[self.cfg.in_progress_label],
+                         unassign=self.cfg.assign and not self.check_only)
+        try:
+            await asyncio.to_thread(self._gh, "issue", "close", ref, "--repo", self.cfg.repo, "--reason", "not planned")
+        except RuntimeError as exc:
+            print(f"[intake] github: could not close #{ref}: {exc}")
+            return
+        self.factory.store.forget_seen(self.source, self._key(ref))  # reopened and labelled, it comes back
 
     async def _release_planned(self, number: int) -> None:
         """An issue from a plan shipped: label the plan's issues that were waiting for it."""
@@ -189,6 +225,8 @@ class GitHubIntake:
 
 
     def describe(self) -> str:
+        if self.query:
+            return f"Open issues in {self.cfg.repo} matching: {self.query}. They all come in by themselves."
         return f"Open issues in {self.cfg.repo}. Ones labelled '{self.cfg.label}' come in by themselves."
 
     async def listing(self) -> list[dict]:
@@ -219,6 +257,7 @@ class GitHubIntake:
         item = await self.factory.submit(
             _spec(issue["title"], issue.get("body", ""), f"{self.cfg.repo}#{ref}"),
             source=self.source, source_ref=ref, source_url=issue["url"], pipeline=self.pipeline,
+            repo=self.cfg.repo, storage=self.storage, manual=True,
         )
         if item is not None:
             self.factory.store.mark_seen(self.source, self._key(ref), item["id"])
@@ -262,9 +301,21 @@ class PrdIntake(GitHubIntake):
 class JiraIntake:
     source = "jira"
 
-    def __init__(self, cfg: JiraIntakeConfig, factory: Factory):
+    def __init__(self, cfg: JiraIntakeConfig, factory: Factory, pipeline: str = "", check_only: bool = False):
+        """pipeline: the line whose own JQL this is (cfg.jql is then that), or "" for the
+        factory-wide JQL from factory.toml, whose crates go to the line that takes Jira issues."""
         self.cfg = cfg
         self.factory = factory
+        self.pipeline = pipeline
+        self.check_only = check_only
+        self.seen_prefix = f"check:{pipeline}:" if check_only else ""
+
+    def mine(self, item: dict) -> bool:
+        if item.get("source") != self.source or not item.get("source_ref"):
+            return False
+        if self.pipeline:
+            return item.get("pipeline") == self.pipeline
+        return item.get("pipeline") not in getattr(self.factory, "jira_lines", set())
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
         token = os.environ.get(self.cfg.token_env, "")
@@ -290,29 +341,42 @@ class JiraIntake:
         new = 0
         for issue in data.get("issues", []):
             key = issue["key"]
-            if self.factory.store.seen(self.source, key):
+            if self.factory.store.seen(self.source, self.seen_prefix + key):
                 continue
             fields = issue.get("fields", {})
             item = await self.factory.submit(
                 _spec(fields.get("summary", key), _adf_text(fields.get("description")), key),
                 source=self.source, source_ref=key, source_url=f"{self.cfg.base_url}/browse/{key}",
+                pipeline=self.pipeline, storage=getattr(self, "storage", ""), repo=getattr(self, "work_repo", ""),
             )
-            self.factory.store.mark_seen(self.source, key, item["id"])
+            if item is None:
+                break  # no pipeline takes them now
+            self.factory.store.mark_seen(self.source, self.seen_prefix + key, item["id"])
             new += 1
         return new
 
     async def notify(self, item: dict, event: str, detail: str) -> None:
-        if item.get("source") != self.source or not item.get("source_ref"):
+        if not self.mine(item):
             return
         key = item["source_ref"]
+        if self.check_only and event != "scrapped":
+            return  # only checked: not ours to assign, move to In Progress or comment on
+        rollback = event == "scrapped" and item.get("scrap_kind") == "wrong_line"
+        rules = self.factory.bin_rules(item.get("location", "")) if event == "scrapped" else {}
+        if rules.get("close_issues") and not rollback:
+            text = _message(item, event, detail, f"Moved to {rules['jira_status']} by the Software Factory's scrap bin.",
+                            closing=True)
+            await self._comment(key, text)
+            if self.cfg.assign and not self.check_only:
+                await self._try(f"unassign {key}", "PUT", f"/rest/api/3/issue/{key}/assignee", {"accountId": None})
+            await self._transition(key, rules["jira_status"])
+            self.factory.store.forget_seen(self.source, self.seen_prefix + key)
+            return
         hint = (f"Add the `{self.cfg.trigger_label}` label again to send it to the factory again."
                 if self.cfg.trigger_label else "Press Retry on its crate in the game's scrap bin to send it again.")
         text = _message(item, event, detail, hint)
         if text:
-            paragraphs = [p for p in text.split("\n\n") if p.strip()]
-            body = {"body": {"type": "doc", "version": 1, "content": [
-                {"type": "paragraph", "content": [{"type": "text", "text": p}]} for p in paragraphs]}}
-            await self._try(f"comment on {key}", "POST", f"/rest/api/3/issue/{key}/comment", body)
+            await self._comment(key, text)
         if event == "picked":
             if self.cfg.assign:
                 me = await self._myself()
@@ -320,12 +384,16 @@ class JiraIntake:
                     await self._try(f"assign {key}", "PUT", f"/rest/api/3/issue/{key}/assignee", {"accountId": me})
             await self._transition(key, self.cfg.pickup_transition)
             # A resubmitted issue still carries the label that said why it came back last time.
-            old = [{"remove": l} for l in set(self.cfg.handback_labels.values()) if l]
+            old = [{"remove": l.replace(" ", "-")} for l in self.factory.rollback_labels()]
+            old += [{"remove": l} for l in set(self.cfg.handback_labels.values()) if l]
             if old:
                 await self._try(f"label {key}", "PUT", f"/rest/api/3/issue/{key}", {"update": {"labels": old}})
         elif event == "scrapped":
             kind = item.get("scrap_kind") or "work_failed"
-            labels = [{"add": l} for l in [self.cfg.handback_labels.get(kind, "")] if l]
+            # Rolled back: Jira labels can't have spaces, so "needs-merger".
+            label = (self.factory.rollback_label(item).replace(" ", "-") if rollback
+                     else self.cfg.handback_labels.get(kind, ""))
+            labels = [{"add": l} for l in [label] if l]
             if self.cfg.trigger_label:
                 labels.append({"remove": self.cfg.trigger_label})
             labelled = None
@@ -338,9 +406,15 @@ class JiraIntake:
             # Only with a trigger label that came off: without one, moving it back to To Do could
             # put it straight back in the query, so it stays a crate you retry from the game.
             if self.cfg.trigger_label and labelled is not None:
-                self.factory.store.forget_seen(self.source, key)
+                self.factory.store.forget_seen(self.source, self.seen_prefix + key)
         elif event == "shipped":
             await self._transition(key, self.cfg.shipped_transition)
+
+    async def _comment(self, key: str, text: str) -> None:
+        paragraphs = [p for p in text.split("\n\n") if p.strip()]
+        body = {"body": {"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": p}]} for p in paragraphs]}}
+        await self._try(f"comment on {key}", "POST", f"/rest/api/3/issue/{key}/comment", body)
 
     async def _try(self, what: str, method: str, path: str, payload: dict | None = None) -> dict | None:
         try:
@@ -389,7 +463,7 @@ class JiraIntake:
                 "ref": key, "label": key, "title": fields.get("summary", key),
                 "url": f"{self.cfg.base_url}/browse/{key}", "by": "", "tags": [status] if status else [],
                 "auto": True, "can_pull": False,
-                **_crate(self.factory, self.factory.store.seen_item(self.source, key)),
+                **_crate(self.factory, self.factory.store.seen_item(self.source, self.seen_prefix + key)),
             })
         return rows
 
@@ -430,8 +504,22 @@ class ReviewRequestIntake:
     def _gh(self, *args: str) -> str:
         return GitHubIntake._gh(self, *args)  # same gh runner, no shared state
 
+    def _line(self):
+        """The line whose intake has a storage of PRs to review belted into it (or, in a layout
+        saved before storages, the one that ticks them)."""
+        for line in self.factory.lines.values():
+            if self.source in line.sources:
+                return line
+        return self.factory.line_for_source(self.source)
+
+    def _filter(self) -> list[str]:
+        """The storage's own search terms, on top of factory.toml's."""
+        line = self._line()
+        return graph.queries_of(line.graph).get(self.source, "").split() if line is not None else []
+
     async def poll(self) -> int:
-        if self.factory.line_for_source(self.source) is None:
+        line = self._line()
+        if line is None:
             if not self.warned:
                 print("[intake] no pipeline takes pull requests to review (source pr_review); "
                       "add one in build mode to start reviewing")
@@ -440,7 +528,7 @@ class ReviewRequestIntake:
         self.warned = False
         args = ["search", "prs", f"--review-requested={self.cfg.reviewer}", "--state=open",
                 "--draft=false", "--limit", "50", "--json", "url,number,title,repository,author"]
-        args += self.cfg.query.split()
+        args += self.cfg.query.split() + self._filter()
         found = json.loads(await asyncio.to_thread(self._gh, *args) or "[]")
         new = 0
         for hit in found:
@@ -459,7 +547,7 @@ class ReviewRequestIntake:
             text = (f"Review {repo}#{hit['number']}: {pr.get('title', hit.get('title', ''))}\n\n"
                     f"By @{author}, at commit {sha[:7]}.\n\n{(pr.get('body') or '').strip()}")[:MAX_TEXT]
             item = await self.factory.submit(text, source=self.source, source_ref=ref, source_url=url,
-                                             pr_url=url, head_sha=sha)
+                                             pr_url=url, head_sha=sha, pipeline=line.id)
             if item is None:
                 return new  # the review pipeline went away; try again next time
             self.factory.store.mark_seen(self.source, ref, item["id"])
@@ -473,7 +561,7 @@ class ReviewRequestIntake:
     async def listing(self) -> list[dict]:
         args = ["search", "prs", f"--review-requested={self.cfg.reviewer}", "--state=open",
                 "--limit", str(LIST_LIMIT), "--json", "url,number,title,repository,author,isDraft"]
-        args += self.cfg.query.split()
+        args += self.cfg.query.split() + self._filter()
         found = json.loads(await asyncio.to_thread(self._gh, *args) or "[]")
         latest: dict[str, int] = {}  # PR url -> its newest crate
         for item in self.factory.store.list_items():
@@ -516,17 +604,30 @@ HANDBACK_HEADLINES = {
     "work_failed": "The Software Factory could not finish this issue and has handed it back. "
                    "The last failure:",
     "rejected": "This issue's change was rejected in the Software Factory, so it has been handed back.",
+    "wrong_line": "This issue needs a machine the Software Factory's line doesn't have, so it has been "
+                  "rolled back to the to-do list and labelled for a line that does. Claude's explanation:",
 }
 
 
-def _message(item: dict, event: str, detail: str, resubmit_hint: str = "") -> str:
-    """The comment posted on the issue for each milestone, or "" for none."""
+CLOSING_HEADLINES = {
+    "needs_info": "The Software Factory is closing this issue: it needs more information.",
+    "already_done": "The Software Factory is closing this issue: it looks already done or a duplicate.",
+    "blocked": "The Software Factory is closing this issue: it's blocked.",
+    "work_failed": "The Software Factory is closing this issue: it couldn't finish it.",
+    "rejected": "The Software Factory is closing this issue: its change was rejected.",
+}
+
+
+def _message(item: dict, event: str, detail: str, resubmit_hint: str = "", closing: bool = False) -> str:
+    """The comment posted on the issue for each milestone, or "" for none. closing: the crate
+    went into a scrap bin that closes issues."""
     if event == "pr_opened":
         return f"The Software Factory opened a pull request for this issue: {detail}"
     if event == "scrapped":
         where, _, why = detail.partition("\n\n")
         kind = item.get("scrap_kind") or "work_failed"
-        text = HANDBACK_HEADLINES.get(kind, HANDBACK_HEADLINES["work_failed"])
+        headlines = CLOSING_HEADLINES if closing else HANDBACK_HEADLINES
+        text = headlines.get(kind, headlines["work_failed"])
         text += f" (Crate #{item['id']}, stopped at {where}.)"
         if why.strip():
             text += "\n\n" + "\n".join("> " + line for line in why.strip().splitlines())
@@ -554,6 +655,84 @@ def _adf_text(node) -> str:
     return inner + ("\n" if node.get("type") in ("paragraph", "heading", "listItem", "codeBlock") else "")
 
 
+DEFAULT_PR_SEARCH = "author:@me"
+
+
+class GitHubPrIntake(GitHubIntake):
+    """Open pull requests in a line's repo (yours, by default, or the ones its search finds) come
+    in as crates that already have their PR, for a Verifier to check they're still needed. Only
+    checked: nothing is commented, assigned or labelled on pick-up. A crate scrapped into a bin
+    that closes PRs gets its PR closed (the branch is kept); one that passes is left open."""
+    source = "github_pr"
+
+    def __init__(self, cfg: GitHubIntakeConfig, factory: Factory, pipeline: str = "", query: str = ""):
+        super().__init__(cfg, factory, pipeline, default=False, query=query or DEFAULT_PR_SEARCH, check_only=True)
+        self.seen_prefix = f"pr:{pipeline}:{cfg.repo}#"
+
+    async def poll(self) -> int:
+        out = await asyncio.to_thread(
+            self._gh, "pr", "list", "--repo", self.cfg.repo, "--search", self.query, "--state", "open",
+            "--limit", "50", "--json", "number,title,body,url,headRefOid",
+        )
+        new = 0
+        for pr in sorted(json.loads(out or "[]"), key=lambda i: i["number"]):
+            ref = str(pr["number"])
+            if self.factory.store.seen(self.source, self._key(ref)):
+                continue
+            item = await self._submit(pr)
+            if item is None:
+                break
+            new += 1
+        return new
+
+    async def _submit(self, pr: dict, manual: bool = False) -> dict | None:
+        ref = str(pr["number"])
+        item = await self.factory.submit(
+            _spec(f"PR: {pr['title']}", pr.get("body", ""), f"{self.cfg.repo}#{ref}"),
+            source=self.source, source_ref=ref, source_url=pr["url"], pr_url=pr["url"], pipeline=self.pipeline,
+            repo=self.cfg.repo, storage=self.storage, manual=manual,
+        )
+        if item is not None:
+            self.factory.store.mark_seen(self.source, self._key(ref), item["id"])
+        return item
+
+    async def notify(self, item: dict, event: str, detail: str) -> None:
+        return  # the factory closes the PR itself when it's scrapped (if the bin says so)
+
+    def describe(self) -> str:
+        return (f"Open pull requests in {self.cfg.repo} matching: {self.query}. They come in by themselves, "
+                "each once, with their PR, for the machines on the line (CI, Approver, Merger, Verifier...).")
+
+    async def listing(self) -> list[dict]:
+        out = await asyncio.to_thread(
+            self._gh, "pr", "list", "--repo", self.cfg.repo, "--search", self.query, "--state", "open",
+            "--limit", str(LIST_LIMIT), "--json", "number,title,url,labels,author",
+        )
+        rows = []
+        for pr in sorted(json.loads(out or "[]"), key=lambda i: i["number"]):
+            ref = str(pr["number"])
+            rows.append({
+                "ref": ref, "label": f"#{ref}", "title": pr.get("title", ""), "url": pr.get("url", ""),
+                "by": (pr.get("author") or {}).get("login", ""),
+                "tags": [str(l.get("name", "")) for l in pr.get("labels", []) or []],
+                "auto": True, "can_pull": True,
+                **_crate(self.factory, self.factory.store.seen_item(self.source, self._key(ref))),
+            })
+        return rows
+
+    async def pull(self, ref: str) -> dict | None:
+        """Check one open PR now (again, if it was checked before)."""
+        seen = self.factory.store.seen_item(self.source, self._key(ref))
+        if seen is not None and (self.factory.store.get_item(seen) or {}).get("state") not in ("shipped", "scrapped"):
+            raise RuntimeError(f"PR #{ref} is already in the factory")
+        pr = json.loads(await asyncio.to_thread(
+            self._gh, "pr", "view", ref, "--repo", self.cfg.repo, "--json", "number,title,body,url,state"))
+        if str(pr.get("state", "")).upper() != "OPEN":
+            raise RuntimeError(f"PR #{ref} is {str(pr.get('state', 'closed')).lower()}")
+        self.factory.store.forget_seen(self.source, self._key(ref))
+        return await self._submit(pr, manual=True)
+
+
 class Feed:
     """One intake adapter as the game sees it: polled on a timer or straight away on request,
     one poll or pull at a time (so the same issue can't come in twice)."""
@@ -567,6 +746,7 @@ class Feed:
         self.last_poll = 0.0
         self.next_poll = 0.0
         self.error = ""
+        self.paused = lambda: False  # main sets it: true while its line or the factory is paused
 
     async def poll_now(self) -> int:
         async with self.lock:
@@ -601,7 +781,8 @@ class Feed:
     async def run(self) -> None:
         """Poll forever (and again whenever woken), logging failures without stopping."""
         while True:
-            await self.poll_now()
+            if not self.paused():  # a paused factory or line brings nothing new in
+                await self.poll_now()
             self.next_poll = time.time() + self.seconds
             self.wake.clear()
             try:

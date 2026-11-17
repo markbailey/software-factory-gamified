@@ -9,7 +9,9 @@ from pathlib import Path
 MAX_LOG_LINES = 500
 TERMINAL_STATES = ("shipped", "scrapped")
 # States that survive a backend restart: finished crates, and crates waiting for you at a gate.
-RESUMABLE_STATES = TERMINAL_STATES + ("awaiting_approval",)
+RESUMABLE_STATES = TERMINAL_STATES + ("awaiting_approval", "held")
+# Crates on a belt or in a machine when the backend stopped: they carry on from there.
+IN_FLIGHT_STATES = ("queued", "waiting", "running", "moving")
 
 
 class Store:
@@ -32,6 +34,21 @@ class Store:
                 item_id INTEGER,
                 PRIMARY KEY (source, ref)
             );
+            CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id INTEGER NOT NULL,
+                pipeline TEXT NOT NULL DEFAULT '',
+                machine TEXT NOT NULL,
+                machine_type TEXT NOT NULL DEFAULT '',
+                started_at REAL NOT NULL,
+                ended_at REAL NOT NULL,
+                outcome TEXT NOT NULL,
+                failed_step TEXT NOT NULL DEFAULT '',
+                cost_usd REAL NOT NULL DEFAULT 0,
+                turns INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS runs_by_item ON runs (item_id);
+            CREATE INDEX IF NOT EXISTS runs_by_time ON runs (started_at);
             CREATE TABLE IF NOT EXISTS events (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 at REAL NOT NULL,
@@ -42,11 +59,14 @@ class Store:
         # Columns added in later slices: add them to older databases.
         have = {r["name"] for r in self.db.execute("PRAGMA table_info(items)")}
         for col in ("source", "source_ref", "source_url", "pr_url", "notes", "review", "pipeline",
-                    "head_sha", "risk", "risk_reason", "outcome", "scrap_kind", "waiting_for", "spec", "route"):
+                    "head_sha", "risk", "risk_reason", "outcome", "scrap_kind", "waiting_for", "spec", "route", "pr_state",
+                    "pr_title", "pr_body", "repo", "storage"):
             if col not in have:
                 self.db.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         if "loops" not in have:  # how many times the crate has been sent back for rework
             self.db.execute("ALTER TABLE items ADD COLUMN loops INTEGER NOT NULL DEFAULT 0")
+        if "finished_at" not in have:  # when it shipped or was scrapped
+            self.db.execute("ALTER TABLE items ADD COLUMN finished_at REAL NOT NULL DEFAULT 0")
         # Before pipelines, there was one line and places had no pipeline prefix.
         self.db.execute("UPDATE items SET pipeline = 'build' WHERE pipeline = ''")
         self.db.execute(
@@ -71,11 +91,20 @@ class Store:
         row = self.db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
         return self._row(row)
 
-    def list_items(self) -> list[dict]:
+    def list_items(self, log_tail: int | None = None) -> list[dict]:
+        """Every crate. With log_tail, only the last lines of each log (log_lines says how many
+        there are): the game asks for a crate's whole log when you open it."""
         rows = self.db.execute("SELECT * FROM items ORDER BY id").fetchall()
-        return [self._row(r) for r in rows]
+        items = [self._row(r) for r in rows]
+        if log_tail is not None:
+            for item in items:
+                item["log_lines"] = len(item["log"])
+                item["log"] = item["log"][-log_tail:] if log_tail else []
+        return items
 
     def update_item(self, item_id: int, **fields) -> None:
+        if fields.get("state") in TERMINAL_STATES and "finished_at" not in fields:
+            fields["finished_at"] = time.time()
         cols = ", ".join(f"{k} = ?" for k in fields)
         self.db.execute(f"UPDATE items SET {cols} WHERE id = ?", (*fields.values(), item_id))
         self.db.commit()
@@ -85,6 +114,52 @@ class Store:
         log = json.loads(row["log"])
         log.append(line)
         self.update_item(item_id, log=json.dumps(log[-MAX_LOG_LINES:]))
+
+    # Machine runs: how long each took, what Claude cost, how it ended ------------------
+    def record_run(self, item_id: int, pipeline: str, machine: str, machine_type: str, started_at: float,
+                   outcome: str, failed_step: str = "", cost_usd: float = 0.0, turns: int = 0) -> None:
+        """outcome: "ok", "failed" or "stopped" (the backend stopped mid-run)."""
+        self.db.execute(
+            "INSERT INTO runs (item_id, pipeline, machine, machine_type, started_at, ended_at, outcome,"
+            " failed_step, cost_usd, turns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (item_id, pipeline, machine, machine_type, started_at, time.time(), outcome, failed_step,
+             float(cost_usd), int(turns)))
+        self.db.commit()
+
+    def runs_since(self, since: float) -> list[dict]:
+        return [dict(r) for r in self.db.execute("SELECT * FROM runs WHERE ended_at >= ? ORDER BY id", (since,))]
+
+    def spent_since(self, since: float) -> float:
+        row = self.db.execute("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM runs WHERE ended_at >= ?", (since,)).fetchone()
+        return float(row["c"])
+
+    def item_costs(self) -> dict[int, tuple[float, float]]:
+        """{crate: (Claude cost in USD, seconds spent in machines)}."""
+        return {r["item_id"]: (float(r["c"]), float(r["t"])) for r in self.db.execute(
+            "SELECT item_id, SUM(cost_usd) AS c, SUM(ended_at - started_at) AS t FROM runs GROUP BY item_id")}
+
+    def item_cost(self, item_id: int) -> float:
+        row = self.db.execute("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM runs WHERE item_id = ?", (item_id,)).fetchone()
+        return float(row["c"])
+
+    def finished_since(self, since: float) -> list[dict]:
+        """Crates shipped or scrapped since then (without their logs)."""
+        return [dict(r) for r in self.db.execute(
+            "SELECT id, state, pipeline, created_at, finished_at, loops, scrap_kind FROM items"
+            " WHERE finished_at >= ? AND state IN ('shipped', 'scrapped') ORDER BY id", (since,))]
+
+    def count_on_line(self, pipeline: str, states: tuple) -> int:
+        row = self.db.execute(
+            f"SELECT COUNT(*) AS n FROM items WHERE pipeline = ? AND state IN ({','.join('?' * len(states))})",
+            (pipeline, *states)).fetchone()
+        return int(row["n"])
+
+    def in_flight(self) -> list[dict]:
+        """Crates a previous run left on a belt or in a machine."""
+        rows = self.db.execute(
+            f"SELECT id FROM items WHERE state IN ({','.join('?' * len(IN_FLIGHT_STATES))}) ORDER BY id",
+            IN_FLIGHT_STATES).fetchall()
+        return [self.get_item(r["id"]) for r in rows]
 
     def scrap_interrupted(self) -> list[int]:
         """Items left mid-pipeline by a previous run can't resume yet, so scrap them."""

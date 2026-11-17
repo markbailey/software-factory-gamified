@@ -6,6 +6,7 @@ signal closed
 signal open_crate(item_id: int)
 signal retry(item_id: int)
 
+const FactoryFloor := preload("res://scripts/factory_floor.gd")
 const WIDTH := 360.0  # the left dock
 const C_QUIET := "9AA1AD"
 const C_RED := "E5484D"
@@ -65,7 +66,7 @@ func show_crates(station_key: String, title: String, rows: Array, empty_text: St
 		child.queue_free()
 	if rows.is_empty():
 		_content.add_child(_text("[color=#%s]%s[/color]" % [C_QUIET, empty_text]))
-	var scrap := not station_key.ends_with(":dock")  # a scrap bin ("scrap" or an extra "scrap_2")
+	var scrap := FactoryFloor.is_bin(station_key)  # a scrap bin ("scrap" or an extra "scrap_2"), not a dock
 	for r in rows:
 		var row := HBoxContainer.new()
 		row.add_theme_constant_override("separation", 6)
@@ -86,12 +87,12 @@ func show_crates(station_key: String, title: String, rows: Array, empty_text: St
 		var log_button := Button.new()
 		log_button.theme_type_variation = &"ButtonGhost"
 		log_button.icon = load("res://assets/ui/icon_log.svg")
-		log_button.tooltip_text = "Show this crate's log"
+		log_button.tooltip_text = "Log: show this crate's log"
 		log_button.pressed.connect(func() -> void: open_crate.emit(id))
 		if bool(r.get("retry", false)):
 			var again := Button.new()
-			again.text = "Retry"
-			again.tooltip_text = "Send it back to the start of the line"
+			again.icon = load("res://assets/ui/icon_retry.svg")
+			again.tooltip_text = "Retry: send it back to the start of the line"
 			again.pressed.connect(func() -> void:
 				again.disabled = true
 				retry.emit(id))

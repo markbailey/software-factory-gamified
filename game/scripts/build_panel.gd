@@ -16,6 +16,8 @@ signal save_requested(pipelines: Array)
 signal cancelled
 signal settings_opened(world: Vector2)  # the settings window opened for something at this point
 signal check_repo_requested(pipeline: String, repo: Dictionary)  # the intake's Check button
+signal belt_speed_changed(cells_per_second: float)  # applies at once, not on Save
+var belt_speed_input: SpinBox
 
 const FactoryFloor := preload("res://scripts/factory_floor.gd")
 # Choices for a reviewer's auto-approve setting, and what the backend calls each one.
@@ -37,17 +39,31 @@ const SOURCE_NAMES := {
 	"jira": "Jira issues",
 	"pr_review": "PRs waiting for my review",
 	"prd": "PRDs (GitHub issues labelled prd)",
+	"github_pr": "Open PRs (mine, or the ones a search finds)",
+}
+# What a storage can hold, and its filter (blank: the default in STORE_FILTERS' second item).
+const STORE_SOURCES := ["jira", "github", "github_pr", "pr_review", "prd"]
+const STORE_WORDS := {"jira": "Jira issues", "github": "GitHub issues", "github_pr": "Open PRs",
+		"pr_review": "PRs waiting for my review", "prd": "PRDs (GitHub issues labelled prd)"}
+const STORE_FILTERS := {
+	"jira": ["JQL", "e.g. project = APP AND status = Backlog", "Blank: the JQL in factory.toml."],
+	"github": ["GitHub issue search", "e.g. is:open label:backlog", "Blank: open issues labelled factory."],
+	"github_pr": ["GitHub PR search", "e.g. author:app/dependabot", "Blank: author:@me (your own open PRs)."],
+	"pr_review": ["Extra search terms", "e.g. org:my-company -repo:owner/noisy", "Blank: every open PR waiting for your review."],
+	"prd": ["", "", "Issues labelled prd in the line's repo. No filter."],
 }
 # Stations you can place from the list: "@intake" starts a new line there (just its intake);
 # "@dock" and "@scrap" place the factory's one shipping dock and scrap bin, which every line's
 # belts can run into.
 const STATION_TILES := {
 	"@intake": {"name": "Intake (new line)", "sprite": "intake",
-			"hint": "Starts a new line here. Pick where its crates come from in the intake's settings, then run belts to the shipping dock (or join another line's machines)."},
+			"hint": "Starts a new line here. Belt Storages into it for issues and PRs (or tick typed specs in its settings), then run belts to the shipping dock (or join another line's machines)."},
 	"@dock": {"name": "Shipping dock", "sprite": "shipping_dock",
-			"hint": "Where finished crates end up. The factory has one: run every line's last belt into it."},
+			"hint": "Where finished crates end up. Place as many as you like: each line ships into whichever dock its last belt runs into."},
 	"@scrap": {"name": "Scrap bin", "sprite": "scrap_bin",
-			"hint": "Where failed crates go, from machines whose red belt runs into it. The factory has one."},
+			"hint": "Where failed crates go, from machines whose red belt runs into it. Place as many as you like, each with its own rules."},
+	"@storage": {"name": "Storage", "sprite": "storage",
+			"hint": "Holds one source's issues or PRs (Jira issues, GitHub issues, open PRs, PRs waiting for your review or PRDs), with its own filter. Belt it into an intake and that line takes them."},
 }
 const STATION_HINTS := {
 	"dock": "The shipping dock: crates that make it through every machine end here.",
@@ -73,15 +89,36 @@ var catalog_order: Array = []
 var sources: Array = []
 var default_repo := {}  # the backend's own test project: {github, path, base_branch}
 # Sources that come from the line's own repo: lines on different repos can each take them.
-const REPO_SOURCES := ["github", "prd"]
+const REPO_SOURCES := ["github", "prd", "github_pr"]
 var draft: Array = []  # pipelines being edited
 var current := ""  # pipeline id being edited
 
 var _sel_key := ""  # footprint key of the selected machine or station
+const CROSS_HINT := "To bridge another belt, go straight over a straight stretch of it (not a bend, a join, or a bridge already there)."
 var _sel_belt := {}  # {pid, from, port} of the selected belt
 var _placing := ""  # machine type being placed
+var _hand_belt := false  # the Conveyor belt tile is on: belts dragged from a port are laid cell by cell
+var _belt_tile: Button
 var _drag := {}
 var _loading := false
+
+# Undo: one history for every build edit, oldest first. {"who": "build", "draft", "current"}
+# holds the layout before a build edit; {"who": "rooms"} marks a room edit, which the room
+# layer undoes itself (rooms_undo).
+const UNDO_MAX := 100
+var _history: Array = []
+var _last: Array = []  # the draft as of the last entry, to spot the next change
+var _restoring := false
+var rooms_undo := Callable()  # set by main: undoes the room layer's latest edit
+var rooms_tracked := false  # the room layer tells us about its edits (else Undo falls back to it)
+signal undo_changed  # the history grew or shrank (the room bar's Undo button follows it)
+var _undo_button: Button
+
+# Several things picked at once (Shift+click, or Shift+drag a box on empty floor): footprint
+# keys. Dragging any of them moves them all; Delete removes them.
+var _group := {}
+var _pending_rooms_step := false  # the room layer took an undo step the history must undo too
+var _room_cells := {}  # room blocks picked with the group (Vector2i -> true), moved and removed with it
 
 var _pipeline_picker: OptionButton
 var _pipeline_name: LineEdit
@@ -92,6 +129,19 @@ var _repo_github: LineEdit
 var _repo_path: LineEdit
 var _repo_base: LineEdit
 var _repo_result: Label
+var _store_box: VBoxContainer  # a storage's settings
+var _store_source: OptionButton
+var _store_query_label: Label
+var _store_query: LineEdit
+var _store_hint: Label
+var _store_repo_label: Label
+var _store_repo: LineEdit
+var _check_only_box: CheckBox
+var _max_crates_input: SpinBox
+var _bin_box: VBoxContainer  # the scrap bin's settings
+var _bin_close_box: CheckBox
+var _bin_close_prs_box: CheckBox
+var _bin_jira_status: LineEdit
 var settings_window: PanelContainer
 var _settings_col: VBoxContainer
 var _palette: GridContainer
@@ -103,21 +153,23 @@ var _name_input: LineEdit
 var _gate_box: CheckBox
 var _timeout_input: SpinBox
 var _timeout_label: Label
+var _retries_input: SpinBox
+var _retries_label: Label
+var _retries_hint: Label
 var _steps_label: Label
 var _fail_label: Label
 var _auto_box: VBoxContainer
 var _auto_picker: OptionButton
 var _auto_hint: Label
-var _fail_picker: OptionButton
 var _scrap_box: VBoxContainer
 var _options_box: VBoxContainer  # the machine type's own tick boxes (machines.toml options)
 var _rules_box: VBoxContainer  # a sorter's rule for each output
 var _scrap_checks := {}  # kind -> CheckBox
-var _fail_targets: Array = []
 var _prompt_label: Label
 var _prompt_input: TextEdit
 var _belt_box: VBoxContainer
 var _belt_label: Label
+var _auto_route_button: Button
 var _station_label: Label
 var _message: Label
 
@@ -139,7 +191,7 @@ func _ready() -> void:
 	title.text = "Build"
 	title.theme_type_variation = &"LabelHeading"
 	col.add_child(title)
-	_hint(col, "Click anything on the floor to open its settings. Drag to move it; Shift+drag moves its whole line. Drag from a green port to the next machine to lay a belt. Failed crates leave by the red port: run it back to an earlier machine for rework, or into the scrap bin. With no red belt, failed crates wait at the machine for you. Hold Space and drag, or drag empty floor, to pan.")
+	_hint(col, "Click anything on the floor to open its settings. Drag to move it; Shift+drag moves its whole line. Shift+click machines, or Shift+drag a box on empty floor, to pick several (room blocks in the box come too); drag any of them to move them together. Ctrl+Z or Undo steps back through every change, rooms included. Drag from a green port to the next machine to lay a belt. Failed crates leave by the red port, along whatever belt you lay from it: back to an earlier machine for rework, on to any machine or dock, or into a scrap bin. With no red belt, failed crates wait at the machine for you. Hold Space and drag, or drag empty floor, to pan.")
 
 	_field_label(col, "Lines")
 	_pipeline_picker = OptionButton.new()
@@ -148,9 +200,18 @@ func _ready() -> void:
 	col.add_child(_pipeline_picker)
 	var line_row := HBoxContainer.new()
 	col.add_child(line_row)
-	_button(line_row, "New", _new_pipeline).theme_type_variation = &"ButtonGhost"
-	_button(line_row, "Delete", _delete_pipeline).theme_type_variation = &"ButtonGhost"
-	_button(line_row, "Clear all", _clear_factory).theme_type_variation = &"ButtonGhost"
+	_button(line_row, "New", _new_pipeline, "icon_add", "start a new line").theme_type_variation = &"ButtonGhost"
+	_button(line_row, "Delete", _delete_pipeline, "icon_delete", "delete the line picked above").theme_type_variation = &"ButtonGhost"
+	_button(line_row, "Clear all", _clear_factory, "icon_clear_all", "remove every line, machine and belt").theme_type_variation = &"ButtonGhost"
+	_field_label(col, "Belt speed (cells a second)")
+	belt_speed_input = SpinBox.new()
+	belt_speed_input.min_value = 0.5
+	belt_speed_input.max_value = 6.0
+	belt_speed_input.step = 0.1
+	belt_speed_input.value = 1.5
+	belt_speed_input.tooltip_text = "How fast every belt runs, and so how fast crates ride them. Changes straight away."
+	belt_speed_input.value_changed.connect(func(v: float) -> void: belt_speed_changed.emit(v))
+	col.add_child(belt_speed_input)
 
 	col.add_child(HSeparator.new())
 	_field_label(col, "Add a machine")
@@ -166,8 +227,11 @@ func _ready() -> void:
 	var actions := HBoxContainer.new()
 	actions.alignment = BoxContainer.ALIGNMENT_END
 	outer.add_child(actions)
-	_button(actions, "Cancel", func() -> void: cancelled.emit()).theme_type_variation = &"ButtonGhost"
-	_button(actions, "Save", _save).theme_type_variation = &"ButtonPrimary"
+	_undo_button = _button(actions, "Undo", undo, "icon_undo", "undo the last change: machines, belts, settings or rooms (Ctrl+Z)")
+	_undo_button.theme_type_variation = &"ButtonGhost"
+	_undo_button.focus_mode = Control.FOCUS_NONE
+	_button(actions, "Cancel", func() -> void: cancelled.emit(), "icon_close", "drop the changes and leave build mode").theme_type_variation = &"ButtonGhost"
+	_button(actions, "Save", _save, "icon_save", "keep the changes and leave build mode").theme_type_variation = &"ButtonPrimary"
 
 	_build_settings_window()
 
@@ -219,7 +283,7 @@ func _build_settings_window() -> void:
 	# Reviewers: let a good review of a low-risk change through without asking.
 	_auto_box = VBoxContainer.new()
 	_machine_box.add_child(_auto_box)
-	_field_label(_auto_box, "Approve by itself when the review looks good and the risk is")
+	_field_label(_auto_box, "Approve by itself when the crate's risk is")
 	_auto_picker = OptionButton.new()
 	for i in AUTO_APPROVE_WORDS.size():
 		var icon_path := "res://assets/ui/%s.svg" % ("icon_human_approval" if i == 0 else "icon_auto_approve")
@@ -235,10 +299,8 @@ func _build_settings_window() -> void:
 	_machine_box.add_child(_options_box)
 	_rules_box = VBoxContainer.new()
 	_machine_box.add_child(_rules_box)
-	_fail_label = _field_label(_machine_box, "If it fails, send the crate to")
-	_fail_picker = OptionButton.new()
-	_fail_picker.item_selected.connect(_on_fail_selected)
-	_machine_box.add_child(_fail_picker)
+	# Where failures go is the red belt you lay from the red port: this only says where it runs.
+	_fail_label = _hint(_machine_box, "")
 	# Which reasons this machine scraps for (with its red belt in the bin); the rest wait here.
 	_scrap_box = VBoxContainer.new()
 	_machine_box.add_child(_scrap_box)
@@ -258,6 +320,14 @@ func _build_settings_window() -> void:
 	_timeout_input.step = 1
 	_timeout_input.value_changed.connect(_on_timeout_changed)
 	_machine_box.add_child(_timeout_input)
+	_retries_label = _field_label(_machine_box, "Retries when it fails")
+	_retries_hint = _hint(_machine_box, "Runs a failed crate through this machine again by itself, with why it failed, before its red belt (or holding it). A red belt back to an earlier machine goes first.")
+	_retries_input = SpinBox.new()
+	_retries_input.min_value = 0
+	_retries_input.max_value = 5
+	_retries_input.step = 1
+	_retries_input.value_changed.connect(_on_retries_changed)
+	_machine_box.add_child(_retries_input)
 	_steps_label = _hint(_machine_box, "")
 	_prompt_label = _field_label(_machine_box, "Prompt for Claude")
 	_prompt_input = TextEdit.new()
@@ -265,7 +335,7 @@ func _build_settings_window() -> void:
 	_prompt_input.custom_minimum_size = Vector2(0, 220)
 	_prompt_input.text_changed.connect(_on_prompt_changed)
 	_machine_box.add_child(_prompt_input)
-	_button(_machine_box, "Remove machine", _remove_selected).theme_type_variation = &"ButtonReject"
+	_button(_machine_box, "Remove machine", _remove_selected, "icon_delete", "take this machine off the floor (Delete)").theme_type_variation = &"ButtonReject"
 
 	_intake_box = VBoxContainer.new()
 	col.add_child(_intake_box)
@@ -276,26 +346,79 @@ func _build_settings_window() -> void:
 	_pipeline_name.text_changed.connect(_on_pipeline_name)
 	_intake_box.add_child(_pipeline_name)
 	_field_label(_intake_box, "Repo this line works on")
-	_hint(_intake_box, "Branches, pull requests and GitHub issues come from here. Leave it blank for the factory's test project.")
+	_hint(_intake_box, "The line's own repo: crates typed in the game, Jira issues and storages without a repo of their own are worked on here (branch, PR and merge). Leave it blank for the factory's test project.")
 	_repo_github = _repo_field("GitHub repo (owner/name or a link)", "github")
 	_repo_path = _repo_field("Local folder (blank: the factory clones it for you)", "path")
 	_repo_base = _repo_field("Base branch (blank: the repo's default branch)", "base_branch")
 	var check_row := HBoxContainer.new()
 	_intake_box.add_child(check_row)
-	var check := _button(check_row, "Check repo", _on_check_repo)
+	var check := _button(check_row, "Check repo", _on_check_repo, "icon_check_repo", "test that the factory can reach this repo")
 	check.theme_type_variation = &"ButtonGhost"
 	_repo_result = _hint(_intake_box, "")
 	_field_label(_intake_box, "Take crates from")
 	_source_boxes = VBoxContainer.new()
 	_intake_box.add_child(_source_boxes)
 	_source_note = _hint(_intake_box, "")
+	_check_only_box = CheckBox.new()
+	_check_only_box.text = "Only check these issues (Verifier, Labeller): don't assign them or move them to In Progress"
+	_check_only_box.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_check_only_box.toggled.connect(_on_check_only_toggled)
+	_intake_box.add_child(_check_only_box)
+	_field_label(_intake_box, "Most crates on the line at once")
+	_hint(_intake_box, "To stop jams: more wait at the intake, and its storages bring nothing new in until one leaves. Crates held for you don't count. 0: no limit.")
+	_max_crates_input = SpinBox.new()
+	_max_crates_input.min_value = 0
+	_max_crates_input.max_value = 99
+	_max_crates_input.step = 1
+	_max_crates_input.value_changed.connect(_on_max_crates_changed)
+	_intake_box.add_child(_max_crates_input)
+
+	_bin_box = VBoxContainer.new()
+	col.add_child(_bin_box)
+	_bin_close_box = CheckBox.new()
+	_bin_close_box.text = "Close the issue of a crate that lands here (GitHub: closed as not planned)"
+	_bin_close_box.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_bin_close_box.toggled.connect(func(on: bool) -> void: _set_bin("close_issues", on))
+	_bin_box.add_child(_bin_close_box)
+	_bin_close_prs_box = CheckBox.new()
+	_bin_close_prs_box.text = "Close the crate's PR too (its branch is kept; a PR you only review is never closed)"
+	_bin_close_prs_box.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_bin_close_prs_box.toggled.connect(func(on: bool) -> void: _set_bin("close_prs", on))
+	_bin_box.add_child(_bin_close_prs_box)
+	_field_label(_bin_box, "Jira status to move it to")
+	_bin_jira_status = LineEdit.new()
+	_bin_jira_status.placeholder_text = "Won't Do"
+	_bin_jira_status.text_changed.connect(func(text: String) -> void: _set_bin("jira_status", text.strip_edges()))
+	_bin_box.add_child(_bin_jira_status)
+	_hint(_bin_box, "With the first box unticked, the issue is handed back instead: unassigned, labelled with why, and moved back to To Do.")
+
+	_store_box = VBoxContainer.new()
+	col.add_child(_store_box)
+	_field_label(_store_box, "What it holds")
+	_store_source = OptionButton.new()
+	for src in STORE_SOURCES:
+		_store_source.add_item(str(STORE_WORDS[src]))
+	_store_source.item_selected.connect(_on_store_source_picked)
+	_store_box.add_child(_store_source)
+	_store_query_label = _field_label(_store_box, "Filter")
+	_store_query = LineEdit.new()
+	_store_query.text_changed.connect(_on_store_query_changed)
+	_store_box.add_child(_store_query)
+	_store_hint = _hint(_store_box, "")
+	_store_repo_label = _field_label(_store_box, "GitHub repo it reads (owner/name or a link)")
+	_store_repo = LineEdit.new()
+	_store_repo.text_changed.connect(_on_store_repo_changed)
+	_store_box.add_child(_store_repo)
+	_hint(_store_box, "Drag from its port into an intake: that line takes what's in it. Crates from a storage with its own repo are coded, PR'd and merged in that repo, so one line can serve several repos. Press Delete to remove it.")
 
 	_belt_box = VBoxContainer.new()
 	col.add_child(_belt_box)
 	_belt_label = Label.new()
 	_belt_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_belt_box.add_child(_belt_label)
-	_button(_belt_box, "Remove belt", _remove_selected).theme_type_variation = &"ButtonReject"
+	_hint(_belt_box, "To lay it by hand, turn on Conveyor belt in the machine list and drag from the output again.")
+	_auto_route_button = _button(_belt_box, "Let it find its own way", _auto_route_selected, "icon_route", "drop the hand-laid path and route the belt automatically")
+	_button(_belt_box, "Remove belt", _remove_selected, "icon_delete", "take this belt off the floor (Delete)").theme_type_variation = &"ButtonReject"
 
 	_station_label = _hint(col, "")
 	add_sibling.call_deferred(settings_window)
@@ -324,9 +447,15 @@ func _repo_field(label: String, key: String) -> LineEdit:
 	return edit
 
 
-func _button(parent: Control, label: String, on_press: Callable) -> Button:
+## With an icon the button shows only the icon; its name and what it does go in the tooltip.
+func _button(parent: Control, label: String, on_press: Callable, icon_name := "", what := "") -> Button:
 	var b := Button.new()
-	b.text = label
+	if icon_name.is_empty():
+		b.text = label
+	else:
+		b.icon = load("res://assets/ui/%s.svg" % icon_name)
+		b.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER  # centred when a container stretches it
+		b.tooltip_text = "%s: %s" % [label, what] if not what.is_empty() else label
 	b.pressed.connect(on_press)
 	parent.add_child(b)
 	return b
@@ -358,7 +487,21 @@ func open(catalog_list: Array, pipelines: Array, source_list: Array, floor: Fact
 	catalog_order.clear()
 	for child in _palette.get_children():
 		child.queue_free()
-	# Stations first: a new line (from its intake) and extra scrap bins.
+	# The conveyor belt first: lay belts by hand, cell by cell, instead of letting them route.
+	_belt_tile = Button.new()
+	_belt_tile.theme_type_variation = &"ButtonTile"
+	_belt_tile.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	_belt_tile.text = "Conveyor belt"
+	_belt_tile.tooltip_text = "Lay a belt by hand: drag across the floor, cell by cell, from a machine's output into where it goes."
+	_belt_tile.toggle_mode = true
+	_belt_tile.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_belt_tile.clip_text = true
+	if ResourceLoader.exists("res://assets/belts/belt_straight_e.svg"):
+		_belt_tile.icon = load("res://assets/belts/belt_straight_e.svg")
+	_belt_tile.toggled.connect(_on_belt_tile_toggled)
+	_palette.add_child(_belt_tile)
+	_hand_belt = false
+	# Stations next: a new line (from its intake) and extra scrap bins.
 	for kind in STATION_TILES:
 		var tile: Dictionary = STATION_TILES[kind]
 		var sb := Button.new()
@@ -399,18 +542,31 @@ func open(catalog_list: Array, pipelines: Array, source_list: Array, floor: Fact
 	_drag = {}
 	_sel_key = ""
 	_sel_belt = {}
-	show_message("")
+	var paused := PackedStringArray()
+	for p in draft:
+		if p.get("paused", false):
+			paused.append(str(p.get("problem", "")))
+	show_message("" if paused.is_empty() else "Paused until fixed:\n" + "\n".join(paused))
 	floor_view.editing = true
+	_history.clear()
+	_clear_group()
+	_last = _snapshot()
 	_rebuild()
+	_last = _snapshot()
+	undo_changed.emit()
 
 
 func close() -> void:
 	settings_window.visible = false
+	_history.clear()
+	_clear_group()
+	undo_changed.emit()
 	if floor_view:
 		floor_view.editing = false
 		floor_view.set_ghost({})
 		floor_view.set_wire({})
 		floor_view.set_highlight("")
+		_show_group()
 
 
 func show_message(text: String) -> void:
@@ -439,9 +595,12 @@ func _node(key: String) -> Dictionary:
 	if ":" in key:
 		var p := _pipeline(key.get_slice(":", 0))
 		var place := key.get_slice(":", 1)
-		for bin in p.get("bins", []):
+		for bin in p.get("bins", []) + p.get("docks", []):
 			if str(bin.get("id", "")) == place:
 				return bin
+		for st in FactoryFloor.storages_of(p):
+			if str(st.get("id", "")) == place:
+				return st
 		return p.get(place, {})
 	return _machine(key)
 
@@ -464,7 +623,7 @@ func _belt_target(pid: String, key: String) -> String:
 
 
 static func _is_dock(node: String) -> bool:
-	return node == "dock" or node.ends_with(":dock")
+	return FactoryFloor.is_dock(node)
 
 
 func _label_of(node: String) -> String:
@@ -475,16 +634,135 @@ func _label_of(node: String) -> String:
 			return "the intake"
 	if FactoryFloor.is_bin(node):
 		return "the scrap bin"
+	if FactoryFloor.is_storage(node):
+		var st := _node(node) if ":" in node else {}
+		return "the %s storage" % str(STORE_WORDS.get(str(st.get("source", "")), "")) if not st.is_empty() else "the storage"
 	var m := _machine(node)
 	return str(m.get("name", node)) if not m.is_empty() else node
 
 
 func _rebuild() -> void:
 	floor_view.set_pipelines(draft)
+	note_edit()
 	_refresh_ui()
 
 
+# Undo --------------------------------------------------------------------------
+
+## Ctrl+Z while building, before the floor and the room bar see it.
+func _input(event: InputEvent) -> void:
+	if not visible:
+		return
+	var key := event as InputEventKey
+	if key == null or not key.pressed or key.echo or key.keycode != KEY_Z or not key.is_command_or_control_pressed():
+		return
+	var focus := get_viewport().gui_get_focus_owner()
+	if focus is LineEdit or focus is TextEdit:
+		return  # their own undo
+	undo()
+	get_viewport().set_input_as_handled()
+
+
+## The draft as it stands (deep), with where we are.
+func _snapshot() -> Array:
+	return draft.duplicate(true)
+
+
+## The layout without its belts' routes (the floor routes them again as things move).
+static func _shape(pipelines: Array) -> Array:
+	var out := pipelines.duplicate(true)
+	for p in out:
+		if p is Dictionary:
+			for b in p.get("belts", []):
+				if b is Dictionary:
+					b.erase("path")
+	return out
+
+
+## Record the draft's latest change, if it changed since the last entry. Called after every
+## edit (settings typed in are recorded when you next click or pick something).
+func note_edit() -> void:
+	if _restoring or not visible:
+		return
+	if _shape(draft) == _shape(_last):
+		_last = _snapshot()  # only routes moved
+		return
+	_push({"who": "build", "draft": _last, "current": current})
+	_last = _snapshot()
+
+
+func _push(entry: Dictionary) -> void:
+	_history.append(entry)
+	if _history.size() > UNDO_MAX:
+		_history.pop_front()
+	undo_changed.emit()
+	if _undo_button:
+		_undo_button.disabled = false
+
+
+## The room layer made an edit: it takes its turn in the history.
+func note_room_edit() -> void:
+	note_edit()  # settings typed before it come first
+	_push({"who": "rooms"})
+
+
+## Take the room edits out of the history (the room layer dropped its own undo steps).
+func forget_room_edits() -> void:
+	_history = _history.filter(func(e) -> bool: return str(e.get("who", "")) != "rooms")
+	undo_changed.emit()
+	_refresh_ui()
+
+
+func can_undo() -> bool:
+	return not _history.is_empty() or (visible and _shape(draft) != _shape(_last))
+
+
+## Undo the latest edit, whichever kind it was.
+func undo() -> void:
+	note_edit()
+	if _history.is_empty():
+		if not rooms_tracked and rooms_undo.is_valid():
+			rooms_undo.call()  # an older room layer keeps its own history
+			return
+		show_message("Nothing to undo.")
+		return
+	var entry: Dictionary = _history.pop_back()
+	if str(entry.get("who", "")) == "rooms":
+		if rooms_undo.is_valid():
+			rooms_undo.call()
+		show_message("Undid the last room change.")
+	else:
+		if entry.get("rooms", false) and rooms_undo.is_valid():
+			rooms_undo.call()  # the room blocks that moved or went with the machines
+		draft = (entry["draft"] as Array).duplicate(true)
+		if _pipeline(str(entry.get("current", ""))).is_empty():
+			current = str(draft[0].get("id", "")) if not draft.is_empty() else ""
+		else:
+			current = str(entry["current"])
+		_placing = ""
+		_drag = {}
+		floor_view.set_ghost({})
+		floor_view.set_wire({})
+		_restoring = true
+		floor_view.set_pipelines(draft)
+		_restoring = false
+		for k in _group.keys():
+			if not floor_view.footprints.has(k):
+				_group.erase(k)
+		if not _sel_key.is_empty() and not floor_view.footprints.has(_sel_key):
+			_sel_key = ""
+		if not _sel_belt.is_empty() and _find_belt(_sel_belt).is_empty():
+			_sel_belt = {}
+		_last = _snapshot()
+		_refresh_ui()
+		show_message("Undid the last change.")
+	undo_changed.emit()
+
+
 func _refresh_ui() -> void:
+	if _undo_button:
+		_undo_button.disabled = not can_undo()
+	_show_group()
 	_loading = true
 	_pipeline_picker.clear()
 	for i in draft.size():
@@ -492,8 +770,12 @@ func _refresh_ui() -> void:
 		_pipeline_picker.add_item(str(p.get("name", p.get("id", ""))))
 		if str(p.get("id", "")) == current:
 			_pipeline_picker.select(i)
-	if _placing.is_empty():
-		_palette_hint.text = "Click a machine, then click the floor where it goes."
+	if _belt_tile:
+		_belt_tile.set_pressed_no_signal(_hand_belt)
+	if _hand_belt:
+		_palette_hint.text = "Drag across the floor, cell by cell, from a machine's output (or the cell just right of it) into where the belt goes. Esc stops."
+	elif _placing.is_empty():
+		_palette_hint.text = "Click a machine, then click the floor where it goes. Drag from an output to belt it up."
 	else:
 		var placing_name: String = str(STATION_TILES[_placing]["name"]) if STATION_TILES.has(_placing) \
 				else str(catalog[_placing].get("name", _placing))
@@ -505,30 +787,46 @@ func _refresh_ui() -> void:
 			and not str(_drag.get("mode", "")) in ["move", "line"]  # out of the way while dragging
 	_machine_box.visible = not machine.is_empty()
 	_intake_box.visible = station == "intake"
+	_bin_box.visible = FactoryFloor.is_bin(station)
+	_store_box.visible = FactoryFloor.is_storage(station)
+	if FactoryFloor.is_storage(station):
+		_fill_storage(_node(_sel_key))
+	if FactoryFloor.is_bin(station):
+		var bin := _bin_station()
+		_bin_close_box.button_pressed = bool(bin.get("close_issues", true))
+		_bin_close_prs_box.button_pressed = bool(bin.get("close_prs", true))
+		_bin_jira_status.text = str(bin.get("jira_status", ""))
 	if station == "intake":
 		var pipeline := _pipeline(current)
 		_title.text = "%s intake" % str(pipeline.get("name", ""))
 		_pipeline_name.text = str(pipeline.get("name", ""))
 		_fill_sources(pipeline)
 		_fill_repo(pipeline)
+		_check_only_box.button_pressed = bool(pipeline.get("check_only", false))
+		_max_crates_input.set_value_no_signal(float(int(pipeline.get("max_crates", 0))))
+	elif FactoryFloor.is_storage(station):
+		_title.text = "Storage: %s" % str(STORE_WORDS.get(str(_node(_sel_key).get("source", "")), ""))
 	elif not station.is_empty():
-		_title.text = "Shipping dock" if station == "dock" else "Scrap bin"
+		_title.text = "Shipping dock" if FactoryFloor.is_dock(station) else "Scrap bin"
 		if station != "scrap" and FactoryFloor.is_bin(station):
 			station = "scrap"  # same hint; this one can be deleted
+		elif station != "dock" and FactoryFloor.is_dock(station):
+			station = "dock"
 			_station_label.text = ""
 	if not machine.is_empty():
 		var base: Dictionary = catalog.get(str(machine.get("type", "")), {})
 		_title.text = str(machine.get("name", base.get("name", "")))
 		_description.text = str(base.get("description", ""))
 		_name_input.text = str(machine.get("name", ""))
-		_gate_box.button_pressed = bool(machine.get("gate", false))
+		_gate_box.button_pressed = FactoryFloor.gated(machine, base)
 		var auto := str(machine.get("auto_approve", ""))
-		_auto_box.visible = bool(base.get("can_auto_approve", false)) and bool(machine.get("gate", false))
+		_auto_box.visible = bool(base.get("can_auto_approve", false)) and FactoryFloor.gated(machine, base)
 		_auto_picker.select(maxi(0, AUTO_APPROVE_LEVELS.find(auto)))
 		_auto_hint.text = ("Needs a Risk analyser earlier on the line. Anything rated higher, or not "
 				+ "rated, still waits for you.") if auto != "" else "Every crate waits for you here."
 		var timeout = machine.get("timeout_seconds", null)
 		_timeout_input.set_value_no_signal(roundf(float(timeout) / 60.0) if timeout else 0.0)
+		_retries_input.set_value_no_signal(float(int(machine.get("retries", 0) if machine.get("retries", 0) != null else 0)))
 		var steps: Array = base.get("steps", [])
 		var names := PackedStringArray()
 		for s in steps:
@@ -539,37 +837,60 @@ func _refresh_ui() -> void:
 		_prompt_input.visible = has_prompt
 		if has_prompt and _prompt_input.text != str(machine.get("prompt", "")):
 			_prompt_input.text = str(machine.get("prompt", ""))
-		_fill_fail_picker(_sel_key)
+		_fill_fail_info(_sel_key)
 		_fill_options(machine, base)
-		var sorter := bool(base.get("sorter", false))
-		_rules_box.visible = sorter
-		for part in [_gate_box, _fail_label, _fail_picker, _timeout_input, _timeout_label]:
+		# A splitter or belt merger only passes crates on: no rules, waits, timeouts or red port.
+		var kind := str(base.get("kind", ""))
+		var sorter := bool(base.get("sorter", false)) or kind == "merger"
+		_rules_box.visible = sorter and kind == ""
+		for part in [_gate_box, _fail_label, _timeout_input, _timeout_label]:
 			part.visible = not sorter
+		# The Approver always waits and the Reviewer never does: no tick for either.
+		_gate_box.visible = not sorter and str(base.get("gate_setting", "choice")) == "choice"
+		_timeout_input.visible = not sorter and not (base.get("steps", []) as Array).is_empty()
+		_timeout_label.visible = _timeout_input.visible
+		for part in [_retries_input, _retries_label, _retries_hint]:
+			part.visible = _timeout_input.visible
 		if sorter:
 			_scrap_box.visible = false
-			_fill_rules(machine)
+			if kind == "":
+				_fill_rules(machine)
 	_belt_box.visible = not _sel_belt.is_empty()
 	if not _sel_belt.is_empty():
 		var b := _find_belt(_sel_belt)
 		var kind := "Rework belt" if _sel_belt["port"] == "fail" else "Belt"
 		_title.text = kind
 		_belt_label.text = "From %s to %s" % [_label_of(_sel_belt["from"]), _label_of(str(b.get("to", "")))]
+		if not str(_sel_belt.get("conv", "")).is_empty():
+			_title.text = "Conveyor loop" if b.get("loop", false) else "Conveyor"
+			_belt_label.text = "%d cells, laid by hand and not linked. Press Delete to take it up." % (b.get("cells", []) as Array).size()
+		elif b.get("manual", false):
+			_belt_label.text += " (laid by hand)"
+		_auto_route_button.visible = b.get("manual", false)
 	_station_label.visible = STATION_HINTS.has(station)
 	_station_label.text = str(STATION_HINTS.get(station, ""))
 	if FactoryFloor.is_bin(_sel_key) and not _sel_key.ends_with(":scrap"):
 		_station_label.text += " Press Delete to remove this one; red belts into it are taken off too."
+	elif FactoryFloor.is_dock(_sel_key) and not _sel_key.ends_with(":dock"):
+		_station_label.text += " Press Delete to remove this one; belts into it are taken off too."
 	_loading = false
 	var route := -1
 	if not _sel_belt.is_empty():
 		for i in floor_view.routes.size():
 			var r: Dictionary = floor_view.routes[i]
-			if r["pid"] == _sel_belt["pid"] and r["from"] == _sel_belt["from"] and r["port"] == _sel_belt["port"]:
+			if r["pid"] == _sel_belt["pid"] and r["from"] == _sel_belt["from"] and r["port"] == _sel_belt["port"] \
+					and str(r.get("conveyor", "")) == str(_sel_belt.get("conv", "")):
 				route = i
 	floor_view.set_highlight(_sel_key, route)
 	_fit_settings_window.call_deferred()
 
 
 func _find_belt(ref: Dictionary) -> Dictionary:
+	if not str(ref.get("conv", "")).is_empty():
+		for conv in FactoryFloor.conveyors_of(_pipeline(str(ref.get("pid", "")))):
+			if str(conv.get("id", "")) == ref["conv"]:
+				return conv
+		return {}
 	for b in _pipeline(str(ref.get("pid", ""))).get("belts", []):
 		if str(b.get("from", "")) == ref["from"] and str(b.get("port", "")) == ref["port"]:
 			return b
@@ -616,34 +937,39 @@ func _on_pipeline_name(text: String) -> void:
 	floor_view.set_pipelines(draft)
 
 
-## One tick box per source. A source another line takes is shown with that line's name.
+## The typed-specs tick, and what the storages belted into this intake hold.
 func _fill_sources(pipeline: Dictionary) -> void:
 	for child in _source_boxes.get_children():
 		child.queue_free()
-	var taken := {}
-	for p in draft:
-		if p != pipeline:
-			for src in _sources_of(p):
-				taken[_source_key(src, p)] = str(p.get("name", p.get("id", "")))
-	var mine := _sources_of(pipeline)
-	for src in sources:
-		var box := CheckBox.new()
-		box.text = str(SOURCE_NAMES.get(src, src))
-		box.button_pressed = src in mine
-		var key := _source_key(src, pipeline)
-		if taken.has(key):
-			box.text += ("  (%s takes these from this repo)" if src in REPO_SOURCES else "  (%s takes these)") \
-					% taken[key]
-			box.disabled = true
-		box.toggled.connect(func(on: bool) -> void: _on_source_toggled(src, on))
-		_source_boxes.add_child(box)
-	_source_note.text = ("GitHub and Jira issues go to the line that takes typed specs when no line ticks them."
-			if not ("github" in mine and "jira" in mine) else "")
+	var box := CheckBox.new()
+	box.text = str(SOURCE_NAMES["game"])
+	box.button_pressed = "game" in _sources_of(pipeline)
+	box.toggled.connect(func(on: bool) -> void: _on_source_toggled("game", on))
+	_source_boxes.add_child(box)
+	var fed := FactoryFloor.fed_storages(pipeline)
+	var names := PackedStringArray()
+	for st in fed:
+		var q := str(st.get("query", "")).strip_edges()
+		var r := github_name(str(st.get("repo", "")))
+		var bits := PackedStringArray([r] if not r.is_empty() else []) + PackedStringArray([q] if not q.is_empty() else [])
+		names.append(str(STORE_WORDS.get(str(st.get("source", "")), "")) + ((" (%s)" % ", ".join(bits)) if not bits.is_empty() else ""))
+	_source_note.text = ("Also from its storages: %s." % ", ".join(names)) if not names.is_empty() else \
+			"Issues and PRs come from storages: place a Storage, pick what it holds, and drag from its port into this intake."
 
 
 ## A source as one line at a time can take it: GitHub issues and PRDs once per repo.
 func _source_key(src: String, p: Dictionary) -> String:
-	return "%s@%s" % [src, repo_key(p)] if src in REPO_SOURCES else src
+	var own := ""
+	for st in FactoryFloor.fed_storages(p):
+		if str(st.get("source", "")) == src and not str(st.get("repo", "")).strip_edges().is_empty():
+			own = github_name(str(st["repo"]))
+	var key := "%s@%s" % [src, own if not own.is_empty() else repo_key(p)] if src in REPO_SOURCES else src
+	var queries := {}
+	for st in FactoryFloor.fed_storages(p):
+		queries[str(st.get("source", ""))] = str(st.get("query", ""))
+	if str(queries.get(src, "")).strip_edges() != "":
+		key += "?" + " ".join(str(queries[src]).split(" ", false)).to_lower()  # its own search
+	return key
 
 
 ## Which repo a line is on, as the backend tells them apart ("" is the test project).
@@ -731,9 +1057,111 @@ func show_repo_check(msg: Dictionary) -> void:
 
 
 func _sources_of(p: Dictionary) -> Array:
-	if p.get("sources") is Array:
-		return p["sources"]
-	return [str(p.get("source", "game"))]
+	return FactoryFloor.line_sources(p)
+
+
+## A storage's settings: what it holds and its filter.
+func _fill_storage(st: Dictionary) -> void:
+	var source := str(st.get("source", "jira"))
+	_store_source.select(maxi(0, STORE_SOURCES.find(source)))
+	var f: Array = STORE_FILTERS.get(source, ["", "", ""])
+	var has_filter := not str(f[0]).is_empty()
+	_store_query_label.visible = has_filter
+	_store_query.visible = has_filter
+	_store_query_label.text = "Filter (%s)" % f[0] if has_filter else ""
+	_store_query.placeholder_text = str(f[1])
+	if _store_query.text != str(st.get("query", "")):
+		_store_query.text = str(st.get("query", ""))
+	var into := ""
+	var line_repo := ""
+	for p in draft:
+		if FactoryFloor.fed_storages(p).has(st):
+			into = str(p.get("name", p.get("id", "")))
+			var r: Dictionary = p.get("repo", {}) if p.get("repo") is Dictionary else {}
+			line_repo = str(r.get("github", ""))
+	var reads_repo := source in ["github", "github_pr", "prd", "jira"]
+	_store_repo_label.text = "Repo its crates are worked on (owner/name)" if source == "jira" \
+			else "GitHub repo it reads (owner/name or a link)"
+	_store_repo_label.visible = reads_repo
+	_store_repo.visible = reads_repo
+	if line_repo.is_empty():
+		line_repo = str(default_repo.get("github", ""))
+	_store_repo.placeholder_text = ("Blank: the line's, %s" % line_repo) if not line_repo.is_empty() else "Blank: the line's repo"
+	if _store_repo.text != str(st.get("repo", "")):
+		_store_repo.text = str(st.get("repo", ""))
+	_store_hint.text = str(f[2]) + ("  It feeds %s." % into if not into.is_empty() else "  Not belted into an intake yet.")
+
+
+func _on_store_source_picked(index: int) -> void:
+	if _loading or index < 0:
+		return
+	var st := _node(_sel_key)
+	if st.is_empty():
+		return
+	st["source"] = STORE_SOURCES[index]
+	st.erase("query")  # a JQL isn't a GitHub search
+	_rebuild()
+
+
+func _on_store_repo_changed(text: String) -> void:
+	if _loading:
+		return
+	var st := _node(_sel_key)
+	if st.is_empty():
+		return
+	if text.strip_edges().is_empty():
+		st.erase("repo")
+	else:
+		st["repo"] = text.strip_edges()
+
+
+func _on_store_query_changed(text: String) -> void:
+	if _loading:
+		return
+	var st := _node(_sel_key)
+	if st.is_empty():
+		return
+	if text.strip_edges().is_empty():
+		st.erase("query")
+	else:
+		st["query"] = text.strip_edges()
+	floor_view.set_pipelines(draft)
+
+
+func _on_check_only_toggled(on: bool) -> void:
+	if _loading:
+		return
+	var p := _pipeline(current)
+	if not p.is_empty():
+		p["check_only"] = on
+
+
+func _on_max_crates_changed(value: float) -> void:
+	if _loading:
+		return
+	var p := _pipeline(current)
+	if p.is_empty():
+		return
+	if int(value) > 0:
+		p["max_crates"] = int(value)
+	else:
+		p.erase("max_crates")
+
+
+## The selected scrap bin's saved dictionary (it holds its pos and its rules).
+func _bin_station() -> Dictionary:
+	if not ":" in _sel_key:
+		return {}
+	var station = _node(_sel_key)  # "scrap" or an extra bin: each has its own rules
+	return station if station is Dictionary and FactoryFloor.is_bin(_sel_key) else {}
+
+
+func _set_bin(key: String, value) -> void:
+	if _loading:
+		return
+	var bin := _bin_station()
+	if not bin.is_empty():
+		bin[key] = value
 
 
 func _on_source_toggled(src: String, on: bool) -> void:
@@ -742,16 +1170,13 @@ func _on_source_toggled(src: String, on: bool) -> void:
 	var p := _pipeline(current)
 	if p.is_empty():
 		return
-	var list: Array = _sources_of(p).duplicate()
-	if on and not src in list:
-		list.append(src)
-	elif not on:
-		list.erase(src)
-	p["sources"] = list
+	p["sources"] = ["game"] if on else []
 	p.erase("source")
+	if not p.has("storages"):
+		p["storages"] = []
 
 
-func _new_pipeline(at := Vector2i(-1, -1)) -> void:
+func _new_pipeline(at := Vector2i(-1, -1), with_intake := true) -> void:
 	var ids := {}
 	var used := {}
 	for p in draft:
@@ -772,16 +1197,19 @@ func _new_pipeline(at := Vector2i(-1, -1)) -> void:
 		y = at.y
 	# Just the intake: the line ships into the factory's dock and scraps into its bin (placed
 	# from Add a machine if there isn't one yet).
-	draft.append({
-		"id": "line-%d" % n, "name": "Line %d" % n, "sources": [],
-		"intake": {"pos": [x, y]}, "machines": [], "belts": [],
-	})
+	var line := {"id": "line-%d" % n, "name": "Line %d" % n, "sources": [], "storages": [],
+			"machines": [], "belts": []}
+	if with_intake:
+		line["intake"] = {"pos": [x, y]}
+	draft.append(line)
 	current = "line-%d" % n
+	if not with_intake:
+		return  # a storage placed before any intake: the caller puts it on this line
 	_sel_key = ""
 	_sel_belt = {}
 	_rebuild()
 	_select("line-%d:intake" % n)
-	show_message("New line added. Pick where its crates come from in the intake settings, then add machines and run belts from the intake to the shipping dock (any line's).")
+	show_message("New line added. Belt a Storage into its intake (or tick typed specs) for its crates, then add machines and run belts from the intake to the shipping dock (any line's).")
 
 
 ## Remove every belt, in any line, that runs into this machine or station (by its footprint key).
@@ -796,7 +1224,7 @@ func _delete_pipeline() -> void:
 	if draft.is_empty():
 		return
 	var gone := _pipeline(current)
-	for st in ["intake", "dock", "scrap"]:
+	for st in ["intake"] + FactoryFloor.docks_of(gone) + FactoryFloor.bins_of(gone):
 		_drop_belts_into("%s:%s" % [current, st])
 	for m in gone.get("machines", []):
 		_drop_belts_into(str(m.get("id", "")))
@@ -823,6 +1251,7 @@ func _clear_factory() -> void:
 ## After a save: carry on editing what the backend saved, keeping the line and thing selected.
 func reload(pipelines: Array) -> void:
 	draft = pipelines.duplicate(true)
+	_last = draft.duplicate(true)  # the saved layout: undo still steps back from it
 	if _pipeline(current).is_empty():
 		current = str(draft[0].get("id", "")) if not draft.is_empty() else ""
 	if not _sel_key.is_empty() and not floor_view.footprints.has(_sel_key) and _node(_sel_key).is_empty():
@@ -844,6 +1273,7 @@ func reload(pipelines: Array) -> void:
 
 func _start_placing(kind: String) -> void:
 	_placing = kind
+	_hand_belt = false
 	_drag = {}
 	_refresh_ui()
 
@@ -860,36 +1290,65 @@ func _new_id(kind: String) -> String:
 func _place(kind: String, tl: Vector2i) -> void:
 	if kind == "@intake":
 		_placing = ""
+		var waiting := _pipeline(current)
+		if not waiting.is_empty() and not waiting.get("intake") is Dictionary:
+			# A line that so far is only storages: this is its intake.
+			waiting["intake"] = {"pos": [tl.x, tl.y]}
+			_rebuild()
+			_select("%s:intake" % current)
+			show_message("Placed its intake. Drag from it to the line's first machine, and from each storage's port into it.")
+			return
 		_new_pipeline(tl)
 		return
 	if kind == "@dock" or kind == "@scrap":
 		var station := "dock" if kind == "@dock" else "scrap"
 		var what := "shipping dock" if kind == "@dock" else "scrap bin"
 		_placing = ""
-		for q in draft:
-			if q.get(station) is Dictionary:
-				show_message("The factory already has a %s (on %s). Run belts into it from any line." % [
-						what, str(q.get("name", q.get("id", "")))])
-				_refresh_ui()
-				return
-		var owner_line := _pipeline(current)
-		if owner_line.is_empty():
-			show_message("There's no line to put it on: place an Intake first, which starts a new line.")
-			_refresh_ui()
-			return
-		owner_line[station] = {"pos": [tl.x, tl.y]}
-		_sel_key = "%s:%s" % [current, station]
+		var owner_line := _line_for_placing()
+		var place := station
+		if owner_line.get(station) is Dictionary:
+			# This line has one already: another one, as an extra ("dock_2", "scrap_2").
+			var list_key := "docks" if station == "dock" else "bins"
+			var taken: Array = FactoryFloor.docks_of(owner_line) if station == "dock" else FactoryFloor.bins_of(owner_line)
+			var n := 2
+			while ("%s_%d" % [station, n]) in taken:
+				n += 1
+			place = "%s_%d" % [station, n]
+			var extras: Array = owner_line.get(list_key, [])
+			extras.append({"id": place, "pos": [tl.x, tl.y]})
+			owner_line[list_key] = extras
+		else:
+			owner_line[station] = {"pos": [tl.x, tl.y]}
+		_sel_key = "%s:%s" % [current, place]
 		_sel_belt = {}
 		_rebuild()
 		show_message("Placed the %s. Run belts into it from any line." % what)
 		return
-	if kind == "@extra_bin":
+	if kind == "@storage":
+		_placing = ""
 		var line := _pipeline(current)
 		if line.is_empty():
-			_placing = ""
-			show_message("There's no line to put it on: place an Intake first, which starts a new line.")
-			_refresh_ui()
-			return
+			# No line yet: the storage starts one, with no intake until you place it.
+			_new_pipeline(Vector2i.ZERO, false)
+			line = _pipeline(current)
+		var taken := {}
+		for q in draft:
+			for st in FactoryFloor.storages_of(q):
+				taken[str(st.get("id", ""))] = true
+		var n := 1
+		while taken.has("store_%d" % n):
+			n += 1
+		var stores: Array = FactoryFloor.storages_of(line)
+		stores.append({"id": "store_%d" % n, "source": "jira", "pos": [tl.x, tl.y]})
+		line["storages"] = stores
+		_sel_key = "%s:store_%d" % [current, n]
+		_sel_belt = {}
+		_rebuild()
+		show_message("Pick what it holds and its filter, then drag from its port into an intake." if line.get("intake") is Dictionary
+				else "Pick what it holds and its filter. Then place an Intake and drag from the storage's port into it.")
+		return
+	if kind == "@extra_bin":
+		var line := _line_for_placing()
 		var taken := FactoryFloor.bins_of(line)
 		var n := 2
 		while ("scrap_%d" % n) in taken:
@@ -901,15 +1360,10 @@ func _place(kind: String, tl: Vector2i) -> void:
 		_sel_key = "%s:scrap_%d" % [current, n]
 		_sel_belt = {}
 		_rebuild()
-		show_message("Now drag a red belt from a machine of %s into it, or pick it in the machine's settings." % str(line.get("name", current)))
+		show_message("Now drag a belt from a machine of %s into it (usually from its red port)." % str(line.get("name", current)))
 		return
 	var base: Dictionary = catalog.get(kind, {})
-	var p := _pipeline(current)
-	if p.is_empty():
-		_placing = ""
-		show_message("There's no line to put it on: place an Intake first, which starts a new line.")
-		_refresh_ui()
-		return
+	var p := _line_for_placing()
 	var id := _new_id(kind)
 	var list: Array = p.get("machines", [])
 	list.append({
@@ -925,17 +1379,60 @@ func _place(kind: String, tl: Vector2i) -> void:
 	show_message("Now drag from a green port into the %s, and from its green port on to the next machine." % str(base.get("name", kind)))
 
 
-func _connect(pid: String, from: String, port: String, to: String) -> void:
+## The line something placed goes on: the one picked, or with none yet, a new line with no
+## intake (place an Intake later and it becomes that line's; belt into its machines from another
+## line and they join that one).
+func _line_for_placing() -> Dictionary:
+	var p := _pipeline(current)
+	if p.is_empty():
+		_new_pipeline(Vector2i.ZERO, false)
+		p = _pipeline(current)
+	return p
+
+
+## A line with nothing on it any more (all its machines joined another): taken away.
+func _drop_if_empty(pid: String) -> void:
+	var p := _pipeline(pid)
+	if p.is_empty() or p.get("intake") is Dictionary or p.get("dock") is Dictionary or p.get("scrap") is Dictionary:
+		return
+	for key in ["machines", "storages", "bins", "docks", "conveyors"]:
+		if not (p.get(key, []) as Array).is_empty():
+			return
+	draft.erase(p)
+	if current == pid:
+		current = str(draft[0].get("id", "")) if not draft.is_empty() else ""
+
+
+func _connect(pid: String, from: String, port: String, to: String, path: Array = []) -> void:
 	var p := _pipeline(pid)
 	var belts: Array = p.get("belts", [])
 	for b in belts.duplicate():
 		if str(b.get("from", "")) == from and str(b.get("port", "")) == port:
 			belts.erase(b)
-	belts.append({"from": from, "port": port, "to": to})
+	var belt := {"from": from, "port": port, "to": to}
+	if not path.is_empty():
+		belt["path"] = path  # laid by hand: the floor keeps it while it fits
+		belt["manual"] = true
+	belts.append(belt)
 	p["belts"] = belts
 
 
+## A belt laid by hand goes back to routing itself.
+func _auto_route_selected() -> void:
+	var b := _find_belt(_sel_belt)
+	if b.is_empty():
+		return
+	b.erase("manual")
+	b.erase("path")
+	_rebuild()
+
+
 func _remove_selected() -> void:
+	if not _sel_belt.is_empty() and not str(_sel_belt.get("conv", "")).is_empty():
+		_drop_conveyor(_sel_belt["pid"], _find_belt(_sel_belt))
+		_sel_belt = {}
+		_rebuild()
+		return
 	if not _sel_belt.is_empty():
 		var p := _pipeline(_sel_belt["pid"])
 		(p["belts"] as Array).erase(_find_belt(_sel_belt))
@@ -944,12 +1441,23 @@ func _remove_selected() -> void:
 		return
 	if _sel_key.is_empty():
 		return
+	if FactoryFloor.is_storage(_sel_key):
+		var owner := _pipeline(_pid_of(_sel_key))
+		var sid := _end_name(_sel_key)
+		owner["storages"] = FactoryFloor.storages_of(owner).filter(func(st) -> bool: return str(st.get("id", "")) != sid)
+		owner["belts"] = (owner.get("belts", []) as Array).filter(func(b) -> bool: return str(b.get("from", "")) != sid)
+		_sel_key = ""
+		_rebuild()
+		show_message("Removed the storage. Its line no longer takes what it held.")
+		return
 	if ":" in _sel_key and _end_name(_sel_key) != "intake":
 		# The dock or a scrap bin: belts from every line that ran into it go with it.
 		var line := _pipeline(_pid_of(_sel_key))
 		var place := _end_name(_sel_key)
 		if FactoryFloor.is_bin(place) and place != "scrap":
 			line["bins"] = (line.get("bins", []) as Array).filter(func(b) -> bool: return str(b.get("id", "")) != place)
+		elif FactoryFloor.is_dock(place) and place != "dock":
+			line["docks"] = (line.get("docks", []) as Array).filter(func(b) -> bool: return str(b.get("id", "")) != place)
 		else:
 			line.erase(place)
 		_drop_belts_into(_sel_key)
@@ -990,18 +1498,28 @@ func handle_floor_input(event: InputEvent, world: Vector2) -> bool:
 		var focus := get_viewport().gui_get_focus_owner()
 		if focus is LineEdit or focus is TextEdit:
 			return false
+		note_edit()
 		if key.keycode == KEY_ESCAPE:
-			if not _placing.is_empty() or not _drag.is_empty():
+			if _hand_belt and _drag.is_empty():
+				_hand_belt = false
+				_refresh_ui()
+			elif not _placing.is_empty() or not _drag.is_empty():
 				_placing = ""
 				_drag = {}
 				floor_view.set_ghost({})
 				floor_view.set_wire({})
 				_refresh_ui()
+			elif _picked_count() > 0:
+				_clear_group()
+				_refresh_ui()
 			else:
 				_select("")
 			return true
 		if key.keycode == KEY_DELETE or key.keycode == KEY_BACKSPACE:
-			_remove_selected()
+			if _picked_count() > 1 or not _room_cells.is_empty():  # one picked room block counts too
+				_remove_group()
+			else:
+				_remove_selected()
 			return true
 		return false
 
@@ -1014,9 +1532,21 @@ func handle_floor_input(event: InputEvent, world: Vector2) -> bool:
 		if str(_drag.get("mode", "")) == "press":
 			if get_viewport().get_mouse_position().distance_to(_drag["screen"]) < DRAG_THRESHOLD:
 				return true
-			_drag["mode"] = "line" if _drag.get("whole_line", false) else "move"
+			if _drag.get("group_move", false):
+				_drag["mode"] = "group"
+			else:
+				_drag["mode"] = "line" if _drag.get("whole_line", false) else "move"
 			settings_window.visible = false  # out of the way while dragging
 		match str(_drag.get("mode", "")):
+			"group":
+				var shift: Vector2i = floor_view.cell_at(world) - _drag["grab"]
+				var gbox: Rect2i = _drag["box"]
+				floor_view.set_ghost({"pos": gbox.position + shift, "size": gbox.size, "ok": _group_fits(shift)})
+				return true
+			"box":
+				_drag["to"] = world
+				floor_view.set_select_box(Rect2(_drag["from"], Vector2.ZERO).expand(world))
+				return true
 			"move":
 				var tl: Vector2i = floor_view.cell_at(world) - _drag["offset"]
 				floor_view.set_ghost({"pos": tl, "ok": floor_view.is_free(tl, _drag["key"])})
@@ -1028,7 +1558,11 @@ func handle_floor_input(event: InputEvent, world: Vector2) -> bool:
 						"ok": floor_view.line_fits(_drag["pid"], delta)})
 				return true
 			"wire":
-				floor_view.set_wire({"from": _drag["from"], "to": world, "kind": _drag["kind"]})
+				if _drag.get("hand", false):
+					_lay_cell(floor_view.cell_at(world))
+					floor_view.set_wire({"cells": _drag["cells"], "kind": _drag["kind"]})
+				else:
+					floor_view.set_wire({"from": _drag["from"], "to": world, "kind": _drag["kind"]})
 				return true
 		return false
 
@@ -1036,6 +1570,7 @@ func handle_floor_input(event: InputEvent, world: Vector2) -> bool:
 	if click == null or click.button_index != MOUSE_BUTTON_LEFT:
 		return false
 	if click.pressed:
+		note_edit()  # settings typed in so far are one undo step
 		return _press(world)
 	return _release(world)
 
@@ -1043,8 +1578,10 @@ func handle_floor_input(event: InputEvent, world: Vector2) -> bool:
 ## True where a left press would do nothing in build mode (so main can pan instead): not
 ## placing a machine, and no port, machine, station or belt under the mouse.
 func is_empty_floor(world: Vector2) -> bool:
-	if not _placing.is_empty():
-		return false
+	if not _placing.is_empty() or Input.is_key_pressed(KEY_SHIFT):
+		return false  # Shift+drag on empty floor draws a box to pick machines
+	if _hand_belt and floor_view.node_at(world).is_empty():
+		return false  # Conveyor belt is on: a drag on the floor lays belt
 	for k in floor_view.footprints:
 		var ports: Dictionary = floor_view.output_ports(k)
 		for port in ports:
@@ -1057,6 +1594,12 @@ func is_empty_floor(world: Vector2) -> bool:
 
 ## A click (no drag) on empty floor: close the settings.
 func click_empty_floor() -> void:
+	# A click on a door picks it (Delete removes it); the floor counts as empty for panning.
+	var rooms := _rooms()
+	var c := floor_view.cell_at(floor_view.get_global_mouse_position())
+	if rooms and rooms.has_method("door_at") and rooms.door_at(c):
+		pick_room_cell(c)
+		return
 	_select("")
 
 
@@ -1074,24 +1617,60 @@ func _press(world: Vector2) -> bool:
 		var ports: Dictionary = floor_view.output_ports(k)
 		for port in ports:
 			if world.distance_to(ports[port]) <= PORT_GRAB:
-				_select(k)
+				if not _hand_belt:
+					_select(k)  # (laying by hand, its settings would slide the view mid-drag)
 				_drag = {"mode": "wire", "key": k, "port": port, "from": ports[port],
 						"kind": "fail" if port == "fail" else "pass"}
+				if _hand_belt:
+					_drag["hand"] = true
+					_drag["cells"] = [floor_view.out_cell(k, port)]
+					floor_view.set_wire({"cells": _drag["cells"], "kind": _drag["kind"]})
 				return true
 	var hit := floor_view.node_at(world)
+	var shift_held := Input.is_key_pressed(KEY_SHIFT)
+	if _hand_belt and hit.is_empty() and not shift_held:
+		# Conveyor belt is on: lay belt from this cell. It becomes a link once it starts at an
+		# output (or just in front of one) and ends at an input; see _finish_hand_belt.
+		_drag = {"mode": "wire", "hand": true, "key": "", "port": "", "kind": "pass",
+				"cells": [floor_view.cell_at(world)]}
+		floor_view.set_wire({"cells": _drag["cells"], "kind": "pass"})
+		return true
 	if not hit.is_empty():
-		_select(hit)
-		# Only a move once the mouse travels a little: a plain click just opens the settings.
+		if _picked_count() > 1 and _group.has(hit):
+			pass  # one of the picked group: a drag moves them all
+		elif not shift_held:
+			_clear_group()
+			_select(hit)
+		# Only a move once the mouse travels a little: a plain click just opens the settings
+		# (Shift+click adds it to the picked group, or takes it out).
 		_drag = {"mode": "press", "key": hit, "offset": floor_view.cell_at(world) - floor_view.footprints[hit],
-				"start": floor_view.footprints[hit], "screen": get_viewport().get_mouse_position()}
-		if Input.is_key_pressed(KEY_SHIFT):
+				"start": floor_view.footprints[hit], "screen": get_viewport().get_mouse_position(),
+				"shift": shift_held}
+		if _picked_count() > 1 and _group.has(hit):
+			_arm_group_move(world)
+		elif shift_held:
 			_arm_line_move(_pid_of(hit), world)
+		return true
+	if not shift_held and _room_cells.has(floor_view.cell_at(world)) and _picked_count() > 1:
+		# A picked room block: a drag moves the whole group, a click lets it go.
+		_drag = {"mode": "press", "key": "", "screen": get_viewport().get_mouse_position(), "shift": false}
+		_arm_group_move(world)
+		return true
+	if shift_held:
+		_drag = {"mode": "box", "from": world, "to": world}
+		return true
+	# A click on a door picks it on its own (Delete removes it, Esc lets go).
+	var rooms := _rooms()
+	if rooms and rooms.has_method("door_at") and rooms.door_at(floor_view.cell_at(world)):
+		pick_room_cell(floor_view.cell_at(world))
 		return true
 	var route := floor_view.route_at(floor_view.cell_at(world))
 	if route >= 0:
 		var r: Dictionary = floor_view.routes[route]
-		_select("", {"pid": r["pid"], "from": r["from"], "port": r["port"]})
+		_clear_group()
+		_select("", {"pid": r["pid"], "from": r["from"], "port": r["port"], "conv": str(r.get("conveyor", ""))})
 		return true
+	_clear_group()
 	_select("")
 	return true
 
@@ -1101,7 +1680,47 @@ func _release(world: Vector2) -> bool:
 	_drag = {}
 	match str(drag.get("mode", "")):
 		"press":
+			if drag.get("shift", false):
+				_toggle_in_group(str(drag["key"]))
 			return true  # a click: the settings are already open
+		"box":
+			floor_view.set_select_box(Rect2())
+			var area := Rect2(drag["from"], Vector2.ZERO).expand(world)
+			var added := 0
+			for k in floor_view.footprints:
+				var r := Rect2(Vector2(floor_view.footprints[k]) * FactoryFloor.CELL, Vector2(2, 2) * FactoryFloor.CELL)
+				if area.intersects(r) and not _group.has(k):
+					_group[k] = true
+					added += 1
+			var rooms := _rooms()
+			if rooms and rooms.has_method("cells_in"):
+				var cells := Rect2i(floor_view.cell_at(area.position), Vector2i.ONE) \
+						.merge(Rect2i(floor_view.cell_at(area.end), Vector2i.ONE))
+				for c in rooms.cells_in(cells):
+					_room_cells[c] = true
+			if _group.size() == 1 and _room_cells.is_empty():
+				_select(str(_group.keys()[0]))
+				_clear_group()
+			elif _picked_count() > 0:
+				_select("")
+			_refresh_ui()
+			show_message(_group_words())
+			return true
+		"group":
+			floor_view.set_ghost({})
+			var shift: Vector2i = floor_view.cell_at(world) - drag["grab"]
+			if shift != Vector2i.ZERO and _group_fits(shift):
+				note_edit()
+				var steps := _history.size()
+				_shift_group(shift)
+				_rebuild()
+				_push_group_step(steps)
+			elif shift != Vector2i.ZERO:
+				show_message("They would land on something else. Pick an empty spot.")
+				_refresh_ui()
+			else:
+				_refresh_ui()
+			return true
 		"move":
 			floor_view.set_ghost({})
 			var tl: Vector2i = floor_view.cell_at(world) - drag["offset"]
@@ -1125,9 +1744,412 @@ func _release(world: Vector2) -> bool:
 			return true
 		"wire":
 			floor_view.set_wire({})
-			_finish_wire(drag, world)
+			if drag.get("hand", false) and str(drag.get("key", "")).is_empty():
+				_finish_hand_belt(drag)
+			else:
+				_finish_wire(drag, world)
 			return true
 	return false
+
+
+## A belt laid by hand from open floor: find the output it starts at and the input it ends at
+## (either way round), then link them along the cells laid.
+func _finish_hand_belt(drag: Dictionary) -> void:
+	var cells: Array = drag["cells"]
+	for attempt in 2:
+		var src := _output_at(cells[0], cells[1] if cells.size() > 1 else cells[0])
+		var target := _input_at(cells[-1])
+		if not src.is_empty() and not target.is_empty():
+			if cells[0] != floor_view.out_cell(src[0], src[1]):
+				cells.push_front(floor_view.out_cell(src[0], src[1]))  # laid from inside the port
+			var d := {"mode": "wire", "hand": true, "key": src[0], "port": src[1],
+					"kind": "fail" if src[1] == "fail" else "pass", "cells": cells}
+			_finish_wire(d, floor_view.cell_center(cells[-1]))
+			return
+		cells.reverse()  # laid from the input back to the output
+	_lay_free_conveyor(drag)
+
+
+## Conveyor cells as [[x, y], ...] for the draft.
+static func _cell_pairs(cells: Array) -> Array:
+	var out: Array = []
+	for c in cells:
+		out.append([c.x, c.y])
+	return out
+
+
+## The free conveyor whose open end is cell c: [pid, conveyor, at_start], or [].
+func _conveyor_end_at(c: Vector2i, skip := {}) -> Array:
+	for p in draft:
+		for conv in FactoryFloor.conveyors_of(p):
+			if conv == skip or conv.get("loop", false):
+				continue
+			var cs: Array = conv.get("cells", [])
+			if cs.is_empty():
+				continue
+			if Vector2i(int(cs[0][0]), int(cs[0][1])) == c:
+				return [str(p.get("id", "")), conv, true]
+			if Vector2i(int(cs[-1][0]), int(cs[-1][1])) == c:
+				return [str(p.get("id", "")), conv, false]
+	return []
+
+
+## Take a free conveyor off the draft.
+func _drop_conveyor(pid: String, conv: Dictionary) -> void:
+	var p := _pipeline(pid)
+	p["conveyors"] = FactoryFloor.conveyors_of(p).filter(func(x) -> bool: return x != conv)
+	if (p["conveyors"] as Array).is_empty():
+		p.erase("conveyors")
+
+
+## A belt laid by hand that doesn't link an output to an input: it stays on the floor as a free
+## conveyor (a closed loop if it came back to where it started). Laid on from the open end of
+## one already there, the two become one, and a link if that now runs output to input.
+func _lay_free_conveyor(drag: Dictionary) -> void:
+	var cells: Array = (drag["cells"] as Array).duplicate()
+	var loop: bool = drag.get("loop", false)
+	var joined: Array = []  # [pid, conveyor] taken into this one
+	if not loop:
+		var head := _conveyor_end_at(cells[0])
+		if not head.is_empty() and not head[2]:  # carries on from its far end
+			var old: Array = _cells_of_conv(head[1])
+			old.pop_back()
+			cells = old + cells
+			joined.append(head)
+		var tail := _conveyor_end_at(cells[-1], head[1] if not head.is_empty() else {})
+		if not tail.is_empty() and tail[2]:  # runs on into its near end
+			var old: Array = _cells_of_conv(tail[1])
+			old.pop_front()
+			cells = cells + old
+			joined.append(tail)
+	# Nothing doubled back over itself, and no machine under it.
+	var seen := {}
+	for c in cells:
+		if seen.has(c) or floor_view.under_node(c):
+			show_message("That belt runs over itself or under a machine. Lay it again round them.")
+			return
+		seen[c] = true
+	# Ending on another belt (not at its start): this one runs into it from the side.
+	var into := -1
+	if not loop and cells.size() >= 2:
+		var r_end := floor_view.route_at(cells[-1])
+		if r_end >= 0 and not _is_joined(floor_view.routes[r_end], joined) \
+				and (floor_view.routes[r_end]["cells"] as Array).find(cells[-1]) > 0:
+			into = r_end
+	for i in cells.size():
+		if i == cells.size() - 1 and into >= 0:
+			continue
+		var r := floor_view.route_at(cells[i])
+		if r >= 0 and not _is_joined(floor_view.routes[r], joined) and not floor_view.can_cross(cells, i):
+			show_message("Belts can't branch off another one: a Splitter does that. Start on open floor, a machine's output or the end of a conveyor." if i == 0
+					else CROSS_HINT)
+			return
+	if cells.size() < 2:
+		show_message("Drag across the floor to lay a conveyor. Start on a machine's output and end at an input to link them.")
+		return
+	if into >= 0 and not str(floor_view.routes[into].get("from", "")).is_empty():
+		# Into a belt that carries crates: from a machine's output, it's a link to where that
+		# belt goes, joining it.
+		var src := _output_at(cells[0], cells[1])
+		if src.is_empty():
+			show_message("A belt that joins one carrying crates has to start at a machine's output (or run on from a conveyor that does).")
+			return
+		if not _join_link(src, cells, floor_view.routes[into]):
+			return
+		for j in joined:
+			_drop_conveyor(j[0], j[1])
+		_rebuild()
+		var b := _find_belt({"pid": _pid_of(src[0]), "from": _end_name(src[0]), "port": src[1]})
+		show_message("Joined: crates run on along that belt." if b.get("manual", false)
+				else "That join didn't fit (it has to meet a straight bit of that belt, the same colour), so the belt found its own way.")
+		return
+	for j in joined:
+		_drop_conveyor(j[0], j[1])
+	# Joined up into a run from an output to an input: that's a link.
+	if not joined.is_empty() and not loop:
+		for attempt in 2:
+			var src := _output_at(cells[0], cells[1])
+			var target := _input_at(cells[-1])
+			if not src.is_empty() and not target.is_empty():
+				var d := {"mode": "wire", "hand": true, "key": src[0], "port": src[1],
+						"kind": "fail" if src[1] == "fail" else "pass", "cells": cells}
+				_finish_wire(d, floor_view.cell_center(cells[-1]))
+				return
+			cells.reverse()
+	var pid := current if not _pipeline(current).is_empty() else ""
+	if not joined.is_empty():
+		pid = str(joined[0][0])
+	else:
+		var src := _output_at(cells[0], cells[1])
+		if not src.is_empty():
+			pid = _pid_of(src[0])  # laid from a machine's output: it's that line's
+	if pid.is_empty():
+		_new_pipeline(Vector2i(-1, -1), false)  # nothing on the floor yet: a line to keep it on
+		pid = current
+	var p := _pipeline(pid)
+	var n := 1
+	var ids := {}
+	for q in draft:
+		for conv in FactoryFloor.conveyors_of(q):
+			ids[str(conv.get("id", ""))] = true
+	while ids.has("conv_%d" % n):
+		n += 1
+	var conv := {"id": "conv_%d" % n, "cells": _cell_pairs(cells)}
+	if loop:
+		conv["loop"] = true
+	if into >= 0:
+		conv["join"] = true  # runs into another conveyor's side: laid after it
+	var list: Array = FactoryFloor.conveyors_of(p)
+	list.append(conv)
+	p["conveyors"] = list
+	_rebuild()
+	show_message("Loop laid: it runs round and round." if loop else
+			"Conveyor laid. Lay on from its end to make it longer, or start on a machine's output and end at an input to link them.")
+
+
+func _is_joined(route: Dictionary, joined: Array) -> bool:
+	for j in joined:
+		if route.get("belt") == j[1]:
+			return true
+	return false
+
+
+## A belt laid by hand from output src ([key, port]) that ends on the side of link `into`:
+## a link to the same place, joining it there. False (with a message) if it can't be.
+func _join_link(src: Array, cells: Array, into: Dictionary) -> bool:
+	var pid := _pid_of(src[0])
+	var target := floor_view.node_key(str(into["pid"]), str(into["to"]))
+	if target == src[0]:
+		show_message("That belt goes back into the machine this one starts at.")
+		return false
+	var kind := "fail" if src[1] == "fail" else "pass"
+	if str(into["kind"]) != kind and not floor_view.is_merger(target):
+		show_message("A red belt can only join a red one, and a green belt a green one.")
+		return false
+	if FactoryFloor.is_storage(src[0]) or _end_name(target) == "intake" or FactoryFloor.is_storage(target):
+		show_message("Storages and intakes link straight to each other, not by joining belts.")
+		return false
+	_adopt(pid, target)
+	var to := _belt_target(pid, target)
+	_connect(pid, _end_name(src[0]), src[1], to, _cell_pairs(cells))
+	var b := _find_belt({"pid": pid, "from": _end_name(src[0]), "port": src[1]})
+	if b.get("manual", false):
+		b["join"] = true  # routed after the belt it joins
+	return true
+
+
+func _cells_of_conv(conv: Dictionary) -> Array:
+	var out: Array = []
+	for c in conv.get("cells", []):
+		out.append(Vector2i(int(c[0]), int(c[1])))
+	return out
+
+
+## The output a hand-laid belt starting on cell c leaves by: [footprint key, port], or [].
+func _output_at(c: Vector2i, _next: Vector2i) -> Array:
+	for k in floor_view.footprints:
+		for port in floor_view.output_ports(k):
+			if floor_view.out_cell(k, port) == c:
+				return [k, port]
+	return []
+
+
+## What a hand-laid belt ending on cell c runs into: the footprint key of a machine, dock or bin
+## whose input cell (or footprint) it is, or "".
+func _input_at(c: Vector2i) -> String:
+	for k in floor_view.footprints:
+		if FactoryFloor.is_storage(k) or k.ends_with(":intake"):
+			continue
+		if floor_view.in_cell(k, "pass") == c or floor_view.in_cell(k, "fail") == c \
+				or Rect2i(floor_view.footprints[k], Vector2i(2, 2)).has_point(c):
+			return k
+	return ""
+
+
+# Picking several -------------------------------------------------------------
+
+func _toggle_in_group(key: String) -> void:
+	if _group.is_empty() and _sel_key != "" and _sel_key != key and floor_view.footprints.has(_sel_key):
+		_group[_sel_key] = true  # what was open joins the group
+	if _group.has(key):
+		_group.erase(key)
+	else:
+		_group[key] = true
+	if _group.size() <= 1 and _room_cells.is_empty():
+		var only := "" if _group.is_empty() else str(_group.keys()[0])
+		_clear_group()
+		_select(only)
+	else:
+		_select("")
+	show_message(_group_words())
+
+
+func _group_words() -> String:
+	if _picked_count() <= 1:
+		return ""
+	var what := "%d picked" % _group.size() if _room_cells.is_empty() else \
+			"%d picked, with %d room block%s" % [_group.size(), _room_cells.size(), "" if _room_cells.size() == 1 else "s"]
+	return "%s. Drag any of them to move them all, or press Delete to remove them. Shift+click adds or takes one out; Esc lets go." % what
+
+
+## Pick one room block on its own, such as a door you clicked: Delete then removes it.
+func pick_room_cell(c: Vector2i) -> void:
+	_clear_group()
+	_select("")
+	_room_cells[c] = true
+	_refresh_ui()
+	show_message("Door picked. Press Delete to remove it, or Esc to let go.")
+
+
+func _clear_group() -> void:
+	_group.clear()
+	_room_cells.clear()
+
+
+## Machines, stations and room blocks picked together.
+func _picked_count() -> int:
+	return _group.size() + _room_cells.size()
+
+
+## The room layer (room_layer.gd), if there is one: main.gd hands us its undo.
+func _rooms() -> Object:
+	return rooms_undo.get_object() if rooms_undo.is_valid() else null
+
+
+func _show_group() -> void:
+	if floor_view:
+		floor_view.set_group(_group if visible else {}, _room_cells if visible else {})
+
+
+func _arm_group_move(world: Vector2) -> void:
+	var box := Rect2i()
+	var first := true
+	for k in _group:
+		if not floor_view.footprints.has(k):
+			continue
+		var r := Rect2i(floor_view.footprints[k], Vector2i(2, 2))
+		box = r if first else box.merge(r)
+		first = false
+	for c in _room_cells:
+		box = Rect2i(c, Vector2i.ONE) if first else box.merge(Rect2i(c, Vector2i.ONE))
+		first = false
+	_drag["group_move"] = true
+	_drag["grab"] = floor_view.cell_at(world)
+	_drag["box"] = box
+
+
+## Whether the group could sit `shift` cells away without landing on anything else.
+func _group_fits(shift: Vector2i) -> bool:
+	var others := {}
+	for k in floor_view.footprints:
+		if not _group.has(k):
+			for c in _cells2(floor_view.footprints[k]):
+				others[c] = true
+	var landing := others.duplicate()
+	for k in _group:
+		if floor_view.footprints.has(k):
+			for c in _cells2(floor_view.footprints[k] + shift):
+				if others.has(c) or (floor_view.room_walls.has(c) and not _room_cells.has(c)):
+					return false
+				landing[c] = true
+	var rooms := _rooms()
+	if not _room_cells.is_empty() and rooms and rooms.has_method("can_shift"):
+		return rooms.can_shift(_room_cells.keys(), shift, landing)
+	return true
+
+
+static func _cells2(tl: Vector2i) -> Array:
+	return [tl, tl + Vector2i(1, 0), tl + Vector2i(0, 1), tl + Vector2i(1, 1)]
+
+
+## A belt's ends as footprint keys.
+func _belt_ends(pid: String, b: Dictionary) -> Array:
+	var from := str(b.get("from", ""))
+	var to := str(b.get("to", ""))
+	var from_key := "%s:%s" % [pid, from] if from == "intake" or FactoryFloor.is_storage(from) else from
+	var to_key := to
+	if not ":" in to and (to in FactoryFloor.STATIONS or FactoryFloor.is_bin(to) or FactoryFloor.is_dock(to)):
+		to_key = "%s:%s" % [pid, to]
+	return [from_key, to_key]
+
+
+## Move everything picked by `shift` cells. Belts between two picked things keep their shape;
+## the floor routes the others again.
+func _shift_group(shift: Vector2i) -> void:
+	var rooms := _rooms()
+	if not _room_cells.is_empty() and rooms and rooms.has_method("shift_cells"):
+		# The blocks move too, as part of the same undo step (see _push_group_step).
+		rooms.shift_cells(_room_cells.keys(), shift)
+		var moved := {}
+		for c in _room_cells:
+			moved[c + shift] = true
+		_room_cells = moved
+		_pending_rooms_step = true
+	for k in _group:
+		var place := _node(k)
+		var pos = place.get("pos")
+		if pos is Array and pos.size() == 2:
+			place["pos"] = [int(pos[0]) + shift.x, int(pos[1]) + shift.y]
+	for p in draft:
+		var pid := str(p.get("id", ""))
+		for b in p.get("belts", []):
+			var ends := _belt_ends(pid, b)
+			var path = b.get("path")
+			if not path is Array:
+				continue
+			if _group.has(ends[0]) and _group.has(ends[1]):
+				var moved: Array = []
+				for c in path:
+					moved.append([int(c[0]) + shift.x, int(c[1]) + shift.y])
+				b["path"] = moved
+			elif _group.has(ends[0]) or _group.has(ends[1]):
+				b.erase("path")
+
+
+## One undo step for a group edit that moved or removed room blocks as well as machines: the
+## draft as it was, plus the room layer's own step.
+## steps: the history's size before the edit (the draft's own step, if any, came after it).
+func _push_group_step(steps: int) -> void:
+	if not _pending_rooms_step:
+		return
+	_pending_rooms_step = false
+	if _history.size() > steps and str(_history[-1].get("who", "")) == "build":
+		_history[-1]["rooms"] = true  # the machines' step undoes the blocks too
+		return
+	_push({"who": "build", "draft": _snapshot(), "current": current, "rooms": true})
+	_last = _snapshot()
+
+
+## Delete removes every picked machine, bin, storage and dock (an intake goes with its line),
+## and the room blocks picked with them.
+func _remove_group() -> void:
+	var keys := _group.keys()
+	var skipped := 0
+	var blocks := _room_cells.keys()
+	note_edit()  # settings typed before it are their own step
+	var steps := _history.size()
+	_clear_group()
+	var rooms := _rooms()
+	if not blocks.is_empty() and rooms and rooms.has_method("erase_cells"):
+		rooms.erase_cells(blocks)
+		_pending_rooms_step = true
+	_restoring = true  # one undo step for all of them
+	for k in keys:
+		if not floor_view.footprints.has(k) and _node(k).is_empty():
+			continue
+		if ":" in k and _end_name(k) == "intake":
+			skipped += 1
+			continue
+		_sel_key = k
+		_sel_belt = {}
+		_remove_selected()
+	_sel_key = ""
+	_restoring = false
+	note_edit()
+	_push_group_step(steps)
+	_refresh_ui()
+	show_message("Removed %d. %s" % [keys.size() - skipped + blocks.size(),
+			"Intakes stay: delete a whole line from the Lines list." if skipped > 0 else "Ctrl+Z brings them back."])
 
 
 ## Make the press that's starting a drag move every part of this line.
@@ -1155,6 +2177,8 @@ func _shift_line(pid: String, delta: Vector2i) -> void:
 			places.append(p[st])
 	places.append_array(p.get("machines", []))
 	places.append_array(p.get("bins", []))
+	places.append_array(p.get("docks", []))
+	places.append_array(FactoryFloor.storages_of(p))
 	for place in places:
 		var pos = place.get("pos")
 		if pos is Array and pos.size() == 2:
@@ -1166,6 +2190,11 @@ func _shift_line(pid: String, delta: Vector2i) -> void:
 			for c in path:
 				moved.append([int(c[0]) + delta.x, int(c[1]) + delta.y])
 			b["path"] = moved
+	for conv in FactoryFloor.conveyors_of(p):
+		var moved: Array = []
+		for c in conv.get("cells", []):
+			moved.append([int(c[0]) + delta.x, int(c[1]) + delta.y])
+		conv["cells"] = moved
 
 
 func _finish_wire(drag: Dictionary, world: Vector2) -> void:
@@ -1174,22 +2203,190 @@ func _finish_wire(drag: Dictionary, world: Vector2) -> void:
 		# Dropped just in front of a machine's input: count it.
 		target = floor_view.node_at(world + Vector2(FactoryFloor.CELL * 0.5, 0))
 	if target.is_empty() or target == drag["key"]:
+		if drag.get("hand", false) and target.is_empty():
+			_lay_free_conveyor({"cells": drag["cells"]})  # from an output to open floor: lay it there
 		return
 	var pid := _pid_of(drag["key"])
-	var to := _belt_target(pid, target)
+	if FactoryFloor.is_storage(drag["key"]):
+		_wire_storage(drag["key"], target)
+		return
+	if FactoryFloor.is_storage(target):
+		show_message("Nothing goes into a storage: drag from its port into an intake instead.")
+		return
 	if _end_name(target) == "intake":
 		show_message("Belts go into machines, the dock or the scrap bin.")
 		return
-	if FactoryFloor.is_bin(to) and drag["port"] != "fail":
-		show_message("Only a red belt (failed crates) can go into the scrap bin.")
-		return
-	if drag["port"] == "fail" and _is_dock(to):
-		show_message("A red belt carries failed crates: run it back to an earlier machine or into the scrap bin.")
-		return
-	_connect(pid, _end_name(drag["key"]), drag["port"], to)
+	var adopted := _adopt(pid, target)
+	var to := _belt_target(pid, target)
+	var laid: Array = _hand_path(drag, target) if drag.get("hand", false) else []
+	_connect(pid, _end_name(drag["key"]), drag["port"], to, laid)
 	_rebuild()
-	show_message("" if _pid_of(target) == pid else
+	if not laid.is_empty():
+		var b := _find_belt({"pid": pid, "from": _end_name(drag["key"]), "port": drag["port"]})
+		if b.get("manual", false):
+			show_message("Belt laid by hand.")
+		else:
+			show_message("That way is blocked, so the belt found its own way. " + CROSS_HINT)
+		return
+	show_message("" if adopted or _pid_of(target) == pid else
 			"Joined to %s: crates from this line carry on along it." % str(_pipeline(_pid_of(target)).get("name", "")))
+
+
+func _on_belt_tile_toggled(on: bool) -> void:
+	_hand_belt = on
+	_placing = ""
+	floor_view.set_ghost({})
+	_refresh_ui()
+
+
+## Laying a belt by hand: the mouse is over cell c. Fills in any cells skipped (a fast mouse)
+## in straight lines, and going back over the last cell takes it up again.
+func _lay_cell(c: Vector2i) -> void:
+	var cells: Array = _drag["cells"]
+	var last: Vector2i = cells[-1]
+	if _drag.get("loop", false):
+		if c == cells[-1] or c == cells[0]:
+			return
+		_drag.erase("loop")  # pulled back out of the closed loop: it opens again
+	while last != c:
+		var step := Vector2i(signi(c.x - last.x), 0) if last.x != c.x else Vector2i(0, signi(c.y - last.y))
+		var next := last + step
+		if cells.size() > 1 and cells[-2] == next:
+			cells.pop_back()  # back the way it came
+		elif next == cells[0] and cells.size() >= 4 and str(_drag.get("key", "")).is_empty():
+			_drag["loop"] = true  # back to where it started: a closed loop
+			return
+		elif cells.has(next) or floor_view.under_node(next):
+			return  # never loop over itself, or run under a machine
+		else:
+			cells.append(next)
+		last = next
+
+
+## The cells laid by hand, from the output port's cell to the cell in front of the target's
+## input (filled in straight, then along, if it was dropped short of it or onto the machine).
+func _hand_path(drag: Dictionary, target: String) -> Array:
+	var goal := floor_view.in_cell(target, drag["kind"])
+	if floor_view.is_merger(target) and not (drag["cells"] as Array).is_empty():
+		# Either input of a belt merger: the one nearer where it was laid to.
+		var lower := floor_view.in_cell(target, "fail")
+		var upper := floor_view.in_cell(target, "pass")
+		var end: Vector2i = drag["cells"][-1]
+		goal = lower if (end - lower).length_squared() < (end - upper).length_squared() else upper
+	var cells: Array = []
+	for c in drag["cells"]:
+		if c == goal:
+			cells.append(c)
+			break
+		if floor_view.node_at(Vector2(c) * FactoryFloor.CELL + Vector2.ONE * FactoryFloor.CELL * 0.5) == target:
+			break  # onto the machine itself: it goes in at its input from here
+		cells.append(c)
+	if cells.is_empty():
+		return []
+	var last: Vector2i = cells[-1]
+	while last != goal:
+		var step := Vector2i(signi(goal.x - last.x), 0) if last.x != goal.x else Vector2i(0, signi(goal.y - last.y))
+		last += step
+		if cells.has(last):
+			return []
+		cells.append(last)
+	var out: Array = []
+	for c in cells:
+		out.append([c.x, c.y])
+	return out
+
+
+## A machine placed while another line was picked, belted into for the first time: it joins
+## the line the belt comes from (with its own belts out), so it isn't stranded on a line whose
+## intake never reaches it. Returns whether it moved.
+func _adopt(pid: String, target: String) -> bool:
+	if ":" in target:
+		return false
+	var from_pid := _pid_of(target)
+	if from_pid.is_empty() or from_pid == pid:
+		return false
+	for q in draft:
+		for b in q.get("belts", []):
+			if str(b.get("to", "")) == target:
+				return false
+	var src := _pipeline(from_pid)
+	var dst := _pipeline(pid)
+	var m := _machine(target)
+	if src.is_empty() or dst.is_empty() or m.is_empty():
+		return false
+	# A line with no intake (machines placed before any line) comes along whole from here: the
+	# machines its belts lead on to as well.
+	var going := {target: true}
+	if not src.get("intake") is Dictionary:
+		var more := true
+		while more:
+			more = false
+			for b in src.get("belts", []):
+				var to := str(b.get("to", ""))
+				if going.has(str(b.get("from", ""))) and not going.has(to) and not _machine(to).is_empty() \
+						and _pid_of(to) == from_pid:
+					going[to] = true
+					more = true
+	var list: Array = dst.get("machines", [])
+	for x in (src.get("machines", []) as Array).duplicate():
+		if going.has(str(x.get("id", ""))):
+			list.append(x)
+	dst["machines"] = list
+	src["machines"] = (src.get("machines", []) as Array).filter(func(x) -> bool: return not going.has(str(x.get("id", ""))))
+	var keep: Array = []
+	var moved: Array = dst.get("belts", [])
+	for b in src.get("belts", []):
+		if not going.has(str(b.get("from", ""))):
+			keep.append(b)
+			continue
+		var to := str(b.get("to", ""))
+		if not ":" in to and (to in FactoryFloor.STATIONS or FactoryFloor.is_bin(to) or FactoryFloor.is_dock(to)):
+			to = "%s:%s" % [from_pid, to]  # the old line's dock or bin, named in full
+		if to.begins_with(pid + ":"):
+			to = to.get_slice(":", 1)
+		b["to"] = to
+		moved.append(b)
+	src["belts"] = keep
+	dst["belts"] = moved
+	_drop_if_empty(from_pid)
+	return true
+
+
+## A belt from a storage into an intake. The storage moves to that intake's line (a storage
+## feeds one intake), and a line takes each source from one storage.
+func _wire_storage(key: String, target: String) -> void:
+	if _end_name(target) != "intake":
+		show_message("A storage's belt goes into an intake.")
+		return
+	var from_line := _pipeline(_pid_of(key))
+	var to_pid := _pid_of(target)
+	var to_line := _pipeline(to_pid)
+	var sid := _end_name(key)
+	var st := _node(key)
+	for other in FactoryFloor.fed_storages(to_line):
+		if other != st and str(other.get("source", "")) == str(st.get("source", "")) \
+				and github_name(str(other.get("repo", ""))) == github_name(str(st.get("repo", ""))) \
+				and str(other.get("query", "")).strip_edges().to_lower() == str(st.get("query", "")).strip_edges().to_lower():
+			show_message("%s already takes %s from another storage with the same repo and filter. Give this one another repo or filter, or remove that one."
+					% [str(to_line.get("name", to_pid)), str(STORE_WORDS.get(str(st.get("source", "")), ""))])
+			return
+	from_line["belts"] = (from_line.get("belts", []) as Array).filter(func(b) -> bool: return str(b.get("from", "")) != sid)
+	if from_line != to_line:
+		from_line["storages"] = FactoryFloor.storages_of(from_line).filter(func(s2) -> bool: return s2 != st)
+		var stores: Array = FactoryFloor.storages_of(to_line)
+		stores.append(st)
+		to_line["storages"] = stores
+		if not from_line.get("intake") is Dictionary and FactoryFloor.storages_of(from_line).is_empty() \
+				and (from_line.get("machines", []) as Array).is_empty():
+			draft.erase(from_line)  # it only held storages waiting for an intake
+	if not to_line.has("sources") or not to_line["sources"] is Array:
+		to_line["sources"] = []
+	_connect(to_pid, sid, "out", "intake")
+	_sel_key = "%s:%s" % [to_pid, sid]
+	current = to_pid
+	_rebuild()
+	show_message("%s now takes %s from this storage." % [str(to_line.get("name", to_pid)),
+			str(STORE_WORDS.get(str(st.get("source", "")), ""))])
 
 
 # Settings ---------------------------------------------------------------------
@@ -1223,6 +2420,16 @@ func _on_timeout_changed(minutes: float) -> void:
 	_machine(_sel_key)["timeout_seconds"] = minutes * 60.0 if minutes > 0 else null
 
 
+func _on_retries_changed(value: float) -> void:
+	if _loading:
+		return
+	var m := _machine(_sel_key)
+	if int(value) > 0:
+		m["retries"] = int(value)
+	else:
+		m.erase("retries")
+
+
 func _on_prompt_changed() -> void:
 	if _loading:
 		return
@@ -1230,40 +2437,26 @@ func _on_prompt_changed() -> void:
 
 
 ## Earlier machines on the line (by the pass belts) that a failure here can go back to.
-func _fill_fail_picker(id: String) -> void:
-	_fail_picker.clear()
-	_fail_picker.add_item("Nowhere: it waits here for me")
-	var chain: Array = floor_view.order.get(_pid_of(id), [])
-	var at := chain.find(id)
-	var pid := _pid_of(id)
-	var bins: Array = []  # every scrap bin in the factory, as a belt from this line names it
-	for q in draft:
-		var qid := str(q.get("id", ""))
-		for bin in FactoryFloor.bins_of(q):
-			if bin == "scrap" and not q.get("scrap") is Dictionary:
-				continue
-			bins.append(bin if qid == pid else "%s:%s" % [qid, bin])
-	_fail_targets = bins + chain.slice(0, maxi(at, 0))
-	for target in _fail_targets:
-		var t := str(target)
-		if FactoryFloor.is_bin(t):
-			var place := _end_name(t)
-			_fail_picker.add_item("The scrap bin" if place == "scrap" else "Scrap bin %s" % place.trim_prefix("scrap_"))
-		else:
-			_fail_picker.add_item("Back to %s for rework" % _label_of(t))
+func _fill_fail_info(id: String) -> void:
 	var current_target := floor_view.on_fail(id)
-	var index := -1
-	for i in _fail_targets.size():
-		if floor_view.node_key(pid, str(_fail_targets[i])) == floor_view.node_key(pid, current_target):
-			index = i
-	_fail_picker.select(index + 1 if index >= 0 else 0)
-	_fail_label.text = ("If it fails, the red belt takes the crate to" if at >= 0
-			else "If it fails, the red belt takes the crate to (join it to the line first)")
+	if current_target.is_empty():
+		_fail_label.text = "Failed crates leave by the red port. No belt is connected to it, so they wait here for you. Drag from the red port to lay one."
+	elif FactoryFloor.is_bin(current_target):
+		var place := _end_name(current_target)
+		_fail_label.text = "Failed crates leave by the red port, along its belt into %s." % (
+				"the scrap bin" if place == "scrap" else "scrap bin %s" % place.trim_prefix("scrap_"))
+	elif _is_dock(current_target):
+		_fail_label.text = "Failed crates leave by the red port, along its belt to the shipping dock."
+	elif int(floor_view.depth.get(current_target, 0)) <= int(floor_view.depth.get(id, 0)):
+		_fail_label.text = "Failed crates leave by the red port, along its belt back to %s for rework." % _label_of(current_target)
+	else:
+		_fail_label.text = "Failed crates leave by the red port, along its belt on to %s, and carry on from there." % _label_of(current_target)
 	_scrap_box.visible = FactoryFloor.is_bin(current_target)
 	var when = _machine(id).get("scrap_when", null)
 	for kind in SCRAP_KINDS:
 		(_scrap_checks[kind] as CheckBox).set_pressed_no_signal(when == null or kind in when)
-	(_scrap_checks["rejected"] as CheckBox).visible = bool(_machine(id).get("gate", false))
+	(_scrap_checks["rejected"] as CheckBox).visible = FactoryFloor.gated(_machine(id),
+			catalog.get(str(_machine(id).get("type", "")), {}))
 
 
 ## The type's tick boxes (say, the Reviewer's "comment on the PR"), with this machine's values.
@@ -1421,20 +2614,6 @@ func _on_scrap_kinds_changed() -> void:
 		_machine(_sel_key).erase("scrap_when")  # all of them: the default
 	else:
 		_machine(_sel_key)["scrap_when"] = kinds
-
-
-func _on_fail_selected(picked: int) -> void:
-	if _loading or _sel_key.is_empty():
-		return
-	var pid := _pid_of(_sel_key)
-	var p := _pipeline(pid)
-	var id := _sel_key
-	if picked <= 0:
-		p["belts"] = (p["belts"] as Array).filter(func(b) -> bool:
-			return not (str(b.get("from", "")) == id and str(b.get("port", "")) == "fail"))
-	else:
-		_connect(pid, id, "fail", str(_fail_targets[picked - 1]))
-	_rebuild()
 
 
 ## Saves even a line that can't run yet: the backend pauses it and says why.

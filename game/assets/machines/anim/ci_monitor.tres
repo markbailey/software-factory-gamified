@@ -1,4 +1,4 @@
-[gd_resource type="SpriteFrames" load_steps=11 format=3]
+[gd_resource type="SpriteFrames" load_steps=15 format=3]
 
 [ext_resource type="Texture2D" path="res://assets/machines/anim/ci_monitor_idle_f0.svg" id="1"]
 [ext_resource type="Texture2D" path="res://assets/machines/anim/ci_monitor_idle_f1.svg" id="2"]
@@ -10,9 +10,24 @@
 [ext_resource type="Texture2D" path="res://assets/machines/anim/ci_monitor_run_f5.svg" id="8"]
 [ext_resource type="Texture2D" path="res://assets/machines/anim/ci_monitor_run_f6.svg" id="9"]
 [ext_resource type="Texture2D" path="res://assets/machines/anim/ci_monitor_run_f7.svg" id="10"]
+[ext_resource type="Texture2D" path="res://assets/machines/anim/ci_monitor_pass_f0.svg" id="11"]
+[ext_resource type="Texture2D" path="res://assets/machines/anim/ci_monitor_pass_f1.svg" id="12"]
+[ext_resource type="Texture2D" path="res://assets/machines/anim/ci_monitor_fail_f0.svg" id="13"]
+[ext_resource type="Texture2D" path="res://assets/machines/anim/ci_monitor_fail_f1.svg" id="14"]
 
 [resource]
 animations = [{
+"frames": [{
+"duration": 1.0,
+"texture": ExtResource("13")
+}, {
+"duration": 1.0,
+"texture": ExtResource("14")
+}],
+"loop": true,
+"name": &"fail",
+"speed": 2.0
+}, {
 "frames": [{
 "duration": 1.0,
 "texture": ExtResource("1")
@@ -22,6 +37,17 @@ animations = [{
 }],
 "loop": true,
 "name": &"idle",
+"speed": 2.0
+}, {
+"frames": [{
+"duration": 1.0,
+"texture": ExtResource("11")
+}, {
+"duration": 1.0,
+"texture": ExtResource("12")
+}],
+"loop": true,
+"name": &"pass",
 "speed": 2.0
 }, {
 "frames": [{

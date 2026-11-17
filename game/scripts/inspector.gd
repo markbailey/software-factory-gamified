@@ -5,6 +5,7 @@ extends PanelContainer
 
 signal closed
 signal open_crate(item_id: int)
+signal pause_toggled(machine_id: String, paused: bool)
 
 const WIDTH := 360.0  # the left dock
 const C_TEXT := "E6E9EF"
@@ -25,6 +26,21 @@ var _last_output := ""
 var _content: VBoxContainer
 
 
+var _pause_button: Button
+var _paused := false
+
+
+## Whether this machine is paused by you (paused), and why it's held otherwise (the line or
+## the factory is paused: then its own button can't resume it).
+func set_paused(paused: bool, other: String) -> void:
+	_paused = paused
+	_pause_button.icon = load("res://assets/ui/icon_play.svg" if paused else "res://assets/ui/icon_pause.svg")
+	_pause_button.tooltip_text = ("Resume: let crates into this machine again" if paused else
+			"Pause: stop crates going into this machine. The one inside finishes; the rest wait on the belt.")
+	if not other.is_empty() and not paused:
+		_pause_button.tooltip_text += "\n(%s.)" % other
+
+
 func _ready() -> void:
 	theme_type_variation = &"PanelDock"
 	custom_minimum_size = Vector2(WIDTH, 0)
@@ -38,6 +54,12 @@ func _ready() -> void:
 	_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_title.clip_text = true
 	header.add_child(_title)
+	_pause_button = Button.new()
+	_pause_button.theme_type_variation = &"ButtonGhost"
+	_pause_button.focus_mode = Control.FOCUS_NONE
+	_pause_button.pressed.connect(func() -> void: pause_toggled.emit(machine_id, not _paused))
+	header.add_child(_pause_button)
+	set_paused(false, "")
 	var esc := Label.new()
 	esc.text = "Esc"
 	esc.theme_type_variation = &"LabelKey"
@@ -178,9 +200,9 @@ func show_status(data: Dictionary) -> void:
 	if bool(data.get("gate", false)):
 		match str(data.get("auto_approve", "")):
 			"low":
-				facts.append("approves by itself when the review looks good and the risk is low; otherwise waits for you")
+				facts.append("lets crates through by itself when their risk is low; otherwise waits for you")
 			"medium":
-				facts.append("approves by itself when the review looks good and the risk is low or medium; otherwise waits for you")
+				facts.append("lets crates through by itself when their risk is low or medium; otherwise waits for you")
 			_:
 				facts.append("waits for your approval")
 	facts.append("failures go %s" % str(data.get("on_fail", "to the scrap bin")))
@@ -197,7 +219,8 @@ func show_status(data: Dictionary) -> void:
 
 	_crate_id = int(crate.get("id", -1)) if not crate.is_empty() else -1
 	_crate_button.visible = _crate_id >= 0
-	_crate_button.text = "Open crate #%d's full log" % _crate_id
+	_crate_button.text = "Crate #%d" % _crate_id
+	_crate_button.tooltip_text = "Log: open crate #%d's full log" % _crate_id
 
 	var lines: Array = data.get("output", [])
 	_output_title.visible = not lines.is_empty()

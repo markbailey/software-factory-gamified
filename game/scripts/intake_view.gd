@@ -4,9 +4,10 @@ extends PanelContainer
 
 signal closed
 signal open_crate(item_id: int)
-signal pull(source: String, ref: String)
-signal check(source: String)
+signal pull(source: String, ref: String, storage: String)
+signal check(source: String, storage: String)
 signal submit(pipeline: String, text: String)
+signal pause_toggled(pipeline: String, paused: bool)
 
 const WIDTH := 360.0  # the left dock
 const C_TEXT := "E6E9EF"
@@ -16,21 +17,38 @@ const C_GREEN := "5ABF66"
 const C_RED := "E5484D"
 const C_AMBER := "F2B84C"
 const SOURCE_TITLES := {"game": "Typed in the game", "github": "GitHub issues", "jira": "Jira issues",
-		"pr_review": "Pull requests to review", "prd": "PRDs"}
+		"pr_review": "Pull requests to review", "prd": "PRDs", "github_pr": "Open PRs"}
 const SOURCE_ICONS := {"game": "icon_crate", "github": "icon_github", "jira": "icon_jira", "pr_review": "icon_pr",
-		"prd": "icon_prd"}
+		"prd": "icon_prd", "github_pr": "icon_pr"}
 const STATE_WORDS := {"queued": "at the intake", "waiting": "on the line", "running": "on the line",
 		"moving": "on the line", "awaiting_approval": "waiting for you", "held": "held at a machine for you", "shipped": "shipped",
 		"scrapped": "in the scrap bin"}
 const STATE_COLORS := {"awaiting_approval": C_AMBER, "held": C_RED, "shipped": C_GREEN, "scrapped": C_RED}
 
 var pipeline := ""
+var only_source := ""  # a storage's window: just that source
+var only_storage := ""  # and just that storage (its id), when the listing says which is which
+var store_name := ""  # its title then ("Jira issues storage")
 var _title: Label
 var _scroll: ScrollContainer
 var _content: VBoxContainer
 var _pending := {}  # "source|ref" being pulled in, so its button shows that
 var _draft := ""  # a PRD being pasted, kept while the listing refreshes
 var _paste_box: TextEdit
+
+
+var _pause_button: Button
+var _paused := false
+
+
+## Whether this line is paused (its storages bring nothing in, and no crate goes into its
+## machines). The button only shows in the intake's own window.
+func set_paused(paused: bool) -> void:
+	_paused = paused
+	_pause_button.icon = load("res://assets/ui/icon_play.svg" if paused else "res://assets/ui/icon_pause.svg")
+	_pause_button.tooltip_text = ("Resume line: start this line again" if paused else
+			"Pause line: stop this line. Nothing new comes in, and crates wait on the belts until you resume it. Machines finish the crate inside.")
+	_pause_button.visible = only_source.is_empty()
 
 
 func _ready() -> void:
@@ -46,6 +64,12 @@ func _ready() -> void:
 	_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_title.clip_text = true
 	header.add_child(_title)
+	_pause_button = Button.new()
+	_pause_button.theme_type_variation = &"ButtonGhost"
+	_pause_button.focus_mode = Control.FOCUS_NONE
+	_pause_button.pressed.connect(func() -> void: pause_toggled.emit(pipeline, not _paused))
+	header.add_child(_pause_button)
+	set_paused(false)
 	var esc := Label.new()
 	esc.text = "Esc"
 	esc.theme_type_variation = &"LabelKey"
@@ -72,7 +96,7 @@ func show_loading(pid: String, name: String) -> void:
 	if pid != pipeline:
 		_pending.clear()
 	pipeline = pid
-	_title.text = "%s intake" % name
+	_title.text = store_name if not only_source.is_empty() else "%s intake" % name
 	_clear()
 	_content.add_child(_text("[color=#%s]Looking up what's waiting...[/color]" % C_QUIET))
 
@@ -82,17 +106,25 @@ func show_listing(data: Dictionary, name: String) -> void:
 	if is_instance_valid(_paste_box) and _paste_box.has_focus() and str(data.get("pipeline", "")) == pipeline:
 		return  # don't pull the box out from under someone typing; the next refresh catches up
 	pipeline = str(data.get("pipeline", ""))
-	_title.text = "%s intake" % name
+	_title.text = store_name if not only_source.is_empty() else "%s intake" % name
 	var keep := _scroll.scroll_vertical
 	_clear()
 	var repo: Dictionary = data.get("repo", {}) if data.get("repo") is Dictionary else {}
-	if not repo.is_empty():
+	if not repo.is_empty() and only_storage.is_empty():
 		var what := str(repo.get("github", "")) if not str(repo.get("github", "")).is_empty() else str(repo.get("path", ""))
-		_content.add_child(_text("[color=#%s]Works on %s, branching from %s. Change it in build mode, in this intake's settings.[/color]"
+		_content.add_child(_text("[color=#%s]Works on %s, branching from %s. Change it in build mode, in the intake's settings.[/color]"
 				% [C_QUIET, what, str(repo.get("base_branch", "")) if not str(repo.get("base_branch", "")).is_empty() else "its default branch"]))
 	var sources: Array = data.get("sources", [])
-	if sources.is_empty():
-		_content.add_child(_text("[color=#%s]This line takes no crates from anywhere yet. Tick its sources in build mode.[/color]" % C_QUIET))
+	if not only_source.is_empty():
+		var by_store := not only_storage.is_empty() and sources.any(func(s) -> bool: return str(s.get("storage", "")) == only_storage)
+		sources = sources.filter(func(s) -> bool:
+			if by_store:
+				return str(s.get("storage", "")) == only_storage
+			return str(s.get("source", "")) == only_source)
+		if sources.is_empty():
+			_content.add_child(_text("[color=#%s]Nothing to show yet: save the layout in build mode, then look again.[/color]" % C_QUIET))
+	elif sources.is_empty():
+		_content.add_child(_text("[color=#%s]This line takes no crates from anywhere yet. In build mode, belt a Storage into its intake or tick typed specs.[/color]" % C_QUIET))
 	for s in sources:
 		_add_source(s)
 	await get_tree().process_frame
@@ -101,6 +133,7 @@ func show_listing(data: Dictionary, name: String) -> void:
 
 func _add_source(s: Dictionary) -> void:
 	var source := str(s.get("source", ""))
+	var storage := str(s.get("storage", ""))
 	var items: Array = s.get("items", [])
 	var heading := str(SOURCE_TITLES.get(source, source))
 	if source != "game" and bool(s.get("enabled", false)) and str(s.get("error", "")).is_empty():
@@ -129,12 +162,12 @@ func _add_source(s: Dictionary) -> void:
 	if bool(s.get("enabled", false)) and source != "game":
 		var now_button := Button.new()
 		now_button.theme_type_variation = &"ButtonGhost"
-		now_button.text = "Check now"
-		now_button.tooltip_text = "Look for new ones straight away and bring in any that come in by themselves"
+		now_button.icon = load("res://assets/ui/icon_refresh.svg")
+		now_button.tooltip_text = "Check now: look for new ones straight away and bring in any that come in by themselves"
 		now_button.pressed.connect(func() -> void:
 			now_button.disabled = true
-			now_button.text = "Checking..."
-			check.emit(source))
+			now_button.tooltip_text = "Checking..."
+			check.emit(source, storage))
 		head.add_child(now_button)
 
 	var about := str(s.get("about", ""))
@@ -164,10 +197,10 @@ func _add_source(s: Dictionary) -> void:
 	var outside := items.filter(func(i: Dictionary) -> bool: return i.get("item_id") == null)
 	var inside := items.filter(func(i: Dictionary) -> bool: return i.get("item_id") != null)
 	for item in outside + inside:
-		_add_row(source, item)
+		_add_row(source, item, storage)
 
 
-func _add_row(source: String, item: Dictionary) -> void:
+func _add_row(source: String, item: Dictionary, storage := "") -> void:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 6)
 	_content.add_child(row)
@@ -202,26 +235,26 @@ func _add_row(source: String, item: Dictionary) -> void:
 		var open := Button.new()
 		open.theme_type_variation = &"ButtonGhost"
 		open.icon = load("res://assets/ui/icon_log.svg")
-		open.tooltip_text = "Show this crate's log"
+		open.tooltip_text = "Log: show this crate's log"
 		open.pressed.connect(func() -> void: open_crate.emit(int(item_id)))
 		buttons.add_child(open)
 	elif bool(item.get("can_pull", false)):
 		var take := Button.new()
-		take.text = "Pulling in..." if _pending.has(key) else "Pull in"
+		take.icon = load("res://assets/ui/icon_pull_in.svg")
 		take.disabled = _pending.has(key)
-		take.tooltip_text = "Make it a crate on this line now"
+		take.tooltip_text = "Pulling in..." if _pending.has(key) else "Pull in: make it a crate on this line now"
 		take.pressed.connect(func() -> void:
 			_pending[key] = true
-			take.text = "Pulling in..."
+			take.tooltip_text = "Pulling in..."
 			take.disabled = true
-			pull.emit(source, str(item.get("ref", ""))))
+			pull.emit(source, str(item.get("ref", "")), storage))
 		buttons.add_child(take)
 	var url := str(item.get("url", ""))
 	if not url.is_empty():
 		var link := Button.new()
 		link.theme_type_variation = &"ButtonGhost"
 		link.icon = load("res://assets/ui/icon_open.svg")
-		link.tooltip_text = url
+		link.tooltip_text = "Open: %s" % url
 		link.pressed.connect(func() -> void: OS.shell_open(url))
 		buttons.add_child(link)
 
@@ -242,8 +275,7 @@ func _add_paste_box() -> void:
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(spacer)
 	var add := Button.new()
-	add.text = "Plan it"
-	add.tooltip_text = "Put it on this line: the Planner turns it into a plan and issues"
+	add.tooltip_text = "Plan it: put it on this line; the Planner turns it into a plan and issues"
 	var icon := load("res://assets/ui/icon_prd.svg") if ResourceLoader.exists("res://assets/ui/icon_prd.svg") else null
 	if icon:
 		add.icon = icon

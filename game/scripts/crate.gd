@@ -10,6 +10,10 @@ const RISK_WORDS := {"low": "Low", "medium": "Medium", "high": "High"}
 var item_id := 0
 var text := ""
 var source := ""  # e.g. "GitHub #12", empty when typed in the game
+var has_pr := false:  # a pull request is open for it: a small PR badge in the top-right corner
+	set(value):
+		has_pr = value
+		queue_redraw()
 var state := "queued"
 var location := "intake"
 var loops := 0  # times sent back for rework
@@ -24,6 +28,9 @@ var selected := false:
 		queue_redraw()
 
 var _tween: Tween
+# Moves that arrived while the crate was still riding a belt: done in turn, so it never cuts a
+# corner off the belts ([waypoints, duration] each).
+var _queued: Array = []
 static var _textures := {}
 
 
@@ -51,6 +58,7 @@ func set_state(new_state: String) -> void:
 
 ## Fade out where it is (it went into the scrap bin, which no belt leads to).
 func vanish() -> void:
+	_queued.clear()
 	if _tween and _tween.is_valid():
 		_tween.kill()
 	var fade := create_tween()
@@ -66,6 +74,7 @@ func _settle() -> void:
 
 
 func move_to(target: Vector2, duration: float) -> void:
+	_queued.clear()
 	if _tween and _tween.is_valid():
 		_tween.kill()
 	if duration <= 0.0:
@@ -79,6 +88,11 @@ func move_to(target: Vector2, duration: float) -> void:
 
 ## Move through waypoints, splitting the time by distance (so speed stays even).
 func move_path(waypoints: Array, duration: float) -> void:
+	if is_moving() and duration > 0.0 and not waypoints.is_empty():
+		# Finish this belt first; catch up a little faster if moves pile up.
+		_queued.append([waypoints, duration * (0.5 if _queued.size() >= 2 else 1.0)])
+		return
+	_queued.clear()
 	if _tween and _tween.is_valid():
 		_tween.kill()
 	if duration <= 0.0 or waypoints.is_empty():
@@ -97,7 +111,19 @@ func move_path(waypoints: Array, duration: float) -> void:
 		var share := from.distance_to(p) / total if total > 0.0 else 1.0 / waypoints.size()
 		_tween.tween_property(self, "position", p, duration * share)
 		from = p
-	_tween.finished.connect(_settle)
+	_tween.finished.connect(_next_move)
+
+
+func _next_move() -> void:
+	if _queued.is_empty():
+		_settle()
+		return
+	var next: Array = _queued.pop_front()
+	_tween = null
+	var rest := _queued.duplicate()
+	_queued.clear()
+	move_path(next[0], next[1])
+	_queued = rest
 
 
 func is_moving() -> bool:
@@ -117,7 +143,20 @@ func _sprite_name() -> String:
 			return "crate_shipped"
 		"scrapped":
 			return "crate_scrapped"
-	return "crate" if source.is_empty() else "crate_issue"
+	match kind():
+		"pr":
+			return "crate_pr"
+		"issue":
+			return "crate_issue"
+	return "crate"
+
+
+## What it came in as: "pr" (a pull request), "issue" (GitHub / Jira issue, a PRD) or "spec"
+## (typed in the game). Each has its own look: plain crate, blue issue tag, purple PR tag.
+func kind() -> String:
+	if source.is_empty():
+		return "spec"
+	return "pr" if source.begins_with("PR #") else "issue"
 
 
 func _texture(sprite: String) -> Texture2D:
@@ -137,6 +176,10 @@ func _draw() -> void:
 		draw_rect(r, Color("16181C"), false, 2.0)
 	if not risk.is_empty():
 		_draw_stamp(Rect2(-SIZE / 2.0 + 2.0, 0.0, STAMP, STAMP))  # bottom-left, as in assets/README.md
+	if has_pr and kind() != "pr" and not state in ["shipped", "scrapped"]:
+		var badge := _texture("badge_pr")  # top-right, the corner the issue tag leaves free
+		if badge:
+			draw_texture_rect(badge, Rect2(SIZE / 2.0 - 13.0, -SIZE / 2.0 + 1.0, 12.0, 12.0), false)
 	if state == "awaiting_approval":
 		draw_rect(r.grow(3.0), AMBER, false, 2.0)
 	elif state == "held":

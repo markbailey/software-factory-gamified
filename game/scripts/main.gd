@@ -10,6 +10,7 @@ const BuildPanel := preload("res://scripts/build_panel.gd")
 const Inspector := preload("res://scripts/inspector.gd")
 const IntakeView := preload("res://scripts/intake_view.gd")
 const BinView := preload("res://scripts/bin_view.gd")
+const StatsView := preload("res://scripts/stats_view.gd")
 const INTAKE_REFRESH := 20.0  # seconds between refreshes of an open intake window
 const MACHINE_OUTPUT_LINES := 14
 
@@ -36,13 +37,20 @@ var crates_layer: Node2D
 var machines_layer: Node2D
 var build_panel: BuildPanel
 var build_button: Button
+var pause_button: Button  # pauses or resumes the whole factory
+var pauses := {"factory": false, "lines": [], "machines": []}
 var bottom_panel: PanelContainer
 var building := false
 var pending_save := false
+var _save_wait := 0.0  # seconds the backend has taken to answer a save
+const SAVE_PATIENCE := 20.0  # then the build panel says it's still waiting
 var last_layout := {}
 var crates := {}  # item_id -> Crate
 var logs := {}  # item_id -> Array of log lines
+var logs_partial := {}  # item_id -> true while only the end of its log is here (the snapshot's)
+var costs := {}  # item_id -> what Claude has cost on it so far, in USD
 var pr_urls := {}  # item_id -> pull request URL
+var pr_states := {}  # item_id -> "merged", "open", "closed" or "unknown" (checked when it ships)
 var selected_id := -1
 var last_seq := 0
 
@@ -83,9 +91,16 @@ var machine_output := {}  # machine id -> its latest output lines
 var machine_stats := {}  # machine id -> {passed, failed} since the game opened
 var _inspect_tick := 0.0
 var intake_view: IntakeView
+var npc_layer: Node2D  # people on the floor (npc_layer.gd)
+var sfx: Node  # sound effects (sfx.gd): listens to the backend's messages, M mutes
 var viewed_intake := ""  # pipeline whose intake window is open
+var viewed_store := ""  # or the storage (footprint key) whose window that is
+var _store_tick := 0.0  # seconds since the storages' counts were last asked for
+const STORE_REFRESH := 120.0
 var _intake_tick := 0.0
 var bin_view: BinView
+var stats_view: StatsView
+var stats_button: Button
 var _bin_tick := 0.0
 var viewed_bin := ""  # station key ("<pipeline>:scrap" or ":dock") whose crate list is open
 
@@ -99,6 +114,17 @@ func _ready() -> void:
 	machines_layer = Node2D.new()
 	add_child(machines_layer)
 	factory_floor.attach_machine_layer(machines_layer)
+	if ResourceLoader.exists("res://scripts/npc_layer.gd"):
+		npc_layer = load("res://scripts/npc_layer.gd").new()
+		npc_layer.factory_floor = factory_floor
+		add_child(npc_layer)
+	# Room walls, doors and belt ports (room_layer.gd): above the crates, under the machines.
+	if ResourceLoader.exists("res://scripts/room_layer.gd"):
+		var rooms: Node2D = load("res://scripts/room_layer.gd").new()
+		rooms.factory_floor = factory_floor
+		rooms.npc_layer = npc_layer
+		add_child(rooms)
+		move_child(rooms, crates_layer.get_index() + 1)
 
 	camera = Camera2D.new()
 	add_child(camera)
@@ -112,6 +138,13 @@ func _ready() -> void:
 	client.connected.connect(_on_connected)
 	client.disconnected.connect(_on_disconnected)
 	client.message_received.connect(_on_message)
+	if npc_layer:
+		client.message_received.connect(npc_layer.on_message)
+	if ResourceLoader.exists("res://scripts/sfx.gd"):
+		sfx = load("res://scripts/sfx.gd").new()
+		sfx.main = self
+		add_child(sfx)
+		client.message_received.connect(sfx.on_message)
 	add_child(client)
 	_set_status("[color=#80858F]●[/color] Connecting")
 
@@ -141,14 +174,14 @@ func _build_ui() -> void:
 
 	spec_input = LineEdit.new()
 	spec_input.placeholder_text = "Describe a change and press Enter"
-	spec_input.custom_minimum_size = Vector2(340, 0)
+	spec_input.custom_minimum_size = Vector2(260, 0)
 	spec_input.text_submitted.connect(func(_t: String) -> void: _submit())
 	row.add_child(spec_input)
 
 	var button := Button.new()
-	button.text = "Add"
+	button.icon = load("res://assets/ui/icon_add.svg")
 	button.theme_type_variation = &"ButtonPrimary"
-	button.tooltip_text = "Put this spec on the intake as a new crate"
+	button.tooltip_text = "Add: put this spec on the intake as a new crate (Enter)"
 	button.pressed.connect(_submit)
 	button.disabled = true
 	spec_input.text_changed.connect(func(t: String) -> void: button.disabled = t.strip_edges().is_empty())
@@ -173,12 +206,27 @@ func _build_ui() -> void:
 	status_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	row.add_child(status_label)
 
+	pause_button = Button.new()  # an icon only, so the top bar still fits a small window
+	pause_button.icon = load("res://assets/ui/icon_pause.svg")
+	pause_button.theme_type_variation = &"ButtonGhost"
+	pause_button.focus_mode = Control.FOCUS_NONE
+	pause_button.pressed.connect(func() -> void:
+		_send_pause("factory", "", not bool(pauses.get("factory", false))))
+	row.add_child(pause_button)
+
+	stats_button = Button.new()  # an icon too
+	stats_button.icon = load("res://assets/ui/icon_stats.svg")
+	stats_button.theme_type_variation = &"ButtonGhost"
+	stats_button.focus_mode = Control.FOCUS_NONE
+	stats_button.tooltip_text = "Factory stats: crates shipped, time, failures and Claude cost"
+	stats_button.pressed.connect(func() -> void: _view_stats(not stats_view.visible))
+	row.add_child(stats_button)
+
 	build_button = Button.new()
-	build_button.text = "Build"
 	build_button.set_pressed_no_signal(false)
 	build_button.icon = load("res://assets/ui/icon_build.svg")
 	build_button.toggle_mode = true
-	build_button.tooltip_text = "Lay out machines and belts"
+	build_button.tooltip_text = "Build: lay out machines and belts"
 	build_button.pressed.connect(_toggle_build)
 	row.add_child(build_button)
 
@@ -202,7 +250,8 @@ func _build_ui() -> void:
 	log_subtitle.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	log_subtitle.clip_text = true
 	header.add_child(log_subtitle)
-	pr_button = _action_button(header, "Open PR", _open_pr)
+	pr_button = _action_button(header, "", _open_pr)
+	pr_button.tooltip_text = "Open PR: open this crate's pull request in your browser"
 	pr_button.theme_type_variation = &"ButtonGhost"
 	pr_button.icon = load("res://assets/ui/icon_pr.svg")
 	var esc := Label.new()
@@ -222,13 +271,17 @@ func _build_ui() -> void:
 	note_input.placeholder_text = "Notes for the Coder (optional)"
 	note_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	gate_row.add_child(note_input)
-	approve_button = _action_button(gate_row, "Approve", func() -> void: _send_action("approve"))
+	approve_button = _action_button(gate_row, "", func() -> void: _send_action("approve"))
 	approve_button.theme_type_variation = &"ButtonApprove"
-	reject_button = _action_button(gate_row, "Reject", func() -> void: _send_action("reject"))
+	approve_button.icon = load("res://assets/ui/icon_check.svg")
+	approve_button.tooltip_text = "Approve: let the crate carry on down the line, with your note"
+	reject_button = _action_button(gate_row, "", func() -> void: _send_action("reject"))
 	reject_button.theme_type_variation = &"ButtonReject"
-	scrap_button = _action_button(gate_row, "Scrap", func() -> void: _send_action("scrap"))
+	scrap_button = _action_button(gate_row, "", func() -> void: _send_action("scrap"))
 	scrap_button.theme_type_variation = &"ButtonGhost"
-	retry_button = _action_button(gate_row, "Retry", func() -> void: _send_action("retry"))
+	scrap_button.icon = load("res://assets/ui/icon_bin.svg")
+	scrap_button.tooltip_text = "Scrap: throw the crate in the scrap bin"
+	retry_button = _action_button(gate_row, "", func() -> void: _send_action("retry"))
 	retry_button.icon = load("res://assets/ui/icon_retry.svg")
 	_refresh_actions()
 
@@ -268,7 +321,7 @@ func _build_ui() -> void:
 	agent_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	agent_label.mouse_filter = Control.MOUSE_FILTER_PASS
 	banner_row.add_child(agent_label)
-	banner_check = _action_button(banner_row, "Check now", func() -> void:
+	banner_check = _action_button(banner_row, "", func() -> void:
 		var sent := false
 		if not agent_available:
 			sent = client.send({"type": "check_agent"})
@@ -277,6 +330,7 @@ func _build_ui() -> void:
 		if sent:
 			_toast("Checking...", Color(0.8, 0.82, 0.86)))
 	banner_check.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	banner_check.icon = load("res://assets/ui/icon_refresh.svg")
 	agent_banner.visible = false
 
 	# Status window for the machine you click (while the factory runs).
@@ -286,6 +340,7 @@ func _build_ui() -> void:
 	inspector.visible = false
 	inspector.closed.connect(func() -> void: _inspect(""))
 	inspector.open_crate.connect(func(item_id: int) -> void: _select(item_id))
+	inspector.pause_toggled.connect(func(id: String, on: bool) -> void: _send_pause("machine", id, on))
 
 	# What's waiting to come in at the intake you click: issues and PRs in its sources.
 	intake_view = IntakeView.new()
@@ -294,12 +349,14 @@ func _build_ui() -> void:
 	intake_view.visible = false
 	intake_view.closed.connect(func() -> void: _view_intake(""))
 	intake_view.open_crate.connect(func(item_id: int) -> void: _select(item_id))
-	intake_view.pull.connect(func(source: String, ref: String) -> void:
-		if not client.send({"type": "intake_pull", "pipeline": viewed_intake, "source": source, "ref": ref}):
+	intake_view.pause_toggled.connect(func(pid: String, on: bool) -> void: _send_pause("line", pid, on))
+	intake_view.pull.connect(func(source: String, ref: String, storage: String) -> void:
+		if not client.send({"type": "intake_pull", "pipeline": viewed_intake, "source": source, "ref": ref,
+				"storage": storage}):
 			intake_view.pull_failed()
 			_toast("Not connected. Is the backend running?", Color("E5484D")))
-	intake_view.check.connect(func(source: String) -> void:
-		client.send({"type": "intake_check", "pipeline": viewed_intake, "source": source}))
+	intake_view.check.connect(func(source: String, storage: String) -> void:
+		client.send({"type": "intake_check", "pipeline": viewed_intake, "source": source, "storage": storage}))
 	intake_view.submit.connect(func(pid: String, text: String) -> void:
 		if client.send({"type": "submit_work", "text": text, "pipeline": pid}):
 			_toast("PRD added to the %s" % _pipeline_name(pid), Color("5ABF66"))
@@ -316,6 +373,14 @@ func _build_ui() -> void:
 	bin_view.retry.connect(func(item_id: int) -> void:
 		if not client.send({"type": "retry", "item_id": item_id, "note": ""}):
 			_toast("Not connected. Is the backend running?", Color("E5484D")))
+
+	# Throughput, failures and cost (left dock).
+	stats_view = StatsView.new()
+	ui.add_child(stats_view)
+	stats_view.position = Vector2(0, TOP_BAR)
+	stats_view.visible = false
+	stats_view.closed.connect(func() -> void: _view_stats(false))
+	stats_view.refresh.connect(func(days: int) -> void: client.send({"type": "stats", "days": days}))
 
 	# Pop-ups for crates that need you, ship or are scrapped (top right, under the top bar).
 	toasts = VBoxContainer.new()
@@ -346,7 +411,11 @@ func _build_ui() -> void:
 	build_panel.visible = false
 	build_panel.save_requested.connect(_on_save_requested)
 	build_panel.cancelled.connect(func() -> void: _close_build())
+	build_panel.belt_speed_changed.connect(func(v: float) -> void:
+		if not client.send({"type": "belt_speed", "speed": v}):
+			_toast("Not connected. Is the backend running?", Color("E5484D")))
 	build_panel.settings_opened.connect(_keep_clear_of_settings)
+	_share_undo()
 	build_panel.check_repo_requested.connect(func(pid: String, repo: Dictionary) -> void:
 		if not client.send({"type": "check_repo", "pipeline": pid, "repo": repo}):
 			build_panel.show_repo_check({"pipeline": pid, "ok": false, "message": "Not connected. Is the backend running?"}))
@@ -376,10 +445,10 @@ func _refresh_actions() -> void:
 	approve_button.visible = waiting
 	# Where the machine sends failures back, Reject means "fix it" and Scrap throws it away.
 	reject_button.visible = waiting
-	reject_button.text = "Send back" if sends_back or redo_here else "Reject"
-	reject_button.tooltip_text = ("Send it back to the Coder with your note" if sends_back
-			else "Have it done again, with your note" if redo_here
-			else "Close the PR and scrap the crate")
+	reject_button.icon = load("res://assets/ui/icon_send_back.svg" if sends_back or redo_here else "res://assets/ui/icon_cross.svg")
+	reject_button.tooltip_text = ("Send back: send it back to the Coder with your note" if sends_back
+			else "Send back: have it done again, with your note" if redo_here
+			else "Reject: close the PR and scrap the crate")
 	scrap_button.visible = (waiting and (sends_back or redo_here)) or held
 	note_input.placeholder_text = ("Notes for the %s (optional)" % str(_layout_machine(crates[selected_id].location).get("name", "machine"))
 			if redo_here else "Notes for the Coder (optional)")
@@ -387,9 +456,8 @@ func _refresh_actions() -> void:
 		note_input.placeholder_text = "Notes for the %s when it runs again (optional)" % str(
 				_layout_machine(crates[selected_id].location).get("name", "machine"))
 	retry_button.visible = state == "scrapped" or held
-	retry_button.text = "Run again" if held else "Retry"
-	retry_button.tooltip_text = ("Run this machine again on the crate, with your note" if held
-			else "Send the crate back to the start of the line")
+	retry_button.tooltip_text = ("Run again: run this machine again on the crate, with your note" if held
+			else "Retry: send the crate back to the start of the line")
 	note_input.visible = state == "awaiting_approval" or state == "scrapped" or held
 	gate_row.visible = note_input.visible
 	pr_button.visible = str(pr_urls.get(selected_id, "")) != ""
@@ -422,7 +490,7 @@ func _refresh_waiting() -> void:
 		if crate.state == "awaiting_approval" or crate.state == "held":
 			counts[crate.location] = int(counts.get(crate.location, 0)) + 1
 		elif (crate.state == "scrapped" and FactoryFloor.is_bin(crate.location)) or \
-				(crate.state == "shipped" and crate.location.ends_with(":dock")):
+				(crate.state == "shipped" and FactoryFloor.is_dock(crate.location)):
 			in_bins[crate.location] = int(in_bins.get(crate.location, 0)) + 1
 	factory_floor.set_waiting(counts)
 	factory_floor.set_bin_counts(in_bins)
@@ -476,11 +544,12 @@ func _toggle_build() -> void:
 		_toast(OLD_BACKEND, Color("E5484D"))
 		return
 	_inspect("")
+	_view_stats(false)
 	_view_intake("")
 	_view_bin("")
 	building = true
 	pending_save = false
-	build_button.text = "Close build"
+	build_button.tooltip_text = "Close build: leave build mode"
 	build_button.set_pressed_no_signal(true)
 	build_panel.visible = true
 	bottom_panel.visible = false
@@ -494,7 +563,7 @@ func _toggle_build() -> void:
 func _close_build() -> void:
 	building = false
 	pending_save = false
-	build_button.text = "Build"
+	build_button.tooltip_text = "Build: lay out machines and belts"
 	build_button.set_pressed_no_signal(false)
 	build_panel.visible = false
 	build_panel.close()
@@ -505,8 +574,25 @@ func _close_build() -> void:
 	_fit_camera(true)
 
 
+## Open or close the Stats window (one left dock at a time).
+func _view_stats(show: bool) -> void:
+	if show == stats_view.visible:
+		return
+	if show:
+		if building:
+			return
+		_inspect("")
+		_view_intake("")
+		_view_bin("")
+		stats_view.open()
+	else:
+		stats_view.visible = false
+	stats_button.modulate = Color("5AB0FF") if show else Color.WHITE
+	_layout_docks()
+
+
 func _left_dock_open() -> bool:
-	return inspector.visible or intake_view.visible or bin_view.visible or \
+	return inspector.visible or intake_view.visible or bin_view.visible or stats_view.visible or \
 			(building and build_panel.settings_window != null and build_panel.settings_window.visible)
 
 
@@ -514,7 +600,7 @@ func _left_dock_open() -> bool:
 ## and the banner start at its right edge.
 func _layout_docks() -> void:
 	var view := get_viewport_rect().size
-	for dock in [inspector, intake_view, bin_view]:
+	for dock in [inspector, intake_view, bin_view, stats_view]:
 		if dock.visible:
 			dock.position = Vector2(0, TOP_BAR)
 			dock.size = Vector2(LEFT_DOCK, view.y - TOP_BAR)
@@ -552,6 +638,7 @@ func _show_layout() -> void:
 func _on_save_requested(pipelines: Array) -> void:
 	if client.send({"type": "save_pipelines", "pipelines": pipelines}):
 		pending_save = true
+		_save_wait = 0.0
 		build_panel.show_message("Saving...")
 	else:
 		build_panel.show_message("Not connected. Is the backend running?")
@@ -599,7 +686,8 @@ func _update_banner() -> void:
 	# One line on the strip; everything, with the raw error, in its tooltip.
 	agent_label.text = "  ·  ".join(parts).replace("\n", " ")
 	agent_label.tooltip_text = "\n\n".join(parts) + ("\n\n" + "\n\n".join(details) if not tool_outages.is_empty() else "")
-	banner_check.text = "Try again" if manual else "Check now"
+	banner_check.tooltip_text = ("Try again: check whether it's fixed now" if manual
+			else "Check now: see whether Claude and the tools are back")
 
 
 ## A Unix time as the local time of day, e.g. "09:41".
@@ -614,7 +702,7 @@ func _clock(unix: float) -> String:
 # Machine status window ----------------------------------------------------------
 
 func _in_pile(location: String) -> bool:
-	return FactoryFloor.is_bin(location) or location.ends_with(":dock")
+	return FactoryFloor.is_bin(location) or FactoryFloor.is_dock(location)
 
 
 func _view_bin(key: String) -> void:
@@ -622,6 +710,7 @@ func _view_bin(key: String) -> void:
 	if not key.is_empty():
 		_inspect("")
 		_view_intake("")
+		_view_stats(false)
 	viewed_bin = key if factory_floor.footprints.has(key) and not building else ""
 	bin_view.visible = not viewed_bin.is_empty()
 	if viewed_bin.is_empty():
@@ -692,26 +781,81 @@ func _claude_says(id: int, fallback: String) -> String:
 
 func _kind_words(kind: String) -> String:
 	var words := {"needs_info": "Needs info", "already_done": "Already done", "blocked": "Blocked",
-			"work_failed": "Work failed", "rejected": "Rejected"}
+			"work_failed": "Work failed", "rejected": "Rejected", "wrong_line": "Not for this line"}
 	return ("%s: " % words[kind]) if words.has(kind) else ""
 
 
 func _ship_note(id: int) -> String:
-	return "PR merged" if pr_urls.has(id) else "Shipped"
+	if not pr_urls.has(id):
+		return "Shipped"
+	match str(pr_states.get(id, "")):
+		"merged":
+			return "PR merged"
+		"open":
+			return "Shipped with its PR still open (not merged)"
+		"closed":
+			return "Shipped, but its PR was closed without merging"
+	return "Shipped with a PR (couldn't check if it merged)"
 
 
-func _view_intake(pid: String) -> void:
-	var opening := not pid.is_empty() and pid != viewed_intake
+# Pausing ---------------------------------------------------------------------
+
+func _set_belt_speed(speed: float) -> void:
+	factory_floor.set_belt_speed(speed)
+	build_panel.belt_speed_input.set_value_no_signal(speed)
+
+
+func _send_pause(target: String, id: String, on: bool) -> void:
+	if not client.send({"type": "pause", "target": target, "id": id, "paused": on}):
+		_toast("Not connected. Is the backend running?", Color("E5484D"))
+		return
+	if on:
+		return
+	# Resuming doesn't start a line whose layout stops it: say so, or it looks like nothing happened.
+	for pl in last_layout.get("pipelines", []):
+		var why := str(pl.get("problem", ""))
+		if why.is_empty() or (target == "line" and str(pl.get("id", "")) != id):
+			continue
+		_toast("%s still can't run: %s (fix it in build mode)" % [str(pl.get("name", "")), why.substr(why.find(": ") + 2) if ": " in why else why],
+				Color("F5A524"))
+
+
+## What's paused (the factory, lines, machines): the floor, the top bar and the open windows.
+func _set_pauses(value) -> void:
+	var p: Dictionary = value if value is Dictionary else {}
+	pauses = {"factory": bool(p.get("factory", false)), "lines": p.get("lines", []), "machines": p.get("machines", [])}
+	factory_floor.set_pauses(pauses)
+	var all := bool(pauses["factory"])
+	pause_button.icon = load("res://assets/ui/icon_play.svg" if all else "res://assets/ui/icon_pause.svg")
+	pause_button.tooltip_text = ("Resume: the factory is paused. Start it again" if all else
+			"Pause: stop the whole factory. Nothing new comes in, and crates wait on the belts until you resume it. Machines finish the crate inside.")
+	pause_button.modulate = Color("5AB0FF") if all else Color.WHITE
+	intake_view.set_paused(viewed_intake in pauses["lines"])
+	_refresh_inspector()
+
+
+func _view_intake(pid: String, store_key := "") -> void:
+	var opening := not pid.is_empty() and (pid != viewed_intake or store_key != viewed_store)
 	if not pid.is_empty():
 		_inspect("")
 		_view_bin("")
-	var key := "%s:intake" % pid
+		_view_stats(false)
+	var key := store_key if not store_key.is_empty() else "%s:intake" % pid
 	viewed_intake = pid if factory_floor.footprints.has(key) and not building else ""
+	viewed_store = store_key if not viewed_intake.is_empty() else ""
 	intake_view.visible = not viewed_intake.is_empty()
 	if viewed_intake.is_empty():
-		if factory_floor.highlighted.ends_with(":intake"):
+		if factory_floor.highlighted.ends_with(":intake") or FactoryFloor.is_storage(factory_floor.highlighted):
 			factory_floor.set_highlight("")
 		return
+	var source := ""
+	for st in FactoryFloor.storages_of(_layout_pipeline(pid)):
+		if "%s:%s" % [pid, str(st.get("id", ""))] == store_key:
+			source = str(st.get("source", ""))
+	intake_view.only_source = source
+	intake_view.only_storage = store_key.get_slice(":", 1) if not store_key.is_empty() else ""
+	intake_view.store_name = "%s storage" % str(FactoryFloor.STORAGE_NAMES.get(source, ""))
+	intake_view.set_paused(pid in pauses["lines"])
 	factory_floor.set_highlight(key)
 	if opening:
 		manual_camera = true
@@ -724,6 +868,37 @@ func _view_intake(pid: String) -> void:
 
 func _layout_intake_view() -> void:
 	_layout_docks()
+
+
+func _layout_pipeline(pid: String) -> Dictionary:
+	for p in last_layout.get("pipelines", []):
+		if str(p.get("id", "")) == pid:
+			return p
+	return {}
+
+
+## From an intake listing: how many of each storage's issues or PRs aren't crates yet.
+func _count_storages(msg: Dictionary) -> void:
+	var pid := str(msg.get("pipeline", ""))
+	var counts := factory_floor.storage_counts.duplicate()
+	for st in FactoryFloor.storages_of(_layout_pipeline(pid)):
+		var key := "%s:%s" % [pid, str(st.get("id", ""))]
+		counts.erase(key)
+		for s in msg.get("sources", []):
+			var mine_ := str(s.get("storage", "")) == str(st.get("id", "")) if s.has("storage") \
+					else str(s.get("source", "")) == str(st.get("source", ""))
+			if mine_ and bool(s.get("enabled", false)) \
+					and str(s.get("error", "")).is_empty() and FactoryFloor.fed_storages(_layout_pipeline(pid)).has(st):
+				counts[key] = (s.get("items", []) as Array).filter(func(i) -> bool: return i.get("item_id") == null).size()
+	factory_floor.set_storage_counts(counts)
+
+
+## Ask every line with a storage what's in it, for the counts on the floor.
+func _ask_storages() -> void:
+	_store_tick = 0.0
+	for p in last_layout.get("pipelines", []):
+		if not FactoryFloor.fed_storages(p).is_empty():
+			client.send({"type": "intake_list", "pipeline": str(p.get("id", ""))})
 
 
 func _pipeline_name(pid: String) -> String:
@@ -739,6 +914,8 @@ func _inspect(id: String) -> void:
 		_view_intake("")
 	if not id.is_empty() and not viewed_bin.is_empty():
 		_view_bin("")
+	if not id.is_empty() and stats_view.visible:
+		_view_stats(false)
 	inspected = id if factory_floor.machines.has(id) and not building else ""
 	inspector.visible = not inspected.is_empty()
 	if opening and not inspected.is_empty():
@@ -764,6 +941,7 @@ func _refresh_inspector() -> void:
 		inspected = ""
 		return
 	inspector.show_status(_machine_status(inspected))
+	inspector.set_paused(inspected in pauses["machines"], factory_floor.machine_paused_why(inspected))
 	_layout_docks()
 
 
@@ -805,14 +983,19 @@ func _machine_status(id: String) -> Dictionary:
 
 	var data := {
 		"id": id, "name": str(m.get("name", id)), "description": str(info.get("description", "")),
-		"steps": info.get("steps", []), "gate": bool(m.get("gate", false)), "uses_agent": uses_agent,
+		"steps": info.get("steps", []), "gate": FactoryFloor.gated(m, info), "uses_agent": uses_agent,
 		"parallel": bool(info.get("parallel", false)), "queue": queue, "approvals": approvals, "held": held, "stuck": stuck,
 		"stats": machine_stats.get(id, {}), "auto_approve": str(m.get("auto_approve", "")), "max_rework": int(last_layout.get("max_rework", 0)),
 		"output": machine_output.get(id, []), "elapsed": -1.0, "step_elapsed": -1.0,
 	}
 	var target := factory_floor.on_fail(id)
-	if not target.is_empty() and factory_floor.machines.has(target):
+	if not target.is_empty() and factory_floor.machines.has(target) \
+			and int(factory_floor.depth.get(target, 0)) > int(factory_floor.depth.get(id, 0)):
+		data["on_fail"] = "on to %s, and on from there" % str(factory_floor.machines[target]["name"])
+	elif not target.is_empty() and factory_floor.machines.has(target):
 		data["on_fail"] = "back to %s for rework" % str(factory_floor.machines[target]["name"])
+	elif FactoryFloor.is_dock(target):
+		data["on_fail"] = "to the shipping dock"
 	elif bool(info.get("rework_here", false)):
 		data["on_fail"] = "back into this machine to try again"
 	elif FactoryFloor.is_bin(target):
@@ -904,6 +1087,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			get_viewport().set_input_as_handled()
 		return
 	var esc := event as InputEventKey
+	if esc and esc.pressed and esc.keycode == KEY_ESCAPE and stats_view.visible:
+		_view_stats(false)
+		get_viewport().set_input_as_handled()
+		return
 	if esc and esc.pressed and esc.keycode == KEY_ESCAPE and not viewed_bin.is_empty():
 		_view_bin("")
 		get_viewport().set_input_as_handled()
@@ -951,6 +1138,10 @@ func _unhandled_input(event: InputEvent) -> void:
 		_view_intake(node.get_slice(":", 0))
 		get_viewport().set_input_as_handled()
 		return
+	if FactoryFloor.is_storage(node):
+		_view_intake(node.get_slice(":", 0), node)
+		get_viewport().set_input_as_handled()
+		return
 	if not viewed_intake.is_empty():
 		_view_intake("")
 		get_viewport().set_input_as_handled()
@@ -958,6 +1149,29 @@ func _unhandled_input(event: InputEvent) -> void:
 	if not machine.is_empty() or not inspected.is_empty():
 		_inspect(machine)
 		get_viewport().set_input_as_handled()
+
+
+## One Undo for the build panel and the room bar: room edits take their turn in the build
+## panel's history, and both Undo buttons (and Ctrl+Z) step back through it.
+func _share_undo() -> void:
+	var rooms: Node = null
+	for child in get_children():
+		if child.has_method("set_tool") and "floors" in child:
+			rooms = child
+	if rooms == null:
+		return
+	build_panel.rooms_undo = Callable(rooms, "undo")
+	if rooms.has_signal("undo_pushed"):
+		build_panel.rooms_tracked = true
+		rooms.connect("undo_pushed", build_panel.note_room_edit)
+	if rooms.has_signal("undo_cleared"):
+		rooms.connect("undo_cleared", build_panel.forget_room_edits)
+	if "undo_router" in rooms:
+		rooms.set("undo_router", build_panel.undo)
+	if "can_undo_check" in rooms:
+		rooms.set("can_undo_check", build_panel.can_undo)
+	if rooms.has_method("refresh_undo"):
+		build_panel.undo_changed.connect(Callable(rooms, "refresh_undo"))
 
 
 ## Scroll to zoom (towards the mouse), drag with the right or middle button (or the left one
@@ -1089,10 +1303,23 @@ func _on_message(msg: Dictionary) -> void:
 	if kind == "tool_status":
 		_set_tools(msg.get("outages", []), false)
 		return
+	if kind == "pauses":
+		_set_pauses(msg.get("pauses", {}))
+		return
+	if kind == "belt_speed":
+		_set_belt_speed(float(msg.get("speed", 1.5)))
+		return
 	if kind == "repo_check":
 		build_panel.show_repo_check(msg)
 		return
+	if kind == "stats":
+		stats_view.show_stats(msg)
+		return
+	if kind == "item_log":
+		_got_full_log(int(msg.get("item_id", -1)), msg.get("log", []))
+		return
 	if kind == "intake_list":
+		_count_storages(msg)
 		if str(msg.get("pipeline", "")) == viewed_intake and intake_view.visible:
 			intake_view.show_listing(msg, _pipeline_name(viewed_intake))
 			_layout_intake_view()
@@ -1175,8 +1402,22 @@ func _on_message(msg: Dictionary) -> void:
 				crate.set_risk(str(msg.get("risk", "")), str(msg.get("reason", "")))
 				if id == selected_id:
 					_select(id)
+			for mid in machine_runs:  # the machine that stamped it shows the decision
+				if int(machine_runs[mid].get("item_id", -1)) == id:
+					factory_floor.set_machine_result(str(mid), str(msg.get("risk", "")))
+		"pr_state":
+			pr_states[int(msg["item_id"])] = str(msg.get("state", ""))
+		"item_cost":
+			costs[int(msg["item_id"])] = float(msg.get("cost_usd", 0.0))
+			if int(msg["item_id"]) == selected_id:
+				_select_subtitle(selected_id)
+		"budget_spent":
+			_toast("Today's Claude budget ($%.2f) is spent: crates wait in front of Claude machines until midnight."
+					% float(msg.get("daily_usd", 0.0)), Color("F5A524"))
 		"pr_opened":
 			pr_urls[int(msg["item_id"])] = str(msg.get("url", ""))
+			if crates.has(int(msg["item_id"])):
+				crates[int(msg["item_id"])].has_pr = true
 			_toast("PR opened for crate #%d" % int(msg["item_id"]), Color("8CBFFF"))
 			_refresh_actions()
 
@@ -1186,11 +1427,18 @@ func _apply_snapshot(snap: Dictionary) -> void:
 		crate.queue_free()
 	crates.clear()
 	logs.clear()
+	logs_partial.clear()
+	costs.clear()
 	pr_urls.clear()
+	pr_states.clear()
 	last_seq = int(snap.get("seq", 0))
 
 	var layout: Dictionary = snap.get("layout", {})
 	last_layout = layout
+	_set_pauses(snap.get("pauses", {}))
+	if layout.has("belt_speed"):
+		_set_belt_speed(float(layout["belt_speed"]))
+	_store_tick = STORE_REFRESH - 1.0  # the storages' counts, in a moment
 	_set_agent(snap.get("agent", {}), true)
 	_set_tools(snap.get("tools", []), true)
 	if not layout.has("pipelines"):
@@ -1228,12 +1476,20 @@ func _add_item(item: Dictionary) -> void:
 	crate.visible = not crate.state in Crate.OFF_FLOOR  # in the bin, at the dock or at a gate
 	if str(item.get("pr_url", "")) != "":
 		pr_urls[id] = str(item["pr_url"])
+		crate.has_pr = true
+	if str(item.get("pr_state", "")) != "":
+		pr_states[id] = str(item["pr_state"])
 	crates_layer.add_child(crate)
 	crates[id] = crate
 	var lines: Array = []
 	for line in item.get("log", []):
 		lines.append(str(line))
 	logs[id] = lines
+	if int(item.get("log_lines", lines.size())) > lines.size():
+		logs_partial[id] = true  # the rest comes when you open the crate
+	else:
+		logs_partial.erase(id)
+	costs[id] = float(item.get("cost_usd", 0.0))
 
 
 func _on_item_moved(msg: Dictionary) -> void:
@@ -1252,7 +1508,7 @@ func _on_item_moved(msg: Dictionary) -> void:
 			_select(id)
 	crate.came_back = was_returning and ":belt_" in crate.location
 	# Along the belts the floor laid out; the last point is where the crate settles.
-	var path: Array = factory_floor.waypoints(from, crate.location)
+	var path: Array = factory_floor.waypoints(from, crate.location, crate.position)
 	path[-1] = _target_for(id, crate.location, crate.state, crate.came_back)
 	if FactoryFloor.is_bin(crate.location) and was_returning:
 		# Along the red belt into the bin; it leaves the floor as it arrives.
@@ -1261,10 +1517,29 @@ func _on_item_moved(msg: Dictionary) -> void:
 		# Scrapped where it stood (you pressed Scrap): it drops out of sight, and the bin shows
 		# it landing.
 		crate.vanish()
+	elif bool(msg.get("carried", false)):
+		# Not this machine's work: a worker carries it straight across to the right machine.
+		crate.move_path([path[-1]], float(msg.get("duration", 0.0)))
+		_toast("A worker carries Crate #%d to the %s" % [id, _place_name(str(msg.get("machine", "")))],
+				Color("7FB2E5"))
 	elif FactoryFloor.is_bin(from):
 		crate.move_path(path, 0.0)  # retried: it reappears at the intake, not flying out of the bin
 	else:
-		crate.move_path(path, float(msg.get("duration", 0.0)))
+		var duration := float(msg.get("duration", 0.0))
+		if duration > 0.0 and ":belt_" in crate.location:
+			# Ride at the belt's own speed, so it sits still on the moving chevrons.
+			var length := 0.0
+			var at := crate.position
+			for p in path:
+				length += at.distance_to(p)
+				at = p
+			duration = length / (factory_floor.belt_fps * 2.0)
+		crate.move_path(path, duration)
+	if ":belt_" in from and from != crate.location:
+		# The crates queued behind it on that belt move up.
+		for other in crates.values():
+			if other != crate and other.location == from and not other.came_back and not other.is_moving():
+				other.move_path([_target_for(other.item_id, from, other.state)], 0.4)
 	_toast_for_move(crate, msg)
 	_refresh_waiting()
 	if id == selected_id:
@@ -1324,6 +1599,8 @@ func _place_name(location: String) -> String:
 		return "the rework belt"
 	if FactoryFloor.is_bin(place):
 		return "the scrap bin"
+	if FactoryFloor.is_dock(place):
+		return "the shipping dock"
 	match place:
 		"intake":
 			return "the intake"
@@ -1392,6 +1669,11 @@ func _refresh_counters() -> void:
 
 ## Keep the belts running while crates are in the line, and the return belt while one rides it.
 func _process(delta: float) -> void:
+	if building and pending_save:
+		var before := _save_wait
+		_save_wait += delta
+		if before < SAVE_PATIENCE and _save_wait >= SAVE_PATIENCE:
+			build_panel.show_message("Still saving: the backend hasn't answered for %d seconds. It may be fetching a repo from GitHub; its window says what it's doing. You can keep editing and press Save again." % int(SAVE_PATIENCE))
 	_update_hover()
 	_layout_docks()
 	_key_pan(delta)
@@ -1404,6 +1686,10 @@ func _process(delta: float) -> void:
 		if _bin_tick >= 0.5:
 			_bin_tick = 0.0
 			_refresh_bin()
+	if not building:
+		_store_tick += delta
+		if _store_tick >= STORE_REFRESH:
+			_ask_storages()
 	if intake_view.visible:
 		_intake_tick += delta
 		if _intake_tick >= INTAKE_REFRESH:
@@ -1414,6 +1700,11 @@ func _process(delta: float) -> void:
 	var returning := false
 	for crate in crates.values():
 		if crate.state in ["shipped", "scrapped", "awaiting_approval", "held"]:
+			# Still riding its last belt to the dock, or a red belt into a bin: that belt keeps
+			# running until the crate is off it.
+			if crate.is_moving() and crate.state in ["shipped", "scrapped"]:
+				active = true
+				returning = returning or FactoryFloor.is_bin(crate.location)
 			continue
 		active = true
 		if _is_return(crate.location) or crate.came_back:
@@ -1431,8 +1722,15 @@ func _target_for(id: int, location: String, state := "", came_back := false) -> 
 	if state == "awaiting_approval":
 		# Crates waiting for you queue up in a row under the gate machine (below its step text).
 		return base + Vector2((float(id % 5) - 2.0) * 22.0, 112.0)
-	if location.ends_with(":intake") or location.ends_with(":dock") or FactoryFloor.is_bin(location) \
-			or ":belt_" in location:
+	if ":belt_" in location:
+		# Crates waiting on a belt queue up along it, nose to tail, the first at its end.
+		var rank := 0
+		for other in crates.values():
+			if other.item_id < id and other.location == location and not other.came_back \
+					and other.state not in ["shipped", "scrapped"]:
+				rank += 1
+		return factory_floor.back_along(location, rank * 30.0)
+	if location.ends_with(":intake") or FactoryFloor.is_dock(location) or FactoryFloor.is_bin(location):
 		# Spread crates that share a spot so they don't hide each other.
 		base += Vector2(float((id * 37) % 29) - 14.0, float((id * 53) % 29) - 14.0)
 	return base
@@ -1463,15 +1761,49 @@ func _select(id: int) -> void:
 		return
 	var crate: Crate = crates[id]
 	crate.selected = true
+	log_title.text = "Crate #%d" % id
+	_select_subtitle(id)
+	if logs_partial.has(id):
+		log_view.append_text("[color=#%s]… loading the start of the log[/color]\n" % LOG_COLORS["factory"])
+		client.send({"type": "get_log", "item_id": id})
+	for line in logs.get(id, []):
+		_write_log_line(str(line))
+
+
+func _select_subtitle(id: int) -> void:
+	if not crates.has(id):
+		return
+	var crate: Crate = crates[id]
 	var title := crate.text.get_slice("\n", 0)
 	if crate.loops > 0:
 		title += "  (sent back %d time%s)" % [crate.loops, "" if crate.loops == 1 else "s"]
 	if not crate.risk.is_empty():
 		title += "  [%s risk]" % crate.risk_words()
-	log_title.text = "Crate #%d" % id
+	if float(costs.get(id, 0.0)) > 0.0:
+		title += "  ·  Claude %s" % StatsView._usd(float(costs[id]))
 	log_subtitle.text = title + (("  ·  " + crate.source) if not crate.source.is_empty() else "")
-	for line in logs.get(id, []):
-		_write_log_line(str(line))
+
+
+## The whole log of a crate, asked for when you opened it.
+func _got_full_log(id: int, full: Array) -> void:
+	if not logs_partial.has(id):
+		return
+	logs_partial.erase(id)
+	var lines: Array = []
+	for line in full:
+		lines.append(str(line))
+	# Lines that arrived after the backend read it are already at the end of ours.
+	var have: Array = logs.get(id, [])
+	var tail_start := have.size()  # (no overlap found: keep the backend's)
+	for k in range(have.size(), 0, -1):
+		if k <= lines.size() and lines.slice(lines.size() - k) == have.slice(0, k):
+			tail_start = k
+			break
+	logs[id] = lines + have.slice(tail_start)
+	if id == selected_id:
+		log_view.clear()
+		for line in logs[id]:
+			_write_log_line(str(line))
 
 
 ## One log line, coloured by what it is: step headers, factory messages, failures, commands.
@@ -1499,4 +1831,6 @@ func _source_label(item: Dictionary) -> String:
 			return "Jira " + ref
 		"prd":
 			return "PRD #" + ref if not ref.is_empty() else "PRD"
+		"github_pr":
+			return "PR #" + ref
 	return ""

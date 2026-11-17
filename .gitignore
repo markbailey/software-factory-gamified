@@ -12,3 +12,4 @@ backend/uv.lock
 
 # The throwaway test project machines run in
 workspace/
+.claude_tmp/

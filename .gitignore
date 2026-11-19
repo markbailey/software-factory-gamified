@@ -13,3 +13,12 @@ backend/uv.lock
 # The throwaway test project machines run in
 workspace/
 .claude_tmp/
+
+# The factory's own GitHub / Jira tokens (set in the game: Accounts)
+backend/accounts.toml
+backend/accounts.tmp
+
+# Build output, scratch
+dist/
+_sf_tmp_to_delete/
+*.tgz

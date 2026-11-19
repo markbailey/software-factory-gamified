@@ -105,4 +105,32 @@ def compute(store: Store, names: dict[str, dict], days: int = 7) -> dict:
         "cost_per_shipped": round(total_cost / len(shipped), 4) if shipped else 0.0,
         "lines": sorted(lines.values(), key=lambda ln: ln["name"]),
         "machines": machine_rows,
+        "agents": by_agent(runs),
     }
+
+
+def by_agent(runs: list[dict]) -> list[dict]:
+    """Runs, cost and time per Claude model and effort. Runs that started no Claude are left out;
+    older runs from before the model was recorded, that still cost something, show as "unknown"."""
+    groups: dict[tuple[str, str], dict] = {}
+    for r in runs:
+        model, effort = r.get("model") or "", r.get("effort") or ""
+        if not model and not effort:
+            if r["cost_usd"] <= 0:
+                continue  # no Claude in this run
+            model = effort = "unknown"
+        g = groups.setdefault((model, effort), {"model": model, "effort": effort, "runs": 0, "failed": 0,
+                                                "seconds": 0.0, "cost_usd": 0.0, "turns": 0})
+        g["cost_usd"] += r["cost_usd"]
+        if r["outcome"] == "stopped":
+            continue
+        g["runs"] += 1
+        g["seconds"] += r["ended_at"] - r["started_at"]
+        g["turns"] += r["turns"]
+        if r["outcome"] == "failed":
+            g["failed"] += 1
+    rows = [{**g, "cost_usd": round(g["cost_usd"], 4), "seconds": round(g["seconds"], 1),
+             "avg_seconds": round(g["seconds"] / g["runs"], 1) if g["runs"] else 0.0,
+             "fail_rate": _rate(g["failed"], g["runs"])} for g in groups.values()]
+    rows.sort(key=lambda g: (-g["cost_usd"], -g["runs"], g["model"], g["effort"]))
+    return rows

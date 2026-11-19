@@ -26,7 +26,7 @@ from typing import Awaitable, Callable
 
 from dataclasses import dataclass
 
-from . import attribution, config, formats, graph, janitor, runner, stats, triage, workspace
+from . import accounts, agents, attribution, branch_names, config, formats, graph, janitor, plans, review_types, runner, stats, triage, workspace
 from .config import Config, MachineConfig, RepoConfig, StepConfig, is_agent_step
 from .health import AgentHealth
 from .hub import Hub
@@ -121,6 +121,7 @@ def _read_pauses() -> dict:
 
 
 BELTS_FILE = config.BACKEND_DIR / "belts.json"
+REPOS_FILE = config.BACKEND_DIR / "repos.json"  # the factory's repo list (Factory settings, Repos)
 DEFAULT_BELT_SPEED = 1.5  # cells a second
 BELT_SPEEDS = (0.5, 6.0)  # slowest and fastest you can set (faster strobes at 60 fps)
 
@@ -185,16 +186,11 @@ def line_view(cfg: Config, p: dict, everything: list[dict], route: dict[str, str
 
 
 def normalize_repo(cfg: Config, p: dict) -> dict:
-    """A pipeline's repo settings as saved: only what's set, and nothing at all for the
-    default repo on its usual base branch (so pipelines on it compare as the same repo)."""
+    """A pipeline's repo settings as saved: only what's set. Nothing set means no repo picked
+    (the line is paused until you pick one), so the repo it picked is always kept."""
     raw = graph.repo_settings(p)
     if raw.get("github"):
         raw["github"] = config.github_name(raw["github"]) or raw["github"]
-    if raw and not graph.validate_repo(raw):
-        repo = config.resolve_repo(cfg, raw)
-        if repo.is_default:
-            raw = {"base_branch": raw["base_branch"]} if raw.get("base_branch") not in (
-                None, "", cfg.default_repo.base_branch) else {}
     if raw:
         p["repo"] = raw
     else:
@@ -212,6 +208,8 @@ def load_pipelines(cfg: Config) -> list[dict]:
             print(f"[factory] moved {', '.join(moved)} to the line that runs crates through them")
         error, _ = graph.check(cfg.catalog, saved)
         if not error:
+            if graph.saved_version() < 6:
+                _name_old_default(cfg, saved)
             return saved
         print(f"[factory] pipelines.json is not usable ({error}); using the line instead")
     entries = [{"type": m.type, "id": m.id, "name": m.name, "gate": m.gate, "prompt": m.prompt
@@ -228,6 +226,31 @@ def load_pipelines(cfg: Config) -> list[dict]:
     return pipelines
 
 
+def _name_old_default(cfg: Config, pipelines: list[dict]) -> None:
+    """Saved when a line that named no repo worked on factory.toml's [workspace] repo (the test
+    project): there's no default any more, so those lines name it, and keep working on it."""
+    repo = cfg.default_repo
+    if repo.github:
+        name = {"github": repo.github}
+    else:  # a remote that isn't on GitHub (or none): name its folder
+        try:
+            name = {"path": repo.path.relative_to(cfg.workspace).as_posix()}
+        except ValueError:
+            name = {"path": str(repo.path)}
+    named = []
+    for p in pipelines:
+        if graph.missing_repo(p):
+            p["repo"] = {**graph.repo_settings(p), **name}
+            named.append(str(p.get("name") or p.get("id")))
+    if named:
+        print(f"[factory] {', '.join(named)} worked on the old default repo; now they name it: "
+              f"{repo.github or repo.path}")
+        try:
+            graph.write(pipelines)
+        except OSError as exc:
+            print(f"[factory] could not save pipelines.json: {exc}")
+
+
 def _with_plan_line(cfg: Config, pipelines: list[dict]) -> list[dict]:
     """Add the Planning line under the others if no pipeline takes PRDs yet (once: after you
     save your pipelines in the game it's part of them, and you can move or delete it)."""
@@ -239,7 +262,9 @@ def _with_plan_line(cfg: Config, pipelines: list[dict]) -> list[dict]:
     return pipelines + [plan]
 
 
-ON_LINE_STATES = ("waiting", "running", "moving", "awaiting_approval")  # what a line's max_crates counts
+# What a line's max_crates counts. Crates waiting for your approval (at an Approver, or any gate)
+# don't: they sit in its holding bay, so a pile of them never stops new work coming in.
+ON_LINE_STATES = ("waiting", "running", "moving")
 LINE_ROOM_POLL_SECONDS = 2.0  # how often a crate waiting for room on a full line looks again
 SNAPSHOT_LOG_LINES = 60
 CARRY_SECONDS = 2.5  # a worker carrying a crate to the machine it needs
@@ -271,9 +296,13 @@ class Factory:
         self.no_rework: set[int] = set()  # crates whose failing step said NO_REWORK
         self.failed_at: dict[int, int] = {}  # crate -> index of the step that failed last
         self.run_spend: dict[int, list] = {}  # crate -> [Claude cost, turns] of its current machine run
+        self.run_agent: dict[int, tuple[str, str]] = {}  # crate -> (model, effort) its current run's Claude used
         self.wrong_machine: dict[int, str] = {}  # crate -> machine type its last Claude reply asked for
         self.carried: dict[int, int] = {}  # crate -> times a worker carried it to another machine
         self.retried: dict[tuple[int, str], int] = {}  # (crate, machine) -> times it ran it again by itself
+        # crate -> ("pass" | "fail", machine id, name, type): how it left the last machine that worked on
+        # it (a green belt, or a red one onward or back for rework). Sorters' "Arrived as" rule reads it.
+        self.arrived: dict[int, tuple[str, str, str, str]] = {}
         self.budget_ok: set[int] = set()  # crates you ran again after they went over their budget
         self._budget_alerted = 0.0  # the day the "budget spent" alert last went out
         self.health: AgentHealth | None = None  # set by main; None means never pause
@@ -344,8 +373,13 @@ class Factory:
                 "sources": list(graph.SOURCES),
                 "belt_seconds": self.cfg.travel_seconds,
                 "belt_speed": self.belt_speed,
+                "force_delete": janitor.force_delete_on(),
+                "branch_pattern": branch_names.factory_pattern(),
+                "agent_defaults": agents.defaults(),
+                "agent_choices": agents.choices(),
                 "max_rework": self.cfg.max_rework,
                 "default_repo": self.cfg.default_repo.summary(),
+                "repos": self.repo_list(),
             },
             "items": self._snapshot_items(),
             "agent": self.health.status() if self.health else {"available": True, "enabled": False},
@@ -375,6 +409,24 @@ class Factory:
                     names[str(m.get("id", ""))] = {"name": str(m.get("name", "") or (mc.name if mc else m.get("id"))),
                                                    "pipeline": pid, "pipeline_name": names[pid]["name"]}
         return {**stats.compute(self.store, names, days), "budget": self.budget()}
+
+    def account_choice(self, item: dict, service: str) -> str:
+        """The account a crate's machines work as on this service: the pick of the storage it came
+        out of (a Jira storage's for Jira, any other storage's for GitHub), else its line's, else
+        "" (the factory's default)."""
+        line = self.lines.get(str(item.get("pipeline") or ""))
+        if line is None:
+            return ""
+        st = next((s for s in graph.storages_of(line.graph) if s.get("id") == item.get("storage")), {})
+        if st.get("account") and (st.get("source") == "jira") == (service == "jira"):
+            return str(st["account"])
+        return graph.account_of(line.graph, service)
+
+    def account_env(self, item_id: int) -> dict:
+        """Environment changes for a crate's commands: its GitHub account and its Jira token."""
+        item = self.store.get_item(item_id) or {}
+        return {**accounts.github_env(self.account_choice(item, "github")),
+                **accounts.jira_env(self.account_choice(item, "jira"))}
 
     def line_for_source(self, source: str) -> Line | None:
         """The pipeline a new crate from this source goes to. Typed specs, GitHub issues and
@@ -468,7 +520,7 @@ class Factory:
         working in). Returns what went wrong, or None."""
         for line in lines:
             for repo in [line.repo, *self._storage_repos(line)]:
-                if _repo_key(repo) in self.prepared:
+                if repo.unset or _repo_key(repo) in self.prepared:
                     continue
                 try:
                     notes = await asyncio.wait_for(asyncio.to_thread(workspace.ensure_repo, self.cfg, repo),
@@ -492,8 +544,12 @@ class Factory:
         out = []
         for st in graph.fed_storages(line.graph):
             name = graph.github_name(str(st.get("repo") or "")) if st.get("source") in graph.WORK_REPO_SOURCES else ""
-            if name and name.lower() != (line.repo.github or "").lower():
-                out.append(self.repo_named(name))
+            # An Open PRs storage ticked to read the factory's repo list: each repo in it.
+            names = self._saved_repos() if graph.lists_repos(st) else [name]
+            for name in names:
+                if name and name.lower() != (line.repo.github or "").lower() \
+                        and all(r.github.lower() != name.lower() for r in out):
+                    out.append(self.repo_named(name))
         return out
 
     def repo_named(self, name: str) -> RepoConfig:
@@ -515,11 +571,14 @@ class Factory:
         return bin_rules(None)
 
     def repos(self) -> list[RepoConfig]:
-        """Every repo the lines work on (the default one first), each once."""
-        out = {self.cfg.default_repo.path: self.cfg.default_repo}
+        """Every repo the lines work on, each once (and factory.toml's [workspace] clone if it's
+        there, so the janitor still tidies worktrees made from it)."""
+        default = self.cfg.default_repo
+        out = {default.path: default} if (default.path / ".git").exists() else {}
         for line in self.lines.values():
             for repo in [line.repo, *self._storage_repos(line)]:
-                out.setdefault(repo.path, repo)
+                if not repo.unset:
+                    out.setdefault(repo.path, repo)
         return list(out.values())
 
     def repo_of(self, item: dict) -> RepoConfig:
@@ -580,8 +639,8 @@ class Factory:
             (bool(line_id) and self.line_full(line_id))
 
     def on_line(self, line_id: str) -> int:
-        """Crates on a line past its intake: on belts, in machines, or at a gate waiting for you.
-        Held crates don't count (they're off to the side, blocking nothing)."""
+        """Crates on a line past its intake: on belts or in machines. Crates waiting for your
+        approval at a gate and held crates don't count (they're off to the side, blocking nothing)."""
         return self.store.count_on_line(line_id, ON_LINE_STATES)
 
     def line_limit(self, line_id: str) -> int:
@@ -800,6 +859,7 @@ class Factory:
             del self.retried[key]  # Run again: each machine's retries count from zero again
         if item["state"] == "held":
             return await self.decide(item_id, "retry", note)
+        self.arrived.pop(item_id, None)  # back to the start: it hasn't been anywhere yet
         if item["state"] != "scrapped":
             return f"crate #{item_id} is not in the scrap bin"
         line = self.lines.get(item.get("pipeline", ""))
@@ -835,6 +895,150 @@ class Factory:
             print(f"[factory] could not save the belt speed: {exc}")
         await self.hub.broadcast({"type": "belt_speed", "speed": self.belt_speed})
         return None
+
+    def _saved_repos(self) -> list[str]:
+        try:
+            raw = json.loads(REPOS_FILE.read_text(encoding="utf-8")).get("repos", [])
+        except (OSError, ValueError, TypeError, AttributeError):
+            return []
+        return [n for n in (config.github_name(str(r)) for r in raw if isinstance(raw, list)) if n]
+
+    def repo_list(self) -> list[dict]:
+        """The repos the game offers in its pickers: the ones added under the gear, then any a
+        line or storage already uses (so older layouts keep working)."""
+        used: list[str] = []
+        for line in self.lines.values():
+            used.append(line.repo.github or "")
+            for st in graph.storages_of(line.graph):
+                used.append(config.github_name(str(st.get("repo") or "")))
+        out: dict[str, dict] = {}
+        for name in [*self._saved_repos(), *used]:
+            if name and name.lower() not in out:
+                out[name.lower()] = {"github": name, "saved": False, "in_use": False, "default": False}
+        for name in self._saved_repos():
+            out[name.lower()]["saved"] = True
+        for name in used:
+            if name:
+                out[name.lower()]["in_use"] = True
+        return list(out.values())
+
+    async def set_repos(self, repos) -> str | None:
+        """The repo list under the gear (owner/name each, or a GitHub link)."""
+        if not isinstance(repos, list):
+            return "the repo list is muddled"
+        names: list[str] = []
+        for r in repos:
+            name = config.github_name(str(r))
+            if not name:
+                return f"{str(r).strip() or 'a blank'} isn't a GitHub repo (owner/name or a github.com link)"
+            if name.lower() not in [n.lower() for n in names]:
+                names.append(name)
+        try:
+            REPOS_FILE.write_text(json.dumps({"repos": names}, indent=1), encoding="utf-8")
+        except OSError as exc:
+            return f"could not save the repo list: {exc}"
+        await self.hub.broadcast({"type": "repos", "repos": self.repo_list()})
+        return None
+
+    async def _with_agent_choice(self, item_id: int, machine: MachineConfig, resolved: list[str]) -> list[str]:
+        """A claude step's command with the machine's model and effort (or the factory default's)."""
+        default = agents.defaults()
+        model, effort = machine.model or default["model"], machine.effort or default["effort"]
+        resolved, notes = await asyncio.to_thread(agents.with_choice, resolved, model, effort)
+        self.run_agent[item_id] = agents.used_choice(resolved)
+        for note in notes:
+            await self._log(item_id, machine.id, f"[factory] {note}")
+        if model or effort:
+            await self._log(item_id, machine.id, f"[factory] Claude: {model or 'CLI default model'}, "
+                            f"{effort or 'default'} effort")
+        return resolved
+
+    async def set_agent_defaults(self, model, effort) -> str | None:
+        """The factory-wide Claude model and effort under the gear: machines left on Default use it."""
+        try:
+            agents.set_defaults(model, effort)
+        except OSError as exc:
+            return f"could not save the Claude defaults: {exc}"
+        await self.hub.broadcast({"type": "agent_defaults", **agents.defaults()})
+        return None
+
+    async def set_branch_pattern(self, pattern) -> str | None:
+        """The Branch naming box under the gear: the pattern new crates' branches are named by."""
+        pattern = str(pattern or "").strip()
+        error = branch_names.validate(pattern)
+        if error:
+            return f"Branch naming: {error}"
+        try:
+            branch_names.set_factory_pattern(pattern)
+        except OSError as exc:
+            return f"could not save the branch naming pattern: {exc}"
+        await self.hub.broadcast({"type": "branch_pattern", "pattern": branch_names.factory_pattern()})
+        return None
+
+    def branch_of(self, item: dict, machine: MachineConfig | None = None, save: bool = False) -> str:
+        """A crate's branch: the name saved on it, else one from the branch naming pattern (its
+        line's, else the factory's), saved when save (a machine that makes or uses it)."""
+        if item.get("branch"):
+            return str(item["branch"])
+        item_id = int(item["id"])
+        legacy = f"crate/{item_id}"
+        try:
+            line = self.lines.get(item.get("pipeline", "")) or self._line_of(item)
+            repo = self.repo_of(item)
+        except Exception:  # no lines (yet): the old name
+            return legacy
+        if (self.cfg.worktrees / f"crate-{item_id}").exists():
+            name = legacy  # a crate from before branch naming, already under way
+        else:
+            pattern = graph.repo_settings(line.graph).get("branch_pattern") or branch_names.factory_pattern()
+            if pattern == branch_names.DEFAULT_PATTERN:
+                name = legacy
+            else:
+                taken = set(branch_names.owners({i["id"]: i for i in self.store.list_items(log_tail=0)
+                                                 if i["id"] != item_id}))
+                if (repo.path / ".git").exists():
+                    taken |= branch_names.local_branches(repo.path)
+                values = branch_names.values_for(item, line.name, (machine.type or machine.name) if machine else "",
+                                                 repo.github or repo.path.name)
+                name = branch_names.choose(pattern, values, taken, {repo.base_branch or "main"})
+        if save:
+            self.store.update_item(item_id, branch=name)
+            item["branch"] = name
+        return name
+
+    async def set_force_delete(self, on) -> str | None:
+        """The Force delete tick box under the gear: how hard removing a worktree tries."""
+        try:
+            janitor.set_force_delete(bool(on))
+        except OSError as exc:
+            return f"could not save force delete: {exc}"
+        await self.hub.broadcast({"type": "force_delete", "on": janitor.force_delete_on()})
+        return None
+
+    async def worktrees_command(self, ws, msg: dict) -> None:
+        """The dashboard's Worktrees & branches tab: "worktrees" lists them, "worktrees_clean"
+        removes the ticked ones ({keys, force}) and then lists them again. Removing holds every
+        repo's lock, so it never pulls a worktree out from under a machine making one."""
+        try:
+            if msg.get("type") == "worktrees_clean":
+                keys = [str(k) for k in msg.get("keys", []) if isinstance(k, str)][:500]
+                force = bool(msg.get("force", False))
+                repos = self.repos()
+                async with contextlib.AsyncExitStack() as stack:
+                    for repo in sorted(repos, key=lambda r: str(r.path).lower()):
+                        await stack.enter_async_context(self.repo_lock(repo.path))
+                    items = {i["id"]: i for i in self.store.list_items(log_tail=0)}
+                    result = await asyncio.to_thread(janitor.clean, self.cfg, items, repos, keys, force)
+                if result["removed"]:
+                    print(f"[dashboard] removed {', '.join(result['removed'])}" + (" (force clean)" if force else ""))
+                await ws.send_json(result)
+            items = {i["id"]: i for i in self.store.list_items(log_tail=0)}
+            await ws.send_json(await asyncio.to_thread(janitor.inventory, self.cfg, items, self.repos()))
+        except Exception as exc:  # the socket may have closed, or git isn't there
+            try:
+                await ws.send_json({"type": "worktrees", "error": str(exc), "worktrees": [], "branches": []})
+            except Exception:
+                pass
 
     def _belt_seconds(self, item_id: int, to: str) -> float | None:
         """How long a crate takes along the belt at `to` ("<line>:belt_<i>") at the belts' speed,
@@ -953,6 +1157,16 @@ class Factory:
                                  state="waiting" if i + 1 < len(machines) else "moving")
                 i += 1
                 continue
+            if machine.switched_off:
+                # Switched off in the game: runs nothing, and the crate goes straight out of its
+                # green port, as if it passed.
+                await self._log(item_id, machine.id, f"[factory] {machine.name} is switched off; "
+                                "passing straight through")
+                await self._move(item_id, machine.id, 0.3, state="running")
+                self.arrived[item_id] = ("pass", machine.id, machine.name, machine.type)
+                await self._move(item_id, belt(i + 1), travel, state="waiting" if i + 1 < len(machines) else "moving")
+                i += 1
+                continue
             last = i == len(machines) - 1
             next_state = "moving" if last else "waiting"
             back_to: int | None = None
@@ -972,6 +1186,8 @@ class Factory:
                     await self._move(item_id, machine.id, 0.3, state="running")
                     ok, failed_step, output = await self._run_machine(item_id, machine, rework)
                     gate_output = output
+                    if ok:
+                        self.arrived[item_id] = ("pass", machine.id, machine.name, machine.type)
                     wanted = self.wrong_machine.pop(item_id, "")
                     if wanted:
                         self.no_rework.discard(item_id)  # not its work: a worker takes it elsewhere
@@ -1020,6 +1236,7 @@ class Factory:
             # Gate: the crate waits here (without blocking the machine) until you decide.
             decision = await self._await_decision(item_id, machine)
             if decision == "approve":
+                self.arrived[item_id] = ("pass", machine.id, machine.name, machine.type)
                 await self._log(item_id, machine.id, f"[factory] approved at {machine.name}")
                 await self._move(item_id, belt(i + 1), travel, state=next_state)
                 i += 1
@@ -1162,15 +1379,41 @@ class Factory:
             self.split_turns[machine.id] = turn + 1
             return ports[turn % len(ports)], "taking turns"
         changes: tuple[list[str], int] | None = None
+        line = self.lines.get(item.get("pipeline", ""))
+        crate = dict(item, repo=item.get("repo") or (line.repo.github if line else "") or "")  # blank: the line's repo
+        crate["arrived"] = self._arrived_as(item, machine)
         for rule in sorted(machine.rules, key=lambda r: r["port"]):
             kind, value = rule["when"], rule.get("value", "")
             if kind in ("files", "size") and changes is None:
                 changes = await self._changes(item)
-            if _rule_matches(kind, value, item, changes):
+            if _rule_matches(kind, value, crate, changes):
                 return rule["port"], _rule_words(kind, value)
         risk = item.get("risk") or "not rated"
-        return None, (f"no output's rule matches this crate (risk {risk}, from {item.get('source') or 'game'}). "
+        result, _, failed_name, _ = crate["arrived"]
+        arrived = f"failed at the {failed_name}" if result == "fail" else "passed"
+        return None, (f"no output's rule matches this crate (risk {risk}, from {item.get('source') or 'game'}, "
+                      f"repo {crate['repo'] or 'unknown'}, {arrived}). "
                       f"Change the sorter's rules, or give an output \"everything else\"")
+
+    def _arrived_as(self, item: dict, sorter: MachineConfig) -> tuple[str, str, str, str]:
+        """How a crate came into a sorter: ("pass" | "fail", machine id, name, type) of the last
+        machine that worked on it. After a restart (nothing remembered) it's read from its route:
+        failed if the machine before the sorter (past other sorters and mergers) sent it on by
+        its red belt."""
+        known = self.arrived.get(int(item["id"]))
+        if known:
+            return known
+        try:
+            line = self._line_of(item)
+        except RuntimeError:
+            return ("pass", "", "", "")
+        ids = [m.id for m in line.machines]
+        route = graph.parse_route(item.get("route", ""))
+        for m in reversed(line.machines[:ids.index(sorter.id)] if sorter.id in ids else []):
+            if m.sorter or m.kind == "merger":
+                continue
+            return ("fail" if route.get(m.id) == graph.FAIL else "pass", m.id, m.name, m.type)
+        return ("pass", "", "", "")
 
     async def _changes(self, item: dict) -> tuple[list[str], int]:
         """The files a crate's branch changes and how many lines (added + removed), against
@@ -1233,6 +1476,7 @@ class Factory:
         item = self.store.get_item(item_id)
         route = graph.parse_route(item.get("route", ""))
         route[machine.id] = graph.FAIL
+        self.arrived[item_id] = ("fail", machine.id, machine.name, machine.type)
         tail = "\n".join(triage.explanation(output).splitlines()[-25:])[-3000:] if output else ""
         note = f"{triage.KIND_WORDS.get(kind, kind)} at the {machine.name} ({reason})." + (f"\n\n{tail}" if tail else "")
         self.store.update_item(item_id, route=graph.route_text(route), scrap_kind=kind, notes=note)
@@ -1309,6 +1553,7 @@ class Factory:
         if details.strip():
             note += "\n\n" + details.strip()
         self.store.update_item(item_id, loops=loops, notes=note, outcome="")
+        self.arrived[item_id] = ("fail", machine.id, machine.name, machine.type)
         if self.store.get_item(item_id).get("risk"):  # the change will differ: assess it again
             await self._stamp_risk(item_id, "", "")
         await self._log(item_id, machine.id,
@@ -1672,22 +1917,27 @@ class Factory:
     async def _cleanup_branch(self, item_id: int) -> None:
         """Remove a crate's old worktree and local branch so the Coder can start fresh."""
         worktree = self.cfg.worktrees / f"crate-{item_id}"
-        branch = f"crate/{item_id}"
-        repo = self.repo_of(self.store.get_item(item_id)).path
+        item = self.store.get_item(item_id)
+        branch = str(item.get("branch") or "") or f"crate/{item_id}"
+        repo = self.repo_of(item).path
         async with self.repo_lock(repo):
             await self._cleanup_branch_in(item_id, worktree, branch, repo)
 
     async def _cleanup_branch_in(self, item_id: int, worktree: Path, branch: str, repo: Path) -> None:
+        force = janitor.force_delete_on()  # the Force delete tick box under the gear
         if worktree.exists():
-            await self._command(item_id, "factory", ["git", "worktree", "remove", "--force", str(worktree)],
-                                repo)
+            for args in janitor.remove_args(worktree, force):
+                await self._command(item_id, "factory", ["git", *args], repo, quiet_fail=args[1] == "unlock")
         if worktree.exists():
-            # git can leave a half-deleted folder on Windows (read-only files in node_modules).
-            await self._log(item_id, "factory", f"[factory] deleting leftover folder {worktree}")
+            # git can leave a half-deleted folder on Windows (read-only files in node_modules,
+            # or files a program still running in there holds open).
+            await self._log(item_id, "factory", f"[factory] deleting leftover folder {worktree}"
+                            + (" (force delete: stopping anything running in it)" if force else ""))
             try:
-                await asyncio.to_thread(janitor.force_remove, worktree)
+                await asyncio.to_thread(janitor.force_remove, worktree, force)
             except OSError as exc:
-                await self._log(item_id, "factory", f"[factory] could not delete it: {exc}")
+                await self._log(item_id, "factory", f"[factory] could not delete it: {exc}"
+                                + ("" if force else ". Tick Force delete under the gear to stop what holds it"))
         await self._command(item_id, "factory", ["git", "worktree", "prune"], repo)
         await self._command(item_id, "factory", ["git", "branch", "-D", branch], repo, quiet_fail=True)
 
@@ -1716,6 +1966,7 @@ class Factory:
         """Run a machine's steps, and record the run: how long it took, what Claude cost."""
         started = time.time()
         self.run_spend[item_id] = [0.0, 0]
+        self.run_agent.pop(item_id, None)
         outcome, failed_step = "stopped", ""
         try:
             ok, failed_step, output = await self._run_steps(item_id, machine, rework)
@@ -1723,9 +1974,10 @@ class Factory:
             return ok, failed_step, output
         finally:
             cost, turns = self.run_spend.pop(item_id, [0.0, 0])
+            model, effort = self.run_agent.pop(item_id, ("", ""))
             item = self.store.get_item(item_id) or {}
             self.store.record_run(item_id, str(item.get("pipeline", "")), machine.id, machine.type, started,
-                                  outcome, failed_step if outcome == "failed" else "", cost, turns)
+                                  outcome, failed_step if outcome == "failed" else "", cost, turns, model, effort)
             if outcome != "stopped":
                 await self.hub.emit({"type": "item_cost", "item_id": item_id, **self._cost_of(item_id)})
 
@@ -1859,6 +2111,8 @@ class Factory:
         await log("$ " + " ".join(argv))
         try:
             resolved = runner.resolve(argv, self.cfg.allowed_commands)
+            if is_agent_step(step):
+                resolved = await self._with_agent_choice(item_id, machine, resolved)
             if not cwd.is_dir():
                 raise FileNotFoundError(f"working folder does not exist: {cwd}")
             repo = self.repo_of(self.store.get_item(item_id)).path
@@ -1922,9 +2176,11 @@ class Factory:
             # The shared checkout (fetch, worktree add): one git command at a time in it, so
             # crates running at once don't trip over each other's lock files.
             async with self.repo_lock(cwd):
-                code = await runner.run(resolved, cwd, on_line, stdin_text=stdin_text, timeout=step.timeout_seconds)
+                code = await runner.run(resolved, cwd, on_line, stdin_text=stdin_text, timeout=step.timeout_seconds,
+                                    env=self.account_env(item_id))
         else:
-            code = await runner.run(resolved, cwd, on_line, stdin_text=stdin_text, timeout=step.timeout_seconds)
+            code = await runner.run(resolved, cwd, on_line, stdin_text=stdin_text, timeout=step.timeout_seconds,
+                                    env=self.account_env(item_id))
         if (self.store.get_item(item_id) or {}).get("waiting_for"):
             await self._set_waiting(item_id, machine.id, "")
         if code == 0 and step.save_result_as == "pr_body" and values.get("agent_result", "").strip():
@@ -1985,7 +2241,10 @@ class Factory:
             "repo": str(repo.path),
             "github_repo": repo.github,
             "worktree": str(self.cfg.worktrees / f"crate-{item_id}"),
-            "branch": f"crate/{item_id}",
+            # Named by the branch naming pattern (under the gear, or the line's own) and saved on
+            # the crate by the first machine that makes or uses it.
+            "branch": Factory.branch_of(self, item, machine, save=any(
+                "{branch}" in " ".join([*s.command, s.cwd]) for s in machine.steps)),
             "base": base,
             "base_ref": f"origin/{base}" if repo.remote else base,
             # A Document writer before the Packager writes these; otherwise the plain ones.
@@ -2018,10 +2277,18 @@ class Factory:
             "source_ref": item.get("source_ref", "") or "",
             "issue_repo": repo.github or self.cfg.github.repo,
             "issue_label": self.cfg.github.label,
-            # Where the Verifier looks up a Jira issue (the token itself stays in its variable).
-            "jira_url": self.cfg.jira.base_url,
-            "jira_email": self.cfg.jira.email,
-            "jira_token_env": self.cfg.jira.token_env,
+            # Where the Verifier looks up a Jira issue, as the crate's Jira account (the token
+            # itself is only in the step's environment).
+            "jira_url": accounts.jira_creds(self.account_choice(item, "jira")).base_url,
+            "jira_email": accounts.jira_creds(self.account_choice(item, "jira")).email,
+            "jira_token_env": accounts.JIRA_TOKEN_VAR,
+            # The label a Document writer puts on the Jira issues it makes that are ready to build.
+            "jira_label": getattr(getattr(self.cfg, "jira", None), "trigger_label", "factory"),
+            # The Reviewer's intent check: the PR text a Document writer drafted before there's a
+            # PR, and the plans the Issue maker made (the PRD a planned issue came from).
+            "draft_pr_body": "" if item.get("pr_url") else (item.get("pr_body") or "").strip(),
+            "plans_dir": str(self.cfg.workspace / "plans"),
+            "prd_ref": _prd_ref(self, item, repo.github or self.cfg.github.repo),
             "previous_plan": (f"Your previous plan was sent back. Revise it; don't start over.\n"
                               f"Why it came back:\n{item['notes']}\n\nYour previous plan:\n{item.get('review', '')}"
                               if item.get("notes") and item.get("review") else ""),
@@ -2029,8 +2296,29 @@ class Factory:
         for key, value in machine.options.items():  # text settings, e.g. {reviewers}
             if isinstance(value, str):
                 values.setdefault(key, value)
-        values["prompt"] = expand(machine.prompt, values).strip() + "\n"
+        if "review_type" in machine.options:  # the Reviewer: what kind of review, and the files it reads
+            values["review_focus"] = review_types.focus(machine.options)
+            values["reference_files"] = review_types.reference_files(machine.options)
+        prompt = machine.prompt
+        if values.get("review_focus") and "{review_focus}" not in prompt:  # a prompt saved before review types
+            prompt = prompt.rstrip() + "\n\n{review_focus}\n"
+        values["prompt"] = expand(prompt, values).strip() + "\n"
         return values
+
+
+def _prd_ref(factory, item: dict, github_repo: str) -> str:
+    """The PRD issue a crate's issue was planned from (via the Issue maker's plan record and the
+    planning crate), or ""."""
+    ref = str(item.get("source_ref") or "")
+    store = getattr(factory, "store", None)
+    if item.get("source") != "github" or not ref.isdigit() or store is None:
+        return ""
+    hit = plans.plan_of(factory.cfg.workspace / "plans", github_repo, int(ref))
+    try:
+        planner = store.get_item(int(hit["crate"])) if hit and hit.get("crate") else None
+    except Exception:  # noqa: BLE001 - a missing crate just means no PRD to show
+        planner = None
+    return str(planner.get("source_ref") or "") if planner and planner.get("source") == "prd" else ""
 
 
 def _words(value: str) -> list[str]:
@@ -2049,6 +2337,17 @@ def _rule_matches(kind: str, value: str, item: dict, changes: tuple[list[str], i
         return RISK_ORDER[risk] >= RISK_ORDER.get(want, 9) if value.endswith("+") else risk == want
     if kind == "source":
         return (item.get("source") or "game") in _words(value)
+    if kind == "repo":  # "owner/name" or just "name", any case
+        repo = config.github_name(str(item.get("repo") or "")).lower()
+        return bool(repo) and any(w.lower() in (repo, repo.rpartition("/")[2])
+                                  for w in (config.github_name(w) or w for w in _words(value)))
+    if kind == "result":  # "pass", "fail", or "fail:Tester, Reviewer" (failed at one of those)
+        result, mid, name, mtype = item.get("arrived") or ("pass", "", "", "")
+        want, _, at = value.partition(":")
+        if result != want.strip():
+            return False
+        names = [w.lower() for w in _words(at)]
+        return not names or any(w in (str(mid).lower(), str(name).lower(), str(mtype).lower()) for w in names)
     if kind == "text":
         text = f"{item.get('text', '')}\n{item.get('spec', '')}".lower()
         return any(w.lower() in text for w in _words(value))
@@ -2063,16 +2362,31 @@ def _rule_matches(kind: str, value: str, item: dict, changes: tuple[list[str], i
 
 def _rule_words(kind: str, value: str) -> str:
     return {"otherwise": "everything else", "risk": f"risk {value.replace('+', ' or higher')}",
-            "source": f"from {value}", "text": f"the spec mentions {value}", "files": f"changes {value}",
+            "source": f"from {value}", "repo": f"for {value}", "result": _result_words(value), "text": f"the spec mentions {value}", "files": f"changes {value}",
             "size": f"changes {value}+ lines"}.get(kind, kind)
+
+
+def _result_words(value: str) -> str:
+    want, _, at = value.partition(":")
+    if want.strip() != "fail":
+        return "it passed (green belt)"
+    return f"it failed at {', '.join(_words(at))} (red belt)" if _words(at) else "it failed (red belt)"
 
 
 def _skip_reason(when: str, options: dict, values: dict) -> str:
     """Why a step with this `when` is skipped, or "" if it runs. Each comma-separated term is a
-    machine option (ticked) or a placeholder (not empty); "!" in front turns it round."""
+    machine option (ticked) or a placeholder (not empty); "!" in front turns it round.
+    "name=a|b" runs while a choice option (or placeholder) is one of those values."""
     for term in [t.strip() for t in (when or "").split(",") if t.strip()]:
         negate = term.startswith("!")
         name = term.lstrip("!")
+        if "=" in name:
+            name, _, wanted = name.partition("=")
+            name = name.strip()
+            current = str(options[name] if name in options else values.get(name, "")).strip()
+            if (current in [w.strip() for w in wanted.split("|")]) == negate:
+                return f"{name.replace('_', ' ')} is set to {current or 'nothing'} in its settings"
+            continue
         on = bool(options[name]) if name in options else bool(str(values.get(name, "")).strip())
         if on == negate:
             words = name.replace("_", " ")
@@ -2147,49 +2461,77 @@ def _pr_template(worktree: Path) -> str:
 def _clean_pipeline(p: dict) -> dict:
     """Keep only the fields a pipeline is saved with (the game sends extra drawing details)."""
     machine_keys = ("id", "type", "name", "pos", "gate", "prompt", "timeout_seconds", "auto_approve", "scrap_when",
-                    "options", "rules", "retries")
+                    "options", "rules", "retries", "model", "effort")
+    # "enabled": false only, on a machine you switched off (one whose type can be).
+    off = {"enabled": False}
     return {
         "id": p["id"], "name": p.get("name", p["id"]),
         # Saved with storages: the intake's own tick (typed specs); the rest come from its storages.
         "sources": [s for s in graph.sources_of(p) if s == "game"] if "storages" in p else graph.sources_of(p),
-        **({"storages": [{"id": str(st["id"]), "source": str(st.get("source", "")), "pos": list(st["pos"]),
+        **({"storages": [{"id": str(st["id"]), "source": str(st.get("source", "")), "pos": list(st["pos"]), **_rot(st),
                           **({"query": " ".join(str(st["query"]).split())[:1000]} if str(st.get("query") or "").strip() else {}),
-                          **({"repo": str(st["repo"]).strip()} if str(st.get("repo") or "").strip() else {})}
+                          **({"repo": str(st["repo"]).strip()} if str(st.get("repo") or "").strip() else {}),
+                          **({"account": str(st["account"]).strip()[:40]} if str(st.get("account") or "").strip() else {}),
+                          **({"listed_repos_only": True} if st.get("listed_repos_only") is True else {}),
+                          **({"include_factory_prs": True} if st.get("include_factory_prs") is True else {}),
+                          **({} if graph.storage_on(st) else {"enabled": False})}
                          for st in graph.storages_of(p) if isinstance(st.get("pos"), (list, tuple))]}
            if "storages" in p else {}),
         # Stations not placed yet are left out (the pipeline is paused until they are).
-        **{st: {"pos": list(p[st]["pos"]), **(_bin_extras(p[st]) if st == "scrap" else {})} for st in graph.STATIONS
+        **{st: {"pos": list(p[st]["pos"]), **_rot(p[st]), **(_bin_extras(p[st]) if st == "scrap" else {})} for st in graph.STATIONS
            if isinstance(p.get(st), dict) and isinstance(p[st].get("pos"), (list, tuple))},
         **({"repo": graph.repo_settings(p)} if graph.repo_settings(p) else {}),
         **({"queries": graph.queries_of(p)} if graph.queries_of(p) and "storages" not in p else {}),
         **({"check_only": True} if graph.check_only(p) else {}),
+        **({"accounts": {k: graph.account_of(p, k) for k in ("github", "jira") if graph.account_of(p, k)}}
+           if any(graph.account_of(p, k) for k in ("github", "jira")) else {}),
         **({"max_crates": graph.max_crates(p)} if graph.max_crates(p) else {}),
-        "bins": [{"id": str(b["id"]), "pos": list(b["pos"]), **_bin_extras(b)} for b in p.get("bins", [])],
-        **({"docks": [{"id": str(d["id"]), "pos": list(d["pos"])} for d in p.get("docks", [])]} if p.get("docks") else {}),
-        "machines": [{k: m[k] for k in machine_keys if k in m} for m in p.get("machines", [])],
+        "bins": [{"id": str(b["id"]), "pos": list(b["pos"]), **_rot(b), **_bin_extras(b)} for b in p.get("bins", [])],
+        **({"docks": [{"id": str(d["id"]), "pos": list(d["pos"]), **_rot(d)} for d in p.get("docks", [])]} if p.get("docks") else {}),
+        "machines": [{**{k: m[k] for k in machine_keys if k in m}, **_rot(m), **(off if m.get("enabled", True) is False else {})}
+                     for m in p.get("machines", [])],
         "belts": [{k: b[k] for k in ("from", "port", "to", "path", "manual", "join") if k in b} for b in p.get("belts", [])],
         **({"conveyors": graph.conveyors_of(p)} if graph.conveyors_of(p) else {}),
     }
 
 
 DEFAULT_JIRA_SCRAP_STATUS = "Won't Do"
+DEFAULT_MAX_RETRIES = 2  # how many times a retrying bin sends one issue back before giving up
 
 
 def bin_rules(raw: dict | None) -> dict:
     """What a scrap bin does to the issue of a crate that lands in it: close it on GitHub (as not
     planned) and move it to jira_status in Jira, unless close_issues is off (then it's handed
     back: unassigned, labelled with why, back to To Do). close_prs closes the crate's own PR
-    (never a reviewed one), keeping its branch."""
+    (never a reviewed one), keeping its branch. retry_issues (with close_issues off): hand the
+    issue back still labelled for the factory, so its intake picks it up again, up to max_retries
+    times; after that it's handed back as usual."""
     raw = raw if isinstance(raw, dict) else {}
+    try:
+        tries = max(0, min(10, int(raw.get("max_retries", DEFAULT_MAX_RETRIES))))
+    except (TypeError, ValueError):
+        tries = DEFAULT_MAX_RETRIES
     return {"close_issues": bool(raw.get("close_issues", True)),
             "close_prs": bool(raw.get("close_prs", True)),
-            "jira_status": str(raw.get("jira_status") or DEFAULT_JIRA_SCRAP_STATUS).strip()[:60]}
+            "jira_status": str(raw.get("jira_status") or DEFAULT_JIRA_SCRAP_STATUS).strip()[:60],
+            "retry_issues": bool(raw.get("retry_issues", False)),
+            "max_retries": tries}
+
+
+def _rot(raw: dict) -> dict:
+    """A machine or station's turn ("rot": quarter turns clockwise, 1-3), if it's turned."""
+    try:
+        turns = int(raw.get("rot") or 0) % 4
+    except (TypeError, ValueError):
+        turns = 0
+    return {"rot": turns} if turns else {}
 
 
 def _bin_extras(raw: dict) -> dict:
     rules = bin_rules(raw)
     return {"close_issues": rules["close_issues"], "close_prs": rules["close_prs"],
-            "jira_status": rules["jira_status"]}
+            "jira_status": rules["jira_status"], "retry_issues": rules["retry_issues"],
+            "max_retries": rules["max_retries"]}
 
 
 def _submitted_after(review: dict, since: datetime) -> bool:

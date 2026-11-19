@@ -46,20 +46,20 @@ from pathlib import Path
 from .config import BACKEND_DIR, SCRAP_KINDS, MachineConfig, github_name, missing_needs, need_words
 
 PIPELINES_FILE = BACKEND_DIR / "pipelines.json"
-SOURCES = ("game", "github", "jira", "pr_review", "prd", "github_pr")
+SOURCES = ("game", "github", "jira", "pr_review", "prd", "github_pr", "custom")
 # What a crate already has when it enters from this source (a PR to review comes with its PR).
 SOURCE_PROVIDES = {"pr_review": ("pr",), "github_pr": ("pr",)}
 # Sources that read the pipeline's own repo (its issues), so one per repo rather than one in all.
 REPO_SOURCES = ("github", "prd", "github_pr")
 SOURCE_WORDS = {"game": "typed specs", "github": "GitHub issues", "jira": "Jira issues",
-                "pr_review": "PRs to review", "prd": "PRDs", "github_pr": "open PRs"}
+                "pr_review": "PRs to review", "prd": "PRDs", "github_pr": "open PRs", "custom": "changes you describe"}
 
 
 def repo_settings(p: dict) -> dict:
     """A pipeline's repo settings, cleaned: only the keys that are set."""
     raw = p.get("repo") if isinstance(p.get("repo"), dict) else {}
     out = {}
-    for key in ("github", "path", "base_branch"):
+    for key in ("github", "path", "base_branch", "branch_pattern"):
         value = str(raw.get(key, "") or "").strip()
         if value:
             out[key] = value
@@ -73,23 +73,45 @@ def validate_repo(raw: dict) -> str | None:
     branch = raw.get("base_branch", "")
     if branch and (any(c in branch for c in " ~^:?*[\\") or branch.startswith("-") or ".." in branch):
         return f"{branch!r} isn't a branch name"
-    return None
+    from .branch_names import validate as validate_pattern  # a line's own branch naming pattern
+    error = validate_pattern(raw.get("branch_pattern", ""))
+    return f"branch naming: {error}" if error else None
+
+
+def missing_repo(p: dict) -> bool:
+    """A line that works on its own repo but hasn't picked one. There's no default repo: it's
+    paused until you pick one. A line whose crates all bring their repo with them (PRs to
+    review, storages with a repo of their own) needs none."""
+    if repo_key(p):
+        return False
+    if "storages" not in p:
+        return any(s != "pr_review" for s in sources_of(p))
+    if "game" in sources_of(p):
+        return True
+    for st in fed_storages(p):
+        source = st.get("source")
+        if source == "pr_review" or lists_repos(st) or (source in WORK_REPO_SOURCES and github_name(str(st.get("repo") or ""))):
+            continue
+        return True
+    return False
 
 
 def repo_key(p: dict) -> str:
-    """Which repo a pipeline is on, for telling pipelines apart ("" is the default repo)."""
+    """Which repo a pipeline is on, for telling pipelines apart ("" is none picked)."""
     raw = repo_settings(p)
     return (github_name(raw.get("github", "")) or raw.get("path", "")).lower()
 STATIONS = ("intake", "dock", "scrap")
 RESERVED_PREFIXES = ("belt_", "return_", "rework_in_", "scrap_", "store_")
-# Storages: "storages": [{"id": "store_1", "source": "jira", "query": "...", "pos": [x, y]}, ...],
+# Storages: "storages": [{"id": "store_1", "source": "jira", "query": "...", "pos": [x, y]}, ...]
+# ("enabled": false on one switched off),
 # each with one belt from its "out" port into its own pipeline's intake. A storage watches one
 # source (with its own search) and its intake takes crates from it. Ids are unique in the factory.
 STORE_ID = re.compile(r"^store_\d+$")
-STORE_SOURCES = ("github", "jira", "github_pr", "pr_review", "prd")
+# "custom": changes you describe in the storage's window in the game (typed specs, from that storage).
+STORE_SOURCES = ("github", "jira", "github_pr", "pr_review", "prd", "custom")
 # Storages whose own repo ("repo") is where their crates are worked on: the GitHub ones read
 # from it too; a Jira storage's crates are coded in it.
-WORK_REPO_SOURCES = ("github", "prd", "github_pr", "jira")
+WORK_REPO_SOURCES = ("github", "prd", "github_pr", "jira", "custom")
 
 
 def storages_of(p: dict) -> list[dict]:
@@ -121,16 +143,27 @@ def source_keys(p: dict) -> list[tuple[str, str]]:
     out = [("game", "game")] if "game" in sources_of(p) else []
     for st in fed_storages(p):
         source = str(st.get("source", ""))
+        if source == "custom":  # what you type goes to the storage you type it into: never shared
+            out.append((source, f"custom#{st.get('id', '')}"))
+            continue
         repo = (github_name(str(st.get("repo") or "")) or repo_key(p)) if source in REPO_SOURCES else ""
+        if lists_repos(st):
+            repo = "*factory-repos*"
         out.append((source, key(source, repo, str(st.get("query") or "") if source in QUERY_SOURCES else "")))
     return out
 
 
-def fed_storages(p: dict) -> list[dict]:
-    """The storages whose belt runs into this pipeline's intake."""
+def storage_on(st: dict) -> bool:
+    """Whether a storage is switched on. One switched off ("enabled": false) stays on the floor,
+    belted in, but isn't checked and brings nothing in, as if it weren't belted into the intake."""
+    return st.get("enabled", True) is not False
+
+
+def fed_storages(p: dict, with_off: bool = False) -> list[dict]:
+    """The storages whose belt runs into this pipeline's intake (switched-off ones too, with_off)."""
     into = {str(b.get("from", "")) for b in p.get("belts", [])
             if isinstance(b, dict) and b.get("port") == "out" and str(b.get("to", "")) in ("intake", f"{p.get('id')}:intake")}
-    return [s for s in storages_of(p) if str(s.get("id", "")) in into]
+    return [s for s in storages_of(p) if str(s.get("id", "")) in into and (with_off or storage_on(s))]
 # Extra scrap bins you place in build mode: "bins": [{"id": "scrap_2", "pos": [x, y]}, ...].
 # Red belts can run into any of a pipeline's bins ("scrap" or one of these).
 BIN_ID = re.compile(r"^scrap_\d+$")
@@ -172,6 +205,24 @@ def queries_of(p: dict) -> dict[str, str]:
     return {k: " ".join(str(raw.get(k) or "").split())[:1000] for k in QUERY_SOURCES if str(raw.get(k) or "").strip()}
 
 
+def listed_repos_only(p: dict, source: str = "pr_review") -> bool:
+    """A storage's "Only repos in the factory's repo list" tick: the storage of this source
+    belted into p's intake only brings in PRs from the repos added under the gear (Repos)."""
+    return any(st.get("source") == source and bool(st.get("listed_repos_only")) for st in fed_storages(p))
+
+
+def lists_repos(st: dict) -> bool:
+    """An Open PRs storage with "Only repos in the factory's repo list" ticked: it reads every repo
+    added under the gear (Repos) instead of its one repo, and needs no repo of its own."""
+    return st.get("source") == "github_pr" and bool(st.get("listed_repos_only"))
+
+
+def includes_factory_prs(st: dict) -> bool:
+    """An Open PRs storage's "Include the factory's own PRs" tick. Off (the default), PRs the
+    factory opened for crates still on a line are left out, so a crate's PR isn't taken twice."""
+    return st.get("source") == "github_pr" and bool(st.get("include_factory_prs"))
+
+
 def max_crates(p: dict) -> int:
     """At most this many crates on the line at once (0: no limit). More wait at the intake, and
     its storages bring nothing new in while it's full."""
@@ -179,6 +230,13 @@ def max_crates(p: dict) -> int:
         return max(0, int(p.get("max_crates") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def account_of(p: dict, service: str) -> str:
+    """The account a line's machines (and storages without their own pick) work as on this
+    service ("github" or "jira"): an account id, "@machine", or "" for the factory's default."""
+    raw = p.get("accounts") if isinstance(p.get("accounts"), dict) else {}
+    return str(raw.get(service) or "").strip()[:40]
 
 
 def check_only(p: dict) -> bool:
@@ -202,15 +260,24 @@ def sources_of(p: dict) -> list[str]:
 RENAMED_TYPES = {
     "pr_checks": ("ci", {}),  # CI check and CI monitor are one CI machine now
     "pr_reviewer": ("reviewer", {"fail_on_changes": False, "comment_on_pr": False}),
-    "pr_poster": ("doc_writer", {}),  # the Review poster and Issue maker are one Document writer
-    "issue_maker": ("doc_writer", {}),
+    "pr_poster": ("doc_writer", {"doc_kind": "review"}),  # the Review poster and Issue maker are one
+    "issue_maker": ("doc_writer", {"doc_kind": "issues"}),  # Document writer, set to what they made
 }
 REVIEW_LINE_OPTIONS = RENAMED_TYPES["pr_reviewer"][1]
 
 
-FILE_VERSION = 5  # 2: scrapping needs a fail belt to the scrap bin; 3: the Approver waits, not the Reviewer;
+FILE_VERSION = 6  # 2: scrapping needs a fail belt to the scrap bin; 3: the Approver waits, not the Reviewer;
 # 4: a Document writer writes the PR's title and description, not the Packager; 5: issues and PRs
-# come from storages belted into the intake, not from its ticks
+# come from storages belted into the intake, not from its ticks; 6: no default repo, so lines
+# that named none (and so worked on factory.toml's test project) name it (engine.load_pipelines)
+
+
+def saved_version(path: Path = PIPELINES_FILE) -> int:
+    """The version pipelines.json was saved as (FILE_VERSION when it's missing or unreadable)."""
+    try:
+        return int(json.loads(path.read_text(encoding="utf-8")).get("version", 1) or 1)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return FILE_VERSION
 
 
 def read(path: Path = PIPELINES_FILE) -> list[dict] | None:
@@ -283,6 +350,9 @@ def conveyors_of(p: dict) -> list[dict]:
             item["loop"] = True
         if conv.get("join") and not item.get("loop"):
             item["join"] = True  # runs into another conveyor's side
+        for flag in ("feeds", "onto_link"):  # runs into a link's start / side: laid after links
+            if conv.get(flag) and not item.get("loop"):
+                item[flag] = True
         out.append(item)
     return out
 
@@ -349,7 +419,8 @@ def add_pr_writers(pipelines: list[dict]) -> None:
             ids.add(wid)
             pos = _free_spot(_pos(m.get("pos")), taken)
             taken.update(_footprint(pos))
-            p["machines"].append({"id": wid, "type": "doc_writer", "name": "PR writer", "pos": list(pos)})
+            p["machines"].append({"id": wid, "type": "doc_writer", "name": "PR writer", "pos": list(pos),
+                                 "options": {"doc_kind": "pr"}})
             for q in pipelines:  # belts from any line can run into it
                 for b in q.get("belts", []) if isinstance(q, dict) else []:
                     if isinstance(b, dict) and b.get("to") == mid and b.get("port") != "fail":
@@ -478,7 +549,7 @@ def review_line(catalog: dict) -> dict | None:
                {"type": "reviewer", "id": "pr_reviewer", "name": "PR reviewer", "options": dict(REVIEW_LINE_OPTIONS)},
                *([{"type": "approver", "id": "pr_approver", "name": "Approve review",
                    "options": {"github_review": False}}] if "approver" in catalog else []),
-               {"type": "doc_writer", "id": "pr_poster"}]
+               {"type": "doc_writer", "id": "pr_poster", "options": {"doc_kind": "review"}}]
     return from_line(entries, "review", "Review line", "pr_review", row=ROW + 8)
 
 
@@ -494,7 +565,8 @@ def plan_line(catalog: dict, pipelines: list[dict]) -> dict | None:
             pos = place.get("pos") if isinstance(place, dict) else None
             if isinstance(pos, (list, tuple)) and len(pos) == 2:
                 rows.append(int(pos[1]))
-    return from_line([{"type": k} for k in kinds], "plan", "Planning line", "prd", row=max(rows) + 6)
+    entries = [{"type": "planner"}, {"type": "doc_writer", "options": {"doc_kind": "issues"}}]
+    return from_line(entries, "plan", "Planning line", "prd", row=max(rows) + 6)
 
 
 def is_station(node: str) -> bool:
@@ -579,7 +651,7 @@ SORTER = "sorter"  # the machine type that sends each crate out of one of its ou
 SORTER_PORTS = tuple(f"out_{i}" for i in range(1, 7))  # out_1/2 north, out_3/4 east, out_5/6 south
 # A sorter rule: {"port": "out_1", "when": <kind>, "value": "..."}. The first rule (in port
 # order) that matches a crate picks its output.
-RULE_KINDS = ("risk", "source", "text", "files", "size", "otherwise")
+RULE_KINDS = ("risk", "source", "repo", "result", "text", "files", "size", "otherwise")
 RULE_NEEDS = {"risk": "risk", "files": "worktree", "size": "worktree"}
 RULE_WORDS = {"risk": "risk", "files": "the files it changes", "size": "the size of its change"}
 
@@ -701,7 +773,7 @@ def to_line(pipeline: dict, pipelines: list[dict] | None = None, route: dict[str
         entry = {"type": m["type"], "id": m["id"], "on_fail": "" if to_bin else fail_to,
                  "scrap_bin": to_bin, "scrap_to": fail_to if to_bin else ""}
         for key in ("name", "gate", "prompt", "timeout_seconds", "auto_approve", "scrap_when", "options", "rules",
-                    "retries"):
+                    "retries", "model", "effort", "enabled"):
             if m.get(key) not in (None, ""):
                 entry[key] = m[key]
         if is_sorter(m):  # only the outputs that have a belt can be chosen
@@ -728,11 +800,40 @@ def rules_problem(rules) -> str | None:
             return f"the rule on output {r['port'][-1]} is too long"
         if r["when"] == "risk" and value.rstrip("+") not in ("low", "medium", "high"):
             return f"the rule on output {r['port'][-1]} needs a risk (low, medium or high)"
+        if r["when"] == "result" and value.partition(":")[0].strip() not in ("pass", "fail"):
+            return f"the rule on output {r['port'][-1]} needs passed or failed"
         if r["when"] == "size" and not value.strip().isdigit():
             return f"the rule on output {r['port'][-1]} needs a number of changed lines"
-        if r["when"] in ("source", "text", "files") and not value.strip():
+        if r["when"] in ("source", "repo", "text", "files") and not value.strip():
             return f"the rule on output {r['port'][-1]} needs something to match"
     return None
+
+
+def switched_off(m: dict, base: MachineConfig) -> bool:
+    """A machine you switched off in the game ("enabled": false, on a type that can be): it runs
+    nothing, and crates go straight out of its green port."""
+    return base.can_switch_off and m.get("enabled", True) is False
+
+
+def coder_mode(m: dict, base: MachineConfig) -> str:
+    options = m.get("options") if isinstance(m.get("options"), dict) else {}
+    return str(options.get("coder_mode") or base.options.get("coder_mode") or "implement")
+
+
+def _test_writer_problem(catalog: dict[str, MachineConfig], m: dict, name: str, out: dict,
+                         everywhere: dict[str, dict], label) -> str | None:
+    """A Coder in Test writer only mode hands its tests straight to a Tester: its green belt
+    must run into one (switched on)."""
+    if m.get("type") != "coder" or coder_mode(m, catalog["coder"]) != "test_only":
+        return None
+    nxt = everywhere.get(out.get((str(m.get("id", "")), "pass"), ""))
+    if nxt is not None and nxt.get("type") == "tester":
+        if switched_off(nxt, catalog["tester"]):
+            return (f"{name} is set to Test writer only, but the {label(str(nxt['id']))} its belt runs into is "
+                    "switched off: switch it on, or set the Coder to another mode")
+        return None
+    return (f"{name} is set to Test writer only, so its green belt must run straight into a Tester "
+            "(nothing in between), to run the tests it writes")
 
 
 def validate(catalog: dict[str, MachineConfig], pipelines: list) -> str | None:
@@ -807,6 +908,16 @@ def check(catalog: dict[str, MachineConfig], pipelines: list) -> tuple[str | Non
                 mine[key] = pname
             if error is None:
                 seen_sources.update(mine)  # only a pipeline that runs claims its sources
+        if error is None and missing_repo(p):
+            repoless = [SOURCE_WORDS.get(str(st.get("source")), str(st.get("source"))) for st in fed_storages(p)
+                        if st.get("source") in WORK_REPO_SOURCES and not github_name(str(st.get("repo") or ""))
+                        and not lists_repos(st)]
+            if repoless and "game" not in sources_of(p):
+                error = (f"{pname}: the {' and '.join(repoless)} storage{'s have' if len(repoless) > 1 else ' has'} "
+                         "no repo: click it and pick its GitHub repo, or pick a repo for the whole line "
+                         "(build mode: its intake's settings)")
+            else:
+                error = f"{pname}: pick a repo for this line (build mode: its intake's settings)"
         if error:
             problems[pid] = error
     return None, problems
@@ -938,6 +1049,10 @@ def _validate_pipeline(catalog: dict[str, MachineConfig], p: dict, pname: str,
     missing = [names[mid] for mid in names if mid not in visited]
     if missing:
         return f"{pname}: {', '.join(missing)} isn't on the path from the intake to the dock"
+    for mid in names:
+        error = _test_writer_problem(catalog, everywhere[mid], names[mid], out, everywhere, label)
+        if error:
+            return f"{pname}: {error}"
     for way in routes:
         error = _check_path(catalog, p, pname, way["order"], everywhere, out, label, way["route"])
         if error:
@@ -950,7 +1065,14 @@ def _check_path(catalog: dict[str, MachineConfig], p: dict, pname: str, order: l
     """Machine rules along one way through: needs/provides and unique types. A crate arrives
     with what every one of the intake's sources gives it; a machine it left by its red belt
     gave it nothing."""
-    provided = [set(SOURCE_PROVIDES.get(s, ())) for s in sources_of(p)]
+    sources = sources_of(p)
+    if sources:
+        # A sorter's rules may keep some sources off this way (an output "from Open PRs" only
+        # gets open PRs): check it only with the sources that can come down it.
+        sources = reaching_sources(sources, order, everywhere, out, route)
+        if not sources:
+            return None  # no crate from this intake can go this way
+    provided = [set(SOURCE_PROVIDES.get(s, ())) for s in sources]
     have: set[str] = set.intersection(*provided) if provided else set()
     seen_types: set[str] = set()
     names = {mid: label(mid) for mid in order}
@@ -960,13 +1082,15 @@ def _check_path(catalog: dict[str, MachineConfig], p: dict, pname: str, order: l
         if base.unique and m["type"] in seen_types:
             return f"{pname}: there can only be one {base.name}"
         seen_types.add(m["type"])
+        if switched_off(m, base):
+            continue  # runs nothing: needs nothing and gives the crate nothing
         missing = missing_needs(base.needs, have)
         if missing:
             # Some of the intake's sources may bring it (PRs to review come with their PR) and
             # others not: say which to take away.
-            without = [SOURCE_WORDS.get(s, s) for s in sources_of(p)
+            without = [SOURCE_WORDS.get(s, s) for s in sources
                        if missing_needs(base.needs, set(SOURCE_PROVIDES.get(s, ())) | have)]
-            if provided and len(without) < len(sources_of(p)):
+            if provided and len(without) < len(sources):
                 return (f"{pname}: {names[mid]} needs {', '.join(need_words(n) for n in missing)} before it, "
                         f"and {' and '.join(without)} don't come with that: "
                         + ("remove their storage from the intake" if "storages" in p else "untick them in the intake's settings"))
@@ -991,6 +1115,66 @@ def _check_path(catalog: dict[str, MachineConfig], p: dict, pname: str, order: l
         if (route or {}).get(mid) != FAIL:
             have.update(base.provides)
     return None
+
+
+def _words(value) -> list[str]:
+    return [w.strip() for w in re.split(r"[,\n]", str(value or "")) if w.strip()]
+
+
+def _rule_verdict(rule: dict, source: str, arrived: tuple[str, str, str, str]) -> bool | None:
+    """Whether a sorter rule takes every crate from this source (True), none of them (False),
+    or it depends on the crate (None): what the layout alone can tell."""
+    kind, value = rule.get("when"), rule.get("value", "")
+    if kind == "otherwise":
+        return True
+    if kind == "source":
+        return (source or "game") in _words(value)
+    if kind == "result":  # same as the engine's "Arrived as" rule
+        result, mid, name, mtype = arrived
+        want, _, at = str(value or "").partition(":")
+        if result != want.strip():
+            return False
+        names = [w.lower() for w in _words(at)]
+        return not names or any(w in (mid.lower(), name.lower(), mtype.lower()) for w in names)
+    return None  # risk, repo, text, files, size: depends on the crate
+
+
+def reaching_sources(sources: list[str], order: list[str], everywhere: dict[str, dict], out: dict,
+                     route: dict[str, str] | None) -> list[str]:
+    """The intake's sources whose crates can take this way through: at each sorter on it, the
+    rules in output order (as the engine tries them) must be able to send that source's crates
+    out of the output the way takes."""
+    route = route or {}
+    left = list(sources)
+    for i, mid in enumerate(order):
+        m = everywhere[mid]
+        port = route.get(mid)
+        if m.get("type") != SORTER or port not in SORTER_PORTS:
+            continue
+        # How crates arrive: from the last machine that worked on them (not a sorter or merger).
+        arrived = ("pass", "", "", "")
+        for prev in reversed(order[:i]):
+            pm = everywhere[prev]
+            if is_sorter(pm) or pm.get("type") == "merger":
+                continue
+            arrived = ("fail" if route.get(prev) == FAIL else "pass", str(prev),
+                       str(pm.get("name") or ""), str(pm.get("type") or ""))
+            break
+        rules = sorted((r for r in m.get("rules", []) or [] if isinstance(r, dict) and (mid, r.get("port")) in out),
+                       key=lambda r: str(r.get("port")))
+        keep = []
+        for source in left:
+            for rule in rules:
+                verdict = _rule_verdict(rule, source, arrived)
+                if verdict is False:
+                    continue
+                if rule.get("port") == port:
+                    keep.append(source)  # it does (or may) go this way
+                    break
+                if verdict:
+                    break  # it surely goes out of an earlier output
+        left = keep
+    return left
 
 
 def _outputs(pipeline: dict) -> dict[tuple[str, str], str]:

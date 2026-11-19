@@ -5,6 +5,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from .conftest import item, simple_layout
+from .test_factory import always_test
 
 FAKE_COST = 0.01  # what tests/fakes/fake_claude.py says each Claude call cost
 
@@ -109,7 +110,8 @@ def test_alerts_go_to_a_webhook(make_factory):
     server = HTTPServer(("127.0.0.1", 0), _Hook)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}/hook"
-    factory = make_factory(f'\n[alerts]\nwebhook = "{url}"\non = ["held", "shipped"]\n')
+    factory = make_factory(f'\n[alerts]\nwebhook = "{url}"\non = ["held", "shipped"]\n',
+                           layout=[always_test(simple_layout())])
     factory.flag("fail_tests")
     factory.start()
 

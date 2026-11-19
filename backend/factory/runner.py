@@ -81,12 +81,20 @@ async def run(
     on_line: Callable[[str], Awaitable[None]],
     stdin_text: str | None = None,
     timeout: float | None = None,
+    env: dict[str, str | None] | None = None,
 ) -> int:
-    """Run argv in cwd, awaiting on_line for each output line. Returns the exit code."""
+    """Run argv in cwd, awaiting on_line for each output line. Returns the exit code. env: changes
+    to this process's environment for it (None unsets a variable), e.g. which account it runs as."""
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     # PYTHONUTF8: our scripts read and write UTF-8 (Windows would otherwise use cp1252).
+    changes = env or {}
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
+    for key, value in changes.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
 
     def emit(kind: str, value) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, (kind, value))

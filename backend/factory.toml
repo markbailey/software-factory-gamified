@@ -7,10 +7,11 @@ port = 8765
 [workspace]
 # Everything the machines touch lives under this folder (relative to this file).
 path = "../workspace"
-# The default repo: the throwaway test project, a clone of `remote`, created on first start
-# if missing. Each pipeline can work on its own repo instead: set it in the game (build mode,
-# the pipeline's intake, Settings). Those are cloned into <workspace>/repos/<owner>/<name>
-# unless you give a folder that's already a clone.
+# There's no default repo: each line picks its own in the game (build mode, the line's intake,
+# Settings), and a line with none is paused until you pick one. Repos are cloned into
+# <workspace>/repos/<owner>/<name> unless you give a folder that's already a clone.
+# `remote` below is the one exception: lines that pick that GitHub repo use its clone in
+# <workspace>/<repo> (where the test project has always been kept, so its crates carry on).
 repo = "test-project"
 remote = "https://github.com/markbailey/test-project.git"
 # Each crate gets its own git worktree and branch here, so crates never clash.
@@ -47,16 +48,16 @@ timeout_seconds = 90
 # ---------------------------------------------------------------------------
 [intake.github]
 # Open issues with this label become crates. Each pipeline that takes GitHub issues watches
-# its own repo; `repo` here is the default repo's (it's read from `remote` if left out). The PR says "Closes #n", and the
-# factory comments on the issue when the PR opens or the crate is scrapped.
+# its own repo (or its storage's). The PR says "Closes #n", and the factory comments on the
+# issue when the PR opens or the crate is scrapped.
 enabled = true
-repo = "markbailey/test-project"
 label = "factory"
 poll_seconds = 60
 
 [intake.jira]
-# Jira Cloud. Put an API token in the JIRA_API_TOKEN environment variable
-# (https://id.atlassian.com/manage-profile/security/api-tokens).
+# Jira Cloud. Set the factory's Jira account in the game (Accounts, the gear in the top bar):
+# that site, email and token (kept in the gitignored accounts.toml) win over base_url, email and
+# the JIRA_API_TOKEN variable here. A Jira storage in build mode needs no enabled = true.
 enabled = false
 base_url = "https://your-site.atlassian.net"
 email = "you@example.com"

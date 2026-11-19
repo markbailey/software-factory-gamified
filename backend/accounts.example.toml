@@ -1,0 +1,20 @@
+# The Software Factory's own accounts. Easiest set in the game (Accounts: the gear in the top
+# bar); or copy this to accounts.toml (which git ignores) and restart the backend.
+
+[defaults]
+github = "factory-bot"   # the account each service uses unless a line or storage picks another;
+jira = "acme"            # "" or "@machine" for this machine's own sign-in
+
+[[github]]
+id = "factory-bot"
+name = "Factory bot"
+token = ""       # a token of that GitHub account (fine-grained: Contents, Issues, Pull requests: read and write)
+git_name = ""    # optional: who its commits are by
+git_email = ""
+
+[[jira]]
+id = "acme"
+name = "Acme Jira bot"
+base_url = ""    # e.g. https://your-site.atlassian.net
+email = ""       # the Atlassian account's email
+token = ""       # its API token (id.atlassian.com > Security > API tokens)

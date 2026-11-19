@@ -51,7 +51,7 @@ def simple_layout(machines=LINE_MACHINES, pid="build", name="Build", row=0) -> d
     ms = [{"id": m, "type": m, "pos": [3 + 3 * k, row]} for k, m in enumerate(machines)]
     order = ["intake", *machines, "dock"]
     belts = [{"from": a, "port": "out" if a == "intake" else "pass", "to": b} for a, b in zip(order, order[1:])]
-    return {"id": pid, "name": name, "sources": ["game"], "storages": [],
+    return {"id": pid, "name": name, "sources": ["game"], "storages": [], "repo": {"path": "test-project"},
             "intake": {"pos": [0, row]}, "dock": {"pos": [3 + 3 * len(machines), row]},
             "scrap": {"pos": [3 + 3 * len(machines), row + 3]}, "machines": ms, "belts": belts}
 
@@ -83,6 +83,13 @@ class Factory:
         seed.mkdir()
         _git(seed, "init", "-q", "-b", "main")
         (seed / "README.md").write_text("# Test project\n", encoding="utf-8")
+        # The project's test, which the Tester runs: it fails while fail_tests is flagged. It is
+        # here from the start because a Coder in Implement mode may not write tests.
+        (seed / "tests").mkdir()
+        (seed / "tests" / "test_work.py").write_text(
+            "import os, unittest\n\nclass T(unittest.TestCase):\n    def test_flag(self):\n"
+            f"        self.assertFalse(os.path.exists({(self.state / 'fail_tests').as_posix()!r}))\n",
+            encoding="utf-8")
         _git(seed, "add", "-A")
         _git(seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
         _git(self.root, "clone", "-q", "--bare", str(seed), str(remote))

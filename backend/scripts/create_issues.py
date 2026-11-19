@@ -8,6 +8,8 @@ depend on ship (it reads the record this writes under --plans).
 
 Safe to run again: what it already created is recorded in <plans>/crate-<id>.json and not
 created twice. When the crate came from a PRD issue, it comments there with the plan's link.
+A plan of a single issue (e.g. one the Document writer wrote from a crate's description) is
+just that issue, with no tracking issue.
 """
 import argparse
 import json
@@ -63,6 +65,7 @@ plans.mkdir(parents=True, exist_ok=True)
 record_path = plans / f"crate-{args.crate}.json"
 record = json.loads(record_path.read_text(encoding="utf-8")) if record_path.exists() else {}
 record.update({"repo": args.repo, "label": args.label, "crate": int(args.crate),
+               **({"prd": args.source_ref} if args.source == "prd" and args.source_ref else {}),
                "title": str(plan.get("title") or "Plan").strip()[:100]})
 tasks = record.setdefault("tasks", {})
 
@@ -76,7 +79,9 @@ for label, color in ((args.label, "0E8A16"), (PLAN_LABEL, "5319E7")):
                    capture_output=True, text=True)
 
 prd = f"#{args.source_ref}" if args.source == "prd" and args.source_ref else ""
-if not record.get("tracking"):
+# One issue needs no tracking issue to list it (a record from before keeps the one it has).
+single = len(plan["issues"]) == 1 and not record.get("tracking")
+if not single and not record.get("tracking"):
     body = (f"Planned by the Software Factory{' from ' + prd if prd else ''}. The tasks are listed "
             f"below once they're created.\n\n{markdown}\n")
     url = run("issue", "create", "--repo", args.repo, "--title", f"Plan: {record['title']}",
@@ -85,7 +90,7 @@ if not record.get("tracking"):
     record["tracking_url"] = url
     save()
     print(f"Tracking issue: {url}", flush=True)
-tracking = record["tracking"]
+tracking = record.get("tracking")
 
 # Create in dependency order, so the issues each one waits for already have numbers.
 issues = plan["issues"]
@@ -102,9 +107,12 @@ for issue in order:
     if key in tasks:
         continue
     deps = [tasks[d]["number"] for d in issue["depends_on"]]
-    body = str(issue.get("body", "")).strip() + f"\n\nPart of #{tracking}."
-    if deps:
-        body += " Waits for " + ", ".join(f"#{n}" for n in deps) + " to ship first."
+    body = str(issue.get("body", "")).strip()
+    if tracking:
+        # Says where it sits in the plan, so a task isn't mistaken for the whole plan again.
+        body += f"\n\nTask {issues.index(issue) + 1} of {len(issues)} in the plan #{tracking}."
+        body += (" Waits for " + ", ".join(f"#{n}" for n in deps) + " to ship first." if deps
+                 else " Ready now: nothing it waits for.")
     ready = not deps
     cmd = ["issue", "create", "--repo", args.repo, "--title", str(issue["title"]).strip()[:200],
            "--body-file", "-"]
@@ -116,6 +124,17 @@ for issue in order:
     save()
     print(f"{key}  #{tasks[key]['number']}  {issue['title']}" + ("  (ready)" if ready else
           f"  (waits for {', '.join('#' + str(n) for n in deps)})"), flush=True)
+
+if single:
+    t = tasks[plan["issues"][0]["key"]]
+    if prd and not record.get("commented"):
+        run("issue", "comment", args.source_ref, "--repo", args.repo, "--body-file", "-",
+            stdin=f"The Software Factory wrote this up as #{t['number']}"
+                  + (f", labelled `{args.label}` for the build line.\n" if t["labelled"] else ".\n"))
+        record["commented"] = True
+        save()
+    print(f"Created the issue {t['url']}" + (" (ready)." if t["labelled"] else "."), flush=True)
+    sys.exit(0)
 
 # The tracking issue lists the tasks; GitHub ticks each one as its issue closes.
 lines = []

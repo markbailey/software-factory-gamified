@@ -100,6 +100,11 @@ class MachineConfig:
     # "low" or "medium". Empty means always ask you. Only types with can_auto_approve.
     auto_approve: str = ""
     can_auto_approve: bool = False
+    # A type the game lets you switch off (can_switch_off in machines.toml). Switched off (a
+    # pipeline machine saved with "enabled": false), it runs nothing: crates go straight out of
+    # its green port.
+    can_switch_off: bool = False
+    switched_off: bool = False
     # Scrapping: a machine only drops a crate in the scrap bin when its fail belt runs to the
     # bin (scrap_bin) and the reason is one of scrap_when (triage kinds). Any other crate it
     # can't send back is held at the machine until you run it again or scrap it.
@@ -118,6 +123,15 @@ class MachineConfig:
     # kind = "splitter": a sorter with no rules that sends crates out of its outputs in turn.
     # kind = "merger": runs no steps; crates from every belt into it carry straight on out.
     kind: str = ""
+    # The prompt is only used while this holds (a show_when, e.g. "doc_kind=auto|pr"); the
+    # rest of the time the game hides it and shows prompt_note (prompt_notes[value] first).
+    prompt_label: str = ""
+    prompt_when: str = ""
+    prompt_notes: dict[str, str] = field(default_factory=dict)
+    # The Claude model and effort level its claude steps use, picked in the game (agents.py).
+    # "" follows the factory-wide default under the gear.
+    model: str = ""
+    effort: str = ""
 
     def summary(self) -> dict:
         """What the game needs to know about this machine."""
@@ -129,9 +143,12 @@ class MachineConfig:
                 "on_fail": self.on_fail, "uses_agent": self.uses_agent(), "parallel": self.parallel,
                 "rework_here": self.rework_here,
                 "auto_approve": self.auto_approve, "can_auto_approve": self.can_auto_approve,
+                "can_switch_off": self.can_switch_off, "switched_off": self.switched_off,
                 "scrap_bin": self.scrap_bin, "scrap_when": self.scrap_when,
                 "option_specs": self.option_specs, "options": self.options,
-                "sorter": self.sorter, "rules": self.rules, "kind": self.kind}
+                "sorter": self.sorter, "rules": self.rules, "kind": self.kind,
+                "prompt_label": self.prompt_label, "prompt_when": self.prompt_when,
+                "prompt_notes": self.prompt_notes, "model": self.model, "effort": self.effort}
 
     def uses_agent(self) -> bool:
         """True if one of its steps runs Claude (so it pauses while Claude is unavailable)."""
@@ -198,11 +215,12 @@ class RepoConfig:
     path: Path  # the local clone
     base_branch: str  # "" until it's found: the repo's default branch
     remote: str  # its clone URL ("" for none)
-    is_default: bool = False  # the one in factory.toml's [workspace]
+    is_default: bool = False  # the one in factory.toml's [workspace] (a clone kept there, not a default)
+    unset: bool = False  # a line that hasn't picked a repo: nothing is cloned or worked on for it
 
     def summary(self) -> dict:
-        return {"github": self.github, "path": str(self.path), "base_branch": self.base_branch or "",
-                "default": self.is_default}
+        return {"github": self.github, "path": "" if self.unset else str(self.path),
+                "base_branch": self.base_branch or "", "default": self.is_default, "unset": self.unset}
 
 
 @dataclass
@@ -228,7 +246,8 @@ class Config:
     scripts_dir: Path
     # PRDs for the Planning line: GitHub issues in the same repo with this label ([intake.prd]).
     prd: GitHubIntakeConfig | None = None
-    # The repo in [workspace]: lines that don't name their own repo work on it.
+    # The repo in [workspace]: where that GitHub repo's clone is kept, for lines that pick it. It
+    # isn't a default: a line that names no repo is paused until you pick one.
     default_repo: RepoConfig | None = None
     # [budget]: what Claude may cost (as Claude Code reports it), 0 for no limit. A crate over
     # crate_usd is held before its next Claude machine; once the day's total reaches daily_usd,
@@ -241,15 +260,18 @@ class Config:
 
 def resolve_repo(cfg: Config, raw) -> RepoConfig:
     """The repo a pipeline's "repo" settings name: {"github": "owner/name", "path": "folder",
-    "base_branch": "main"}, each optional. Nothing set means the default repo. A GitHub repo
-    with no folder is cloned into workspace/repos/<owner>/<name>; a relative folder is under the
-    workspace."""
+    "base_branch": "main"}, each optional. Nothing set means no repo (unset: the line is paused
+    until you pick one). A GitHub repo with no folder is cloned into workspace/repos/<owner>/<name>
+    (factory.toml's [workspace] repo keeps its clone where [workspace] says); a relative folder is
+    under the workspace."""
     raw = raw if isinstance(raw, dict) else {}
     default = cfg.default_repo
     github = github_name(raw.get("github", ""))
     path_text = str(raw.get("path", "") or "").strip()
     base = str(raw.get("base_branch", "") or "").strip()
-    if not path_text and (not github or github.lower() == default.github.lower()):
+    if not path_text and not github:
+        return RepoConfig(github="", path=cfg.workspace / "no-repo", base_branch=base, remote="", unset=True)
+    if not path_text and default.github and github.lower() == default.github.lower():
         return dataclasses.replace(default, base_branch=base or default.base_branch)
     if path_text:
         path = Path(path_text).expanduser()
@@ -298,17 +320,29 @@ def _machine(raw: dict) -> MachineConfig:
         unique=bool(raw.get("unique", False)),
         on_fail=str(raw.get("on_fail", "")),
         can_auto_approve=bool(raw.get("can_auto_approve", False)),
+        can_switch_off=bool(raw.get("can_switch_off", False)),
         auto_approve=_risk_level(raw.get("auto_approve", "")),
         option_specs=[_option_spec(o) for o in raw.get("options", [])],
         options={s["id"]: s["default"] for s in (_option_spec(o) for o in raw.get("options", []))},
         sorter=str(raw.get("kind", "")) in ("sorter", "splitter"),
         kind=str(raw.get("kind", "")),
+        prompt_label=str(raw.get("prompt_label", "")),
+        prompt_when=str(raw.get("prompt_when", "")),
+        prompt_notes={str(k): str(v) for k, v in (raw.get("prompt_notes") or {}).items()},
     )
 
 
 def _option_spec(raw: dict) -> dict:
     """A tick box (default: on or off); with type = "text" a line of text (default: ""); with
-    type = "choice" one of `choices` ([{value, label}], default: the first)."""
+    type = "choice" one of `choices` ([{value, label}], default: the first). With show_when =
+    "<choice id>=<value>[|<value>...]" the game only shows it while that choice has one of them."""
+    spec = _option_spec_base(raw)
+    if raw.get("show_when"):
+        spec["show_when"] = str(raw["show_when"])
+    return spec
+
+
+def _option_spec_base(raw: dict) -> dict:
     if str(raw.get("type", "")) == "choice":
         choices = [{"value": str(c["value"]), "label": str(c.get("label", c["value"]))} for c in raw.get("choices", [])]
         values = [c["value"] for c in choices]
@@ -397,11 +431,15 @@ def build_line(catalog: dict[str, MachineConfig], entries: list[dict]) -> list[M
             m.auto_approve = _risk_level(entry["auto_approve"])
         if not (m.can_auto_approve and m.gate):
             m.auto_approve = ""
+        m.switched_off = m.can_switch_off and entry.get("enabled", True) is False
         m.scrap_bin = bool(entry.get("scrap_bin", False))
         m.scrap_to = str(entry.get("scrap_to") or "scrap")
         if isinstance(entry.get("options"), dict):
             choices = {s["id"]: [c["value"] for c in s["choices"]] for s in m.option_specs if s.get("type") == "choice"}
             for key, value in entry["options"].items():
+                if key == "review_type":  # a Reviewer saved with a type since merged into another
+                    from .review_types import ALIASES
+                    value = ALIASES.get(str(value), value)
                 if key in choices:
                     if str(value) in choices[key]:
                         m.options[key] = str(value)
@@ -419,6 +457,12 @@ def build_line(catalog: dict[str, MachineConfig], entries: list[dict]) -> list[M
             m.retries = max(0, min(MAX_RETRIES, int(entry.get("retries") or 0))) if not m.sorter and m.steps else 0
         except (TypeError, ValueError):
             m.retries = 0
+        if m.uses_agent():
+            from . import agents  # agents imports config
+            m.model = agents.clean_model(entry.get("model", m.model))
+            m.effort = agents.clean_effort(entry.get("effort", m.effort))
+        else:
+            m.model = m.effort = ""
         if entry.get("timeout_seconds"):
             for st in m.steps:  # one limit for each of the machine's steps, set in the game
                 st.timeout_seconds = float(entry["timeout_seconds"])
@@ -449,7 +493,7 @@ def load(path: Path = DEFAULT_CONFIG) -> Config:
         host=raw.get("server", {}).get("host", "127.0.0.1"),
         port=int(raw.get("server", {}).get("port", 8765)),
         workspace=workspace,
-        repo=workspace / ws.get("repo", "test-project"),
+        repo=workspace / (str(ws.get("repo", "") or "").strip() or "local-repo"),
         worktrees=workspace / ws.get("worktrees", "worktrees"),
         base_branch=ws.get("base_branch", "main"),
         remote=ws.get("remote", ""),
@@ -493,10 +537,10 @@ def load(path: Path = DEFAULT_CONFIG) -> Config:
         alerts=dict(raw.get("alerts", {})),
     )
     remote = str(ws.get("remote", ""))
+    # Which GitHub repo that clone is: its remote's, or [intake.github] repo's for a remote that
+    # isn't on GitHub. Only lines that pick it use it.
     cfg.default_repo = RepoConfig(github=github_name(remote) or github_name(cfg.github.repo), path=cfg.repo,
                                   base_branch=cfg.base_branch, remote=remote, is_default=True)
-    if not cfg.github.repo:
-        cfg.github.repo = cfg.default_repo.github
     prd = intake.get("prd", {})
     if bool(prd.get("enabled", cfg.github.enabled)):
         cfg.prd = dataclasses.replace(

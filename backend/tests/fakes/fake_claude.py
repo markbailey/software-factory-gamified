@@ -16,9 +16,15 @@ import time
 from pathlib import Path
 
 state = Path(os.environ.get("FAKE_STATE", "."))
+if "--help" in sys.argv:  # what the factory asks to see which options this CLI has
+    print("Usage: claude [options]\n  --model <model>\n  --effort <level>")
+    sys.exit(0)
+with open(state / "claude_args.jsonl", "a", encoding="utf-8") as f:  # for tests: each run's options
+    f.write(json.dumps(sys.argv[1:]) + "\n")
 prompt = sys.stdin.read() if not sys.stdin.isatty() else ""
 roles = {"coder": "You are the Coder machine", "verifier": "You are the Verifier",
-         "refiner": "You are the Refiner", "reviewer": "Reviewer machine", "risk": "Risk analyser machine"}
+         "refiner": "You are the Refiner", "reviewer": "Reviewer machine", "risk": "Risk analyser machine",
+         "planner": "You are the Planner", "doc_issues": "turning a change request into GitHub"}
 role = next((r for r, words in roles.items() if words in prompt), "other")
 slow = state / f"slow_{role}"
 if slow.exists():
@@ -58,19 +64,33 @@ if role == "coder":
     item = re.search(r"Crate #(\d+)", prompt)
     with open(here / "work.txt", "a", encoding="utf-8") as f:
         f.write(f"work {time.time()}\n")
-    tests = here / "tests"
-    tests.mkdir(exist_ok=True)
-    flag = (state / "fail_tests").as_posix()
-    (tests / "test_work.py").write_text(
-        "import os, unittest\n\nclass T(unittest.TestCase):\n    def test_flag(self):\n"
-        f"        self.assertFalse(os.path.exists({flag!r}))\n", encoding="utf-8")
-    reply("Wrote work.txt and a test.")
+    if "implementation code only" in prompt:  # Implement mode: no tests (the project has one)
+        reply("Wrote work.txt.")
+    else:
+        tests = here / "tests"
+        tests.mkdir(exist_ok=True)
+        flag = (state / "fail_tests").as_posix()
+        (tests / "test_work.py").write_text(
+            "import os, unittest\n\nclass T(unittest.TestCase):\n    def test_flag(self):\n"
+            f"        self.assertFalse(os.path.exists({flag!r}))\n", encoding="utf-8")
+        reply("Wrote work.txt and a test.")
 elif role == "verifier":
     reply("Ready: clear enough to start.")
 elif role == "refiner":
     reply("## Goal\nDo it.\n## Acceptance criteria\n- [ ] done")
 elif role == "reviewer":
     reply("Verdict: Looks good\n- fine")
+elif role == "planner":  # three tickets: T2 waits for T1
+    reply("## Summary\nThree small steps.\n## Approach\n- one at a time\n## Open questions\nNone\n\n```json\n"
+          + json.dumps({"title": "Greetings", "issues": [
+              {"key": "T1", "title": "Add a greeting", "body": "Add it.", "depends_on": []},
+              {"key": "T2", "title": "Translate the greeting", "body": "Translate it.", "depends_on": ["T1"]},
+              {"key": "T3", "title": "Add a farewell", "body": "Add it.", "depends_on": []}]})
+          + "\n```")
+elif role == "doc_issues":  # the Document writer with no plan: one issue from the description
+    reply("## Summary\nOne change.\n\n```json\n" + json.dumps({"title": "Greeting", "issues": [
+        {"key": "T1", "title": "Add a greeting", "body": "Add it.\n### Acceptance criteria\n- [ ] it greets",
+         "depends_on": []}]}) + "\n```")
 elif role == "risk":
     reply("Risk: Low\nSmall change.")
 else:

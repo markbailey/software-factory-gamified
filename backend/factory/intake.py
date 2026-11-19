@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import json
 import os
 import shutil
@@ -27,12 +28,28 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover
     import tomli as tomllib
 
-from . import graph, plans
+from . import accounts, graph, plans
 from .config import DEFAULT_CONFIG, GitHubIntakeConfig, JiraIntakeConfig
 from .engine import Factory
 
 MAX_TEXT = 20000
 LIST_LIMIT = 100  # how many issues or PRs the intake window lists per source
+CLOSED_HIDE_SECONDS = 600.0  # a closed issue or PR stays out of the listing while GitHub's search catches up
+DONE_NAMES = ("done", "closed", "resolved", "complete", "completed")  # preferred Jira close transitions
+
+
+def _hide_closed(adapter, rows: list[dict]) -> list[dict]:
+    """Leave out the rows closed from the game a moment ago (searches can lag behind)."""
+    now = time.time()
+    closed = {r: t for r, t in getattr(adapter, "closed_refs", {}).items() if now - t < CLOSED_HIDE_SECONDS}
+    adapter.closed_refs = closed
+    return [r for r in rows if str(r.get("ref", "")) not in closed]
+
+
+def _closed_now(adapter, ref: str) -> None:
+    refs = getattr(adapter, "closed_refs", {})
+    refs[ref] = time.time()
+    adapter.closed_refs = refs
 
 
 def _crate(factory: Factory, item_id: int | None) -> dict:
@@ -90,7 +107,9 @@ class GitHubIntake:
         gh = shutil.which("gh")
         if not gh:
             raise RuntimeError("gh is not installed or not on PATH")
-        r = subprocess.run([gh, *args], input=stdin, capture_output=True, text=True, encoding="utf-8")
+        # As the GitHub account its line or storage picked (main sets .account), or the default.
+        env = accounts.process_env(accounts.github_env(getattr(self, "account", "")))
+        r = subprocess.run([gh, *args], input=stdin, capture_output=True, text=True, encoding="utf-8", env=env)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout).strip())
         return r.stdout
@@ -107,7 +126,8 @@ class GitHubIntake:
             if self.factory.store.seen(self.source, self._key(ref)):
                 continue
             item = await self.factory.submit(
-                _spec(issue["title"], issue.get("body", ""), f"{self.cfg.repo}#{ref}"),
+                _with_last_try(self.factory, self.source, self._key(ref),
+                               _spec(issue["title"], issue.get("body", ""), f"{self.cfg.repo}#{ref}")),
                 source=self.source, source_ref=ref, source_url=issue["url"], pipeline=self.pipeline,
                 repo=self.cfg.repo, storage=self.storage,
             )
@@ -127,7 +147,19 @@ class GitHubIntake:
         if event == "scrapped" and not rollback and self.factory.bin_rules(item.get("location", "")).get("close_issues"):
             await self._close(item, ref, detail)
             return
-        body = _message(item, event, detail, self._resubmit_hint())
+        retry = (_try_again(self.factory, self.source, self._key(ref), item)
+                 if event == "scrapped" and not rollback and not self.check_only else {})
+        if retry.get("again"):
+            # Handed back for another go: still labelled for the factory, so the next check takes it.
+            body = _message(item, event, detail, retry["hint"])
+            await asyncio.to_thread(
+                self._gh, "issue", "comment", ref, "--repo", self.cfg.repo, "--body-file", "-", stdin=body)
+            await self._edit(ref, add_labels=[] if self.query else [self.cfg.label],
+                             remove_labels=[self.cfg.in_progress_label], unassign=self.cfg.assign)
+            self.factory.store.add_retry(self.source, self._key(ref), detail)
+            self.factory.store.forget_seen(self.source, self._key(ref))
+            return
+        body = _message(item, event, detail, retry.get("hint", "") + self._resubmit_hint())
         if body:
             await asyncio.to_thread(
                 self._gh, "issue", "comment", ref, "--repo", self.cfg.repo, "--body-file", "-", stdin=body)
@@ -151,6 +183,7 @@ class GitHubIntake:
             if ["--remove-label", self.cfg.label] not in failed:
                 self.factory.store.forget_seen(self.source, self._key(ref))
         elif event == "shipped":
+            self.factory.store.clear_retries(self.source, self._key(ref))
             await self._edit(ref, remove_labels=[self.cfg.in_progress_label])
             await self._release_planned(int(ref) if ref.isdigit() else 0)
 
@@ -167,6 +200,7 @@ class GitHubIntake:
             print(f"[intake] github: could not close #{ref}: {exc}")
             return
         self.factory.store.forget_seen(self.source, self._key(ref))  # reopened and labelled, it comes back
+        await self._plan_scrapped(int(ref) if ref.isdigit() else 0)
 
     async def _release_planned(self, number: int) -> None:
         """An issue from a plan shipped: label the plan's issues that were waiting for it."""
@@ -178,6 +212,55 @@ class GitHubIntake:
             if not failed:
                 plans.labelled(folder, self.cfg.repo, n)
                 print(f"[intake] github: #{n} was waiting for #{number}; labelled it '{self.cfg.label}'")
+        await self._close_finished_plans(number)
+
+    async def _plan_scrapped(self, number: int) -> None:
+        """An issue from a plan was scrapped and closed. The tasks waiting for it won't be
+        labelled by themselves, so say so on the plan and on each of them, with the way out."""
+        folder = self.factory.cfg.workspace / "plans"
+        if not number or not folder.exists():
+            return
+        for hit in plans.scrapped(folder, self.cfg.repo, number):
+            blocked = hit["blocked"]
+            if blocked:
+                refs = ", ".join(f"#{n}" for n in blocked)
+                note = (f"#{number} was scrapped, so {refs} {'waits' if len(blocked) == 1 else 'wait'} for it "
+                        f"and won't be sent to the factory by itself. Reopen #{number} and label it "
+                        f"`{self.cfg.label}` to try it again (the rest follow once it ships), label a "
+                        f"waiting issue `{self.cfg.label}` to build it anyway, or close the ones you "
+                        "don't want.\n")
+                for ref in [str(hit["tracking"])] + [str(n) for n in blocked]:
+                    try:
+                        await asyncio.to_thread(self._gh, "issue", "comment", ref, "--repo", self.cfg.repo,
+                                                "--body-file", "-", stdin=note)
+                    except RuntimeError as exc:
+                        print(f"[intake] github: could not comment on #{ref}: {exc}")
+        await self._close_finished_plans(number)
+
+    async def _close_finished_plans(self, number: int) -> None:
+        """Close the tracking issue of each plan whose tasks are now all shipped or scrapped."""
+        folder = self.factory.cfg.workspace / "plans"
+        if not number or not folder.exists():
+            return
+        for done in plans.finished(folder, self.cfg.repo, number):
+            ref, shipped, scrapped = str(done["tracking"]), done["shipped"], done["scrapped"]
+            total = len(shipped) + len(scrapped)
+            body = f"All {total} task{'' if total == 1 else 's'} in this plan are done"
+            if scrapped:
+                body += (": shipped " + (", ".join(f"#{n}" for n in shipped) or "none")
+                         + "; scrapped " + ", ".join(f"#{n}" for n in scrapped))
+            body += ". Closing the plan.\n"
+            reason = "completed" if shipped else "not planned"
+            try:
+                await asyncio.to_thread(self._gh, "issue", "comment", ref, "--repo", self.cfg.repo,
+                                        "--body-file", "-", stdin=body)
+                await asyncio.to_thread(self._gh, "issue", "close", ref, "--repo", self.cfg.repo,
+                                        "--reason", reason)
+            except RuntimeError as exc:
+                print(f"[intake] github: could not close the plan #{ref}: {exc}")
+                continue
+            plans.closed(folder, self.cfg.repo, done["tracking"])
+            print(f"[intake] github: every task in the plan #{ref} is done; closed it")
 
     def _resubmit_hint(self) -> str:
         return f"Put the `{self.cfg.label}` label back on this issue to send it to the factory again."
@@ -224,6 +307,16 @@ class GitHubIntake:
         self._labels_made = made
 
 
+    async def close(self, ref: str, comment: str = "", reason: str = "", transition: str = "") -> None:
+        """Close one issue from the game (its storage's Close), as the storage's account."""
+        args = ["issue", "close", ref, "--repo", self.cfg.repo]
+        if reason in ("completed", "not planned"):
+            args += ["--reason", reason]
+        if comment.strip():
+            args += ["--comment", comment.strip()[:MAX_TEXT]]
+        await asyncio.to_thread(self._gh, *args)
+        _closed_now(self, ref)
+
     def describe(self) -> str:
         if self.query:
             return f"Open issues in {self.cfg.repo} matching: {self.query}. They all come in by themselves."
@@ -244,7 +337,7 @@ class GitHubIntake:
                 "auto": self.cfg.label in labels, "can_pull": True,
                 **_crate(self.factory, self.factory.store.seen_item(self.source, self._key(ref))),
             })
-        return rows
+        return _hide_closed(self, rows)
 
     async def pull(self, ref: str) -> dict | None:
         """Bring one open issue in now, labelled or not. Returns the new item."""
@@ -292,10 +385,13 @@ class PrdIntake(GitHubIntake):
                 "auto": True, "can_pull": True,
                 **_crate(self.factory, self.factory.store.seen_item(self.source, self._key(ref))),
             })
-        return rows
+        return _hide_closed(self, rows)
 
     async def _release_planned(self, number: int) -> None:
         return  # a PRD isn't a task in a plan
+
+    async def _plan_scrapped(self, number: int) -> None:
+        return  # nor is a scrapped one
 
 
 class JiraIntake:
@@ -310,6 +406,11 @@ class JiraIntake:
         self.check_only = check_only
         self.seen_prefix = f"check:{pipeline}:" if check_only else ""
 
+    account = ""  # the Jira account to use ("" the default, "@machine" this machine's), set by main
+
+    def _site(self) -> str:
+        return accounts.jira_creds(self.account).base_url
+
     def mine(self, item: dict) -> bool:
         if item.get("source") != self.source or not item.get("source_ref"):
             return False
@@ -318,12 +419,13 @@ class JiraIntake:
         return item.get("pipeline") not in getattr(self.factory, "jira_lines", set())
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
-        token = os.environ.get(self.cfg.token_env, "")
-        if not token:
-            raise RuntimeError(f"set the {self.cfg.token_env} environment variable to a Jira API token")
-        auth = base64.b64encode(f"{self.cfg.email}:{token}".encode()).decode()
+        creds = accounts.jira_creds(self.account)  # the Jira account its line or storage picked
+        missing = accounts.jira_ready(creds)
+        if missing:
+            raise RuntimeError(missing)
+        auth = base64.b64encode(f"{creds.email}:{creds.token}".encode()).decode()
         req = urllib.request.Request(
-            self.cfg.base_url + path,
+            creds.base_url + path,
             method=method,
             data=json.dumps(payload).encode() if payload is not None else None,
             headers={"Authorization": f"Basic {auth}", "Accept": "application/json",
@@ -336,7 +438,7 @@ class JiraIntake:
     async def poll(self) -> int:
         data = await asyncio.to_thread(
             self._request, "POST", "/rest/api/3/search/jql",
-            {"jql": self.cfg.jql, "fields": ["summary", "description"], "maxResults": 50},
+            {"jql": self.cfg.jql, "fields": ["summary", "description", "status"], "maxResults": 50},
         )
         new = 0
         for issue in data.get("issues", []):
@@ -344,9 +446,12 @@ class JiraIntake:
             if self.factory.store.seen(self.source, self.seen_prefix + key):
                 continue
             fields = issue.get("fields", {})
+            if self._closed_here(key, fields):
+                continue  # closed from the game: not work to do, unless it's reopened
             item = await self.factory.submit(
-                _spec(fields.get("summary", key), _adf_text(fields.get("description")), key),
-                source=self.source, source_ref=key, source_url=f"{self.cfg.base_url}/browse/{key}",
+                _with_last_try(self.factory, self.source, self.seen_prefix + key,
+                               _spec(fields.get("summary", key), _adf_text(fields.get("description")), key)),
+                source=self.source, source_ref=key, source_url=f"{self._site()}/browse/{key}",
                 pipeline=self.pipeline, storage=getattr(self, "storage", ""), repo=getattr(self, "work_repo", ""),
             )
             if item is None:
@@ -372,9 +477,23 @@ class JiraIntake:
             await self._transition(key, rules["jira_status"])
             self.factory.store.forget_seen(self.source, self.seen_prefix + key)
             return
+        retry = (_try_again(self.factory, self.source, self.seen_prefix + key, item)
+                 if event == "scrapped" and not rollback and not self.check_only else {})
+        if retry.get("again"):
+            # Handed back for another go: back to To Do, keeping (or getting) the trigger label.
+            await self._comment(key, _message(item, event, detail, retry["hint"]))
+            if self.cfg.trigger_label:
+                await self._try(f"label {key}", "PUT", f"/rest/api/3/issue/{key}",
+                                {"update": {"labels": [{"add": self.cfg.trigger_label}]}})
+            if self.cfg.assign:
+                await self._try(f"unassign {key}", "PUT", f"/rest/api/3/issue/{key}/assignee", {"accountId": None})
+            await self._transition(key, self.cfg.handback_transition)
+            self.factory.store.add_retry(self.source, self.seen_prefix + key, detail)
+            self.factory.store.forget_seen(self.source, self.seen_prefix + key)
+            return
         hint = (f"Add the `{self.cfg.trigger_label}` label again to send it to the factory again."
                 if self.cfg.trigger_label else "Press Retry on its crate in the game's scrap bin to send it again.")
-        text = _message(item, event, detail, hint)
+        text = _message(item, event, detail, retry.get("hint", "") + hint)
         if text:
             await self._comment(key, text)
         if event == "picked":
@@ -408,7 +527,27 @@ class JiraIntake:
             if self.cfg.trigger_label and labelled is not None:
                 self.factory.store.forget_seen(self.source, self.seen_prefix + key)
         elif event == "shipped":
+            self.factory.store.clear_retries(self.source, self.seen_prefix + key)
             await self._transition(key, self.cfg.shipped_transition)
+            await self._release_planned(key)
+
+    async def _release_planned(self, key: str) -> None:
+        """An issue a Document writer made from a plan shipped: label the plan's issues that
+        were waiting for it, so the line that looks for that label takes them next."""
+        folder = self.factory.cfg.workspace / "plans"
+        if not folder.exists() or "-" not in key:
+            return
+        repo = "jira:" + key.rsplit("-", 1)[0].upper()
+        hit = plans.plan_of(folder, repo, key)
+        label = str((hit or {}).get("label") or self.cfg.trigger_label).replace(" ", "-")
+        for ready in plans.shipped(folder, repo, key):
+            if not label:
+                continue
+            done = await self._try(f"label {ready}", "PUT", f"/rest/api/3/issue/{ready}",
+                                   {"update": {"labels": [{"add": label}]}})
+            if done is not None:
+                plans.labelled(folder, repo, ready)
+                print(f"[intake] jira: {ready} was waiting for {key}; labelled it '{label}'")
 
     async def _comment(self, key: str, text: str) -> None:
         paragraphs = [p for p in text.split("\n\n") if p.strip()]
@@ -446,6 +585,50 @@ class JiraIntake:
         print(f"[intake] jira: {key} has no transition called '{name}' right now (it has: {names or 'none'})")
 
 
+    def _closed_here(self, key: str, fields: dict) -> bool:
+        """Closed from the game's storage and still in a done status."""
+        done = str(((fields.get("status") or {}).get("statusCategory") or {}).get("key", "")) == "done"
+        return done and self.factory.store.seen(self.source, f"closed:{self.seen_prefix}{key}")
+
+    async def close_options(self, key: str) -> dict:
+        """The transitions this issue can take now, the ones into a done status first, and the
+        one Close uses by default."""
+        data = await asyncio.to_thread(self._request, "GET", f"/rest/api/3/issue/{key}/transitions")
+        options = []
+        for t in data.get("transitions", []):
+            to = t.get("to") or {}
+            done = str((to.get("statusCategory") or {}).get("key", "")) == "done"
+            options.append({"id": str(t.get("id", "")), "name": str(t.get("name", "")),
+                            "to": str(to.get("name", "")), "done": done})
+        options.sort(key=lambda o: not o["done"])
+        return {"transitions": options, "default": _pick_done(options)}
+
+    async def close(self, ref: str, comment: str = "", reason: str = "", transition: str = "") -> None:
+        """Move one issue to a done status from the game (with a comment first, if any), as the
+        storage's account. transition: its name (or the status it goes to); "" picks the done one."""
+        options = (await self.close_options(ref))["transitions"]
+        want = transition.strip().lower()
+        if want:
+            pick = next((o for o in options if want in (o["name"].lower(), o["to"].lower(), o["id"])), None)
+            if pick is None:
+                names = ", ".join(o["name"] for o in options) or "none"
+                raise RuntimeError(f"{ref} can't take '{transition}' now (it can: {names})")
+        else:
+            pick = next((o for o in options if o["name"] == _pick_done(options)), None)
+            if pick is None:
+                names = ", ".join(o["name"] for o in options) or "none"
+                raise RuntimeError(f"{ref} has no transition to a done status now (it has: {names})")
+        if comment.strip():
+            paragraphs = [p for p in comment.strip()[:MAX_TEXT].split("\n\n") if p.strip()]
+            await asyncio.to_thread(self._request, "POST", f"/rest/api/3/issue/{ref}/comment", {"body": {
+                "type": "doc", "version": 1, "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": p}]} for p in paragraphs]}})
+        await asyncio.to_thread(self._request, "POST", f"/rest/api/3/issue/{ref}/transitions",
+                                {"transition": {"id": pick["id"]}})
+        _closed_now(self, ref)
+        # So a JQL that also matches done issues doesn't bring it straight back in as a crate.
+        self.factory.store.mark_seen(self.source, f"closed:{self.seen_prefix}{ref}", None)
+
     def describe(self) -> str:
         return f"Jira issues matching: {self.cfg.jql}. They all come in by themselves."
 
@@ -458,14 +641,16 @@ class JiraIntake:
         for issue in data.get("issues", []):
             key = issue["key"]
             fields = issue.get("fields", {})
+            if self._closed_here(key, fields):
+                continue  # closed from the game; it shows again if it's reopened
             status = (fields.get("status") or {}).get("name", "")
             rows.append({
                 "ref": key, "label": key, "title": fields.get("summary", key),
-                "url": f"{self.cfg.base_url}/browse/{key}", "by": "", "tags": [status] if status else [],
+                "url": f"{self._site()}/browse/{key}", "by": "", "tags": [status] if status else [],
                 "auto": True, "can_pull": False,
                 **_crate(self.factory, self.factory.store.seen_item(self.source, self.seen_prefix + key)),
             })
-        return rows
+        return _hide_closed(self, rows)
 
 
 @dataclass
@@ -517,6 +702,23 @@ class ReviewRequestIntake:
         line = self._line()
         return graph.queries_of(line.graph).get(self.source, "").split() if line is not None else []
 
+    def _repo_terms(self) -> list[str] | None:
+        """With the storage's "Only repos in the factory's repo list" ticked: a repo: term per repo
+        added under the gear (None: the list is empty, so nothing comes in). Unticked: no terms."""
+        line = self._line()
+        if line is None or not graph.listed_repos_only(line.graph, self.source):
+            return []
+        repos = self.factory._saved_repos()
+        return [f"--repo={r}" for r in repos] if repos else None
+
+    def _listed(self, hit: dict) -> bool:
+        """Whether a search hit is from a repo the storage takes (always, unless it's ticked)."""
+        line = self._line()
+        if line is None or not graph.listed_repos_only(line.graph, self.source):
+            return True
+        repo = ((hit.get("repository") or {}).get("nameWithOwner") or "").lower()
+        return repo in {r.lower() for r in self.factory._saved_repos()}
+
     async def poll(self) -> int:
         line = self._line()
         if line is None:
@@ -528,10 +730,15 @@ class ReviewRequestIntake:
         self.warned = False
         args = ["search", "prs", f"--review-requested={self.cfg.reviewer}", "--state=open",
                 "--draft=false", "--limit", "50", "--json", "url,number,title,repository,author"]
-        args += self.cfg.query.split() + self._filter()
+        repos = self._repo_terms()
+        if repos is None:
+            return 0  # only the factory's repos, and none are listed yet
+        args += self.cfg.query.split() + self._filter() + repos
         found = json.loads(await asyncio.to_thread(self._gh, *args) or "[]")
         new = 0
         for hit in found:
+            if not self._listed(hit):
+                continue
             url = hit["url"]
             pr = json.loads(await asyncio.to_thread(
                 self._gh, "pr", "view", url, "--json", "headRefOid,isDraft,state,title,body,author"))
@@ -556,13 +763,21 @@ class ReviewRequestIntake:
 
     def describe(self) -> str:
         who = "you" if self.cfg.reviewer == "@me" else self.cfg.reviewer
-        return f"Open pull requests waiting for a review from {who}. They all come in by themselves."
+        where = ""
+        if self._repo_terms() is None:
+            where = " Only the factory's repos are taken, and none are listed yet: add some under the gear (Repos)."
+        elif self._repo_terms():
+            where = " Only PRs in the factory's repo list are taken."
+        return f"Open pull requests waiting for a review from {who}. They all come in by themselves.{where}"
 
     async def listing(self) -> list[dict]:
         args = ["search", "prs", f"--review-requested={self.cfg.reviewer}", "--state=open",
                 "--limit", str(LIST_LIMIT), "--json", "url,number,title,repository,author,isDraft"]
-        args += self.cfg.query.split() + self._filter()
-        found = json.loads(await asyncio.to_thread(self._gh, *args) or "[]")
+        repos = self._repo_terms()
+        if repos is None:
+            return []  # only the factory's repos, and none are listed yet
+        args += self.cfg.query.split() + self._filter() + repos
+        found = [hit for hit in json.loads(await asyncio.to_thread(self._gh, *args) or "[]") if self._listed(hit)]
         latest: dict[str, int] = {}  # PR url -> its newest crate
         for item in self.factory.store.list_items():
             if item.get("source") == self.source and item.get("source_url"):
@@ -578,7 +793,15 @@ class ReviewRequestIntake:
                 "auto": not hit.get("isDraft"), "can_pull": False,
                 **_crate(self.factory, latest.get(url)),
             })
-        return rows
+        return _hide_closed(self, rows)
+
+    async def close(self, ref: str, comment: str = "", reason: str = "", transition: str = "") -> None:
+        """Close someone's PR from the game (ref is its URL). Asked for by you, so it's allowed here."""
+        args = ["pr", "close", ref]
+        if comment.strip():
+            args += ["--comment", comment.strip()[:MAX_TEXT]]
+        await asyncio.to_thread(self._gh, *args)
+        _closed_now(self, ref)
 
     async def _supersede(self, url: str, sha: str) -> None:
         """New commits on a PR: scrap its older crate if that one is waiting for you."""
@@ -618,6 +841,33 @@ CLOSING_HEADLINES = {
 }
 
 
+def _try_again(factory, source: str, key: str, item: dict) -> dict:
+    """Should a scrapped issue go back to the factory for another try? Only from a bin that hands
+    issues back with retry_issues on, and at most max_retries times (no endless loop): then
+    {"again": True, "hint": ...}. Out of tries: {"hint": ...} saying so, and the count starts
+    again, so labelling it yourself gives it fresh tries. Otherwise {}."""
+    rules = factory.bin_rules(item.get("location", ""))
+    if rules.get("close_issues") or not rules.get("retry_issues"):
+        return {}
+    done, _ = factory.store.retries(source, key)
+    most = int(rules.get("max_retries", 0))
+    if done < most:
+        return {"again": True, "hint": f"Sent back to the factory to try again (retry {done + 1} of {most})."}
+    factory.store.clear_retries(source, key)
+    if not most:
+        return {}
+    return {"hint": f"The factory has tried this {done + 1} times now, so it's handed back to you. "}
+
+
+def _with_last_try(factory, source: str, key: str, spec: str) -> str:
+    """A retried issue's spec, with why its last try was scrapped, so the next try can do better."""
+    done, note = factory.store.retries(source, key)
+    if not done or not note.strip():
+        return spec
+    extra = f"\n\nRetry {done}: the last try at this was scrapped. What went wrong:\n{note.strip()}"
+    return spec[:MAX_TEXT - len(extra[:6000])] + extra[:6000]
+
+
 def _message(item: dict, event: str, detail: str, resubmit_hint: str = "", closing: bool = False) -> str:
     """The comment posted on the issue for each milestone, or "" for none. closing: the crate
     went into a scrap bin that closes issues."""
@@ -641,6 +891,17 @@ def _message(item: dict, event: str, detail: str, resubmit_hint: str = "", closi
     return ""
 
 
+def _pick_done(options: list[dict]) -> str:
+    """The name of the transition Close uses by default: into a done status, Done/Closed/Resolved first."""
+    done = [o for o in options if o.get("done")] or [
+        o for o in options if o.get("name", "").lower() in DONE_NAMES or o.get("to", "").lower() in DONE_NAMES]
+    for name in DONE_NAMES:
+        for o in done:
+            if name in (o.get("name", "").lower(), o.get("to", "").lower()):
+                return o["name"]
+    return done[0]["name"] if done else ""
+
+
 def _adf_text(node) -> str:
     """Flatten Jira's rich text (Atlassian Document Format) into plain text."""
     if node is None:
@@ -658,6 +919,48 @@ def _adf_text(node) -> str:
 DEFAULT_PR_SEARCH = "author:@me"
 
 
+def _pr_key(url: str) -> str:
+    """owner/name#number for a GitHub PR link (lower-case), or "" if it isn't one."""
+    parts = str(url or "").split("github.com/", 1)[-1].strip("/").split("/")
+    if len(parts) >= 4 and parts[2] == "pull" and parts[3].isdigit():
+        return f"{parts[0]}/{parts[1]}#{parts[3]}".lower()
+    return ""
+
+
+def factory_crate_of(factory, repo: str, pr: dict) -> int | None:
+    """The live crate (not shipped or scrapped) that this open PR belongs to: one the factory
+    opened itself, found by the crate's saved PR link or its saved branch name (crate/<n> for
+    crates from before branch naming). Crates that came in from an Open PRs storage don't count:
+    their PR is someone's own, brought in to be checked."""
+    from . import branch_names  # here, so intake doesn't import git helpers it rarely needs
+    from .store import TERMINAL_STATES
+    live: dict[int, dict] = {}
+    for it in factory.store.list_items(log_tail=0):
+        if it.get("state") not in TERMINAL_STATES and it.get("source") != "github_pr":
+            live[int(it["id"])] = it
+    if not live:
+        return None
+    key = _pr_key(pr.get("url", "")) or f"{repo}#{pr.get('number', '')}".lower()
+    for cid, it in live.items():
+        if it.get("pr_url") and _pr_key(it["pr_url"]) == key:
+            return cid
+    head = str(pr.get("headRefName") or "")
+    if not head:
+        return None
+    cid = branch_names.crate_of(head, branch_names.owners(live))
+    if cid is None or cid not in live:
+        return None
+    it = live[cid]
+    if it.get("branch") and str(it["branch"]) != head:
+        return None  # crate/<n> naming, but crate n has another branch: not its
+    lines = getattr(factory, "lines", {}) or {}
+    line = lines.get(it.get("pipeline")) if isinstance(lines, dict) else None
+    crate_repo = str(it.get("repo") or getattr(getattr(line, "repo", None), "github", "") or "")
+    if crate_repo and crate_repo.lower() != repo.lower():
+        return None  # the same branch name in another repo
+    return cid
+
+
 class GitHubPrIntake(GitHubIntake):
     """Open pull requests in a line's repo (yours, by default, or the ones its search finds) come
     in as crates that already have their PR, for a Verifier to check they're still needed. Only
@@ -665,20 +968,29 @@ class GitHubPrIntake(GitHubIntake):
     that closes PRs gets its PR closed (the branch is kept); one that passes is left open."""
     source = "github_pr"
 
-    def __init__(self, cfg: GitHubIntakeConfig, factory: Factory, pipeline: str = "", query: str = ""):
+    def __init__(self, cfg: GitHubIntakeConfig, factory: Factory, pipeline: str = "", query: str = "",
+                 include_factory_prs: bool = False):
         super().__init__(cfg, factory, pipeline, default=False, query=query or DEFAULT_PR_SEARCH, check_only=True)
         self.seen_prefix = f"pr:{pipeline}:{cfg.repo}#"
+        # Off (the default), PRs the factory opened for crates still on a line are left alone:
+        # they come in once their crate has shipped or been scrapped, if they're still open.
+        self.include_factory_prs = include_factory_prs
+
+    def _factory_crate(self, pr: dict) -> int | None:
+        return None if self.include_factory_prs else factory_crate_of(self.factory, self.cfg.repo, pr)
 
     async def poll(self) -> int:
         out = await asyncio.to_thread(
             self._gh, "pr", "list", "--repo", self.cfg.repo, "--search", self.query, "--state", "open",
-            "--limit", "50", "--json", "number,title,body,url,headRefOid",
+            "--limit", "50", "--json", "number,title,body,url,headRefOid,headRefName",
         )
         new = 0
         for pr in sorted(json.loads(out or "[]"), key=lambda i: i["number"]):
             ref = str(pr["number"])
             if self.factory.store.seen(self.source, self._key(ref)):
                 continue
+            if self._factory_crate(pr) is not None:
+                continue  # the factory's own PR, its crate still on a line (not marked seen)
             item = await self._submit(pr)
             if item is None:
                 break
@@ -699,26 +1011,38 @@ class GitHubPrIntake(GitHubIntake):
     async def notify(self, item: dict, event: str, detail: str) -> None:
         return  # the factory closes the PR itself when it's scrapped (if the bin says so)
 
+    async def close(self, ref: str, comment: str = "", reason: str = "", transition: str = "") -> None:
+        """Close one PR from the game (its branch is kept), as the storage's account."""
+        args = ["pr", "close", ref, "--repo", self.cfg.repo]
+        if comment.strip():
+            args += ["--comment", comment.strip()[:MAX_TEXT]]
+        await asyncio.to_thread(self._gh, *args)
+        _closed_now(self, ref)
+
     def describe(self) -> str:
         return (f"Open pull requests in {self.cfg.repo} matching: {self.query}. They come in by themselves, "
-                "each once, with their PR, for the machines on the line (CI, Approver, Merger, Verifier...).")
+                "each once, with their PR, for the machines on the line (CI, Approver, Merger, Verifier...)."
+                + _own_prs_note(self.include_factory_prs))
 
     async def listing(self) -> list[dict]:
         out = await asyncio.to_thread(
             self._gh, "pr", "list", "--repo", self.cfg.repo, "--search", self.query, "--state", "open",
-            "--limit", str(LIST_LIMIT), "--json", "number,title,url,labels,author",
+            "--limit", str(LIST_LIMIT), "--json", "number,title,url,labels,author,headRefName",
         )
         rows = []
         for pr in sorted(json.loads(out or "[]"), key=lambda i: i["number"]):
             ref = str(pr["number"])
+            own = self._factory_crate(pr)
+            tags = [str(l.get("name", "")) for l in pr.get("labels", []) or []]
+            if own is not None:
+                tags.append(f"factory's own (crate #{own})")
             rows.append({
                 "ref": ref, "label": f"#{ref}", "title": pr.get("title", ""), "url": pr.get("url", ""),
-                "by": (pr.get("author") or {}).get("login", ""),
-                "tags": [str(l.get("name", "")) for l in pr.get("labels", []) or []],
-                "auto": True, "can_pull": True,
+                "by": (pr.get("author") or {}).get("login", ""), "tags": tags,
+                "auto": own is None, "can_pull": True, **({"factory_crate": own} if own is not None else {}),
                 **_crate(self.factory, self.factory.store.seen_item(self.source, self._key(ref))),
             })
-        return rows
+        return _hide_closed(self, rows)
 
     async def pull(self, ref: str) -> dict | None:
         """Check one open PR now (again, if it was checked before)."""
@@ -731,6 +1055,90 @@ class GitHubPrIntake(GitHubIntake):
             raise RuntimeError(f"PR #{ref} is {str(pr.get('state', 'closed')).lower()}")
         self.factory.store.forget_seen(self.source, self._key(ref))
         return await self._submit(pr, manual=True)
+
+
+def _own_prs_note(included: bool) -> str:
+    if included:
+        return " PRs the factory opened itself come in too, even while their crate is still on a line."
+    return (" PRs the factory opened itself are left alone while their crate is still on a line"
+            " (tick \"Include the factory's own PRs\" to take them too).")
+
+
+LISTED_REPOS = "*factory-repos*"  # an Open PRs storage ticked "Only repos in the factory's repo list"
+
+
+class ListedReposPrIntake:
+    """An Open PRs storage with "Only repos in the factory's repo list" ticked: open PRs (matching
+    its search) in every repo added under the gear (Repos), instead of its one repo. Each repo is
+    read as a plain Open PRs storage on it would read it, so a PR is taken once either way. Rows
+    and refs are owner/name#number, since numbers repeat across repos."""
+    source = "github_pr"
+    storage = ""
+    check_only = True
+
+    def __init__(self, cfg: GitHubIntakeConfig, factory: Factory, pipeline: str = "", query: str = "",
+                 include_factory_prs: bool = False):
+        self.cfg = cfg  # cfg.repo is LISTED_REPOS
+        self.factory = factory
+        self.pipeline = pipeline
+        self.query = query or DEFAULT_PR_SEARCH
+        self.include_factory_prs = include_factory_prs
+
+    def _one(self, repo: str) -> GitHubPrIntake:
+        one = GitHubPrIntake(dataclasses.replace(self.cfg, repo=repo), self.factory, self.pipeline, self.query,
+                             self.include_factory_prs)
+        one.storage = self.storage
+        one.account = getattr(self, "account", "")
+        one._gh = self._gh
+        return one
+
+    def _gh(self, *args: str, stdin: str | None = None) -> str:
+        return GitHubIntake._gh(self, *args, stdin=stdin)  # as this storage's account
+
+    def _repos(self) -> list[str]:
+        return self.factory._saved_repos()
+
+    def _split(self, ref: str) -> tuple[GitHubPrIntake, str]:
+        repo, _, number = str(ref).rpartition("#")
+        match = next((r for r in self._repos() if r.lower() == repo.lower()), "")
+        if not match or not number:
+            raise RuntimeError(f"{ref} isn't a PR in one of the factory's repos")
+        return self._one(match), number
+
+    async def poll(self) -> int:
+        new = 0
+        for repo in self._repos():
+            new += await self._one(repo).poll()
+        return new
+
+    async def notify(self, item: dict, event: str, detail: str) -> None:
+        return  # the factory closes the PR itself when it's scrapped (if the bin says so)
+
+    def describe(self) -> str:
+        repos = self._repos()
+        if not repos:
+            return ("Open pull requests in the factory's repo list, and none are listed yet: "
+                    "add some under the gear (Repos).")
+        return (f"Open pull requests matching: {self.query}, in the factory's repos ({', '.join(repos)}). "
+                "They come in by themselves, each once, with their PR, for the machines on the line."
+                + _own_prs_note(self.include_factory_prs))
+
+    async def listing(self) -> list[dict]:
+        rows = []
+        for repo in self._repos():
+            for row in await self._one(repo).listing():
+                ref = f"{repo}#{row['ref']}"
+                rows.append({**row, "ref": ref, "label": ref})
+        return _hide_closed(self, rows)
+
+    async def close(self, ref: str, comment: str = "", reason: str = "", transition: str = "") -> None:
+        one, number = self._split(ref)
+        await one.close(number, comment, reason, transition)
+        _closed_now(self, ref)
+
+    async def pull(self, ref: str) -> dict | None:
+        one, number = self._split(ref)
+        return await one.pull(number)
 
 
 class Feed:
@@ -768,8 +1176,36 @@ class Feed:
         async with self.lock:
             return await self.adapter.pull(ref)
 
+    async def close(self, refs: list[str], comment: str = "", reason: str = "", transition: str = "") -> dict:
+        """Close these issues or PRs (or move Jira issues to done), one at a time.
+        Returns {"closed": [refs], "failed": [{"ref", "error"}]}."""
+        if not hasattr(self.adapter, "close"):
+            raise RuntimeError("these can't be closed from the game")
+        out: dict = {"closed": [], "failed": []}
+        async with self.lock:  # not while a poll might be taking the same issue in
+            for ref in refs:
+                try:
+                    await self.adapter.close(ref, comment, reason, transition)
+                    out["closed"].append(ref)
+                except Exception as exc:
+                    out["failed"].append({"ref": ref, "error": str(exc)})
+        for ref in out["closed"]:
+            print(f"[intake] {self.source}: closed {ref} from the game as {self.account_label()}")
+        return out
+
+    async def close_options(self, refs: list[str]) -> dict:
+        """How Close would close these: Jira's transitions (for the first one); nothing for GitHub."""
+        if hasattr(self.adapter, "close_options") and refs:
+            return await self.adapter.close_options(refs[0])
+        return {"transitions": [], "default": ""}
+
+    def account_label(self) -> str:
+        service = "jira" if self.source == "jira" else "github"
+        return accounts.label(service, str(getattr(self.adapter, "account", "") or ""))
+
     async def listing(self) -> dict:
         out = {"source": self.source, "enabled": True, "about": self.adapter.describe(),
+               "can_close": hasattr(self.adapter, "close"), "account": self.account_label(),
                "poll_seconds": self.seconds, "last_poll": self.last_poll, "next_poll": self.next_poll,
                "poll_error": self.error, "items": [], "error": ""}
         try:

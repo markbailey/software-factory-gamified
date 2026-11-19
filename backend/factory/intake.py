@@ -961,6 +961,10 @@ def factory_crate_of(factory, repo: str, pr: dict) -> int | None:
     return cid
 
 
+# What an Open PRs storage reads of each PR: its branch, so a crate works on the PR itself.
+PR_FIELDS = "number,title,body,url,headRefOid,headRefName,isCrossRepository"
+
+
 class GitHubPrIntake(GitHubIntake):
     """Open pull requests in a line's repo (yours, by default, or the ones its search finds) come
     in as crates that already have their PR, for a Verifier to check they're still needed. Only
@@ -982,12 +986,22 @@ class GitHubPrIntake(GitHubIntake):
     async def poll(self) -> int:
         out = await asyncio.to_thread(
             self._gh, "pr", "list", "--repo", self.cfg.repo, "--search", self.query, "--state", "open",
-            "--limit", "50", "--json", "number,title,body,url,headRefOid,headRefName",
+            "--limit", "50", "--json", PR_FIELDS,
         )
         new = 0
         for pr in sorted(json.loads(out or "[]"), key=lambda i: i["number"]):
             ref = str(pr["number"])
             if self.factory.store.seen(self.source, self._key(ref)):
+                again = self._changed_since_shipped(pr)
+                if again is None:
+                    continue
+                # Its crate shipped (a Coder fixed it, say merge conflicts, and pushed), so the
+                # PR comes in again for the machines that check and merge it. Its loops carry on,
+                # so a PR can't go round Merger -> Coder -> ... for ever.
+                item = await self._submit(pr, loops=again)
+                if item is None:
+                    break
+                new += 1
                 continue
             if self._factory_crate(pr) is not None:
                 continue  # the factory's own PR, its crate still on a line (not marked seen)
@@ -997,7 +1011,22 @@ class GitHubPrIntake(GitHubIntake):
             new += 1
         return new
 
-    async def _submit(self, pr: dict, manual: bool = False) -> dict | None:
+    def _changed_since_shipped(self, pr: dict) -> int | None:
+        """For a PR taken before: when its crate shipped and the PR has new commits since it came
+        in (the factory pushed a fix), the loops to carry over to a new crate; else None."""
+        seen = self.factory.store.seen_item(self.source, self._key(str(pr["number"])))
+        try:
+            old = self.factory.store.get_item(seen) if seen is not None else None
+        except Exception:  # its crate was deleted
+            old = None
+        if not old or old.get("state") != "shipped" or old.get("source") != self.source:
+            return None
+        sha, then = str(pr.get("headRefOid") or ""), str(old.get("intake_sha") or "")
+        if not sha or not then or sha == then:
+            return None
+        return int(old.get("loops", 0) or 0)
+
+    async def _submit(self, pr: dict, manual: bool = False, loops: int = 0) -> dict | None:
         ref = str(pr["number"])
         item = await self.factory.submit(
             _spec(f"PR: {pr['title']}", pr.get("body", ""), f"{self.cfg.repo}#{ref}"),
@@ -1006,6 +1035,18 @@ class GitHubPrIntake(GitHubIntake):
         )
         if item is not None:
             self.factory.store.mark_seen(self.source, self._key(ref), item["id"])
+            # Work on the PR's own branch (a Coder fixing its merge conflicts pushes to the PR),
+            # not a new branch from the base that would open a second PR. Not for a PR from a
+            # fork: the factory can't push there.
+            head = str(pr.get("headRefName") or "")
+            fields = {"loops": loops} if loops else {}
+            if pr.get("headRefOid"):
+                fields["intake_sha"] = str(pr["headRefOid"])
+            if head and not pr.get("isCrossRepository"):
+                fields["branch"] = head
+            if fields:
+                self.factory.store.update_item(item["id"], **fields)
+                item.update(fields)
         return item
 
     async def notify(self, item: dict, event: str, detail: str) -> None:
@@ -1050,7 +1091,7 @@ class GitHubPrIntake(GitHubIntake):
         if seen is not None and (self.factory.store.get_item(seen) or {}).get("state") not in ("shipped", "scrapped"):
             raise RuntimeError(f"PR #{ref} is already in the factory")
         pr = json.loads(await asyncio.to_thread(
-            self._gh, "pr", "view", ref, "--repo", self.cfg.repo, "--json", "number,title,body,url,state"))
+            self._gh, "pr", "view", ref, "--repo", self.cfg.repo, "--json", PR_FIELDS + ",state"))
         if str(pr.get("state", "")).upper() != "OPEN":
             raise RuntimeError(f"PR #{ref} is {str(pr.get('state', 'closed')).lower()}")
         self.factory.store.forget_seen(self.source, self._key(ref))
@@ -1200,7 +1241,7 @@ class Feed:
         return {"transitions": [], "default": ""}
 
     def account_label(self) -> str:
-        service = "jira" if self.source == "jira" else "github"
+        service = graph.storage_service(self.source)
         return accounts.label(service, str(getattr(self.adapter, "account", "") or ""))
 
     async def listing(self) -> dict:

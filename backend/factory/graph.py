@@ -46,13 +46,14 @@ from pathlib import Path
 from .config import BACKEND_DIR, SCRAP_KINDS, MachineConfig, github_name, missing_needs, need_words
 
 PIPELINES_FILE = BACKEND_DIR / "pipelines.json"
-SOURCES = ("game", "github", "jira", "pr_review", "prd", "github_pr", "custom")
+SOURCES = ("game", "github", "jira", "pr_review", "prd", "github_pr", "custom", "notion")
 # What a crate already has when it enters from this source (a PR to review comes with its PR).
 SOURCE_PROVIDES = {"pr_review": ("pr",), "github_pr": ("pr",)}
 # Sources that read the pipeline's own repo (its issues), so one per repo rather than one in all.
 REPO_SOURCES = ("github", "prd", "github_pr")
 SOURCE_WORDS = {"game": "typed specs", "github": "GitHub issues", "jira": "Jira issues",
-                "pr_review": "PRs to review", "prd": "PRDs", "github_pr": "open PRs", "custom": "changes you describe"}
+                "pr_review": "PRs to review", "prd": "PRDs", "github_pr": "open PRs", "custom": "changes you describe",
+                "notion": "Notion pages"}
 
 
 def repo_settings(p: dict) -> dict:
@@ -108,10 +109,11 @@ RESERVED_PREFIXES = ("belt_", "return_", "rework_in_", "scrap_", "store_")
 # source (with its own search) and its intake takes crates from it. Ids are unique in the factory.
 STORE_ID = re.compile(r"^store_\d+$")
 # "custom": changes you describe in the storage's window in the game (typed specs, from that storage).
-STORE_SOURCES = ("github", "jira", "github_pr", "pr_review", "prd", "custom")
+# "notion": pages in Notion (PRDs, say), each a crate; its filter is the page or database links.
+STORE_SOURCES = ("github", "jira", "github_pr", "pr_review", "prd", "custom", "notion")
 # Storages whose own repo ("repo") is where their crates are worked on: the GitHub ones read
 # from it too; a Jira storage's crates are coded in it.
-WORK_REPO_SOURCES = ("github", "prd", "github_pr", "jira", "custom")
+WORK_REPO_SOURCES = ("github", "prd", "github_pr", "jira", "custom", "notion")
 
 
 def storages_of(p: dict) -> list[dict]:
@@ -191,7 +193,7 @@ ROW = 3  # the row the default layout puts the line on
 STRIDE = 4  # cells per belt (2) + machine (2) in the default layout
 
 
-QUERY_SOURCES = ("github", "jira", "github_pr", "pr_review")  # sources a storage can search with its own filter
+QUERY_SOURCES = ("github", "jira", "github_pr", "pr_review", "notion")  # sources a storage can search with its own filter
 
 
 def queries_of(p: dict) -> dict[str, str]:
@@ -234,9 +236,14 @@ def max_crates(p: dict) -> int:
 
 def account_of(p: dict, service: str) -> str:
     """The account a line's machines (and storages without their own pick) work as on this
-    service ("github" or "jira"): an account id, "@machine", or "" for the factory's default."""
+    service ("github", "jira" or "notion"): an account id, "@machine", or "" for the factory's default."""
     raw = p.get("accounts") if isinstance(p.get("accounts"), dict) else {}
     return str(raw.get(service) or "").strip()[:40]
+
+
+def storage_service(source: str) -> str:
+    """The accounts service a storage of this source works as: "jira", "notion" or "github"."""
+    return source if source in ("jira", "notion") else "github"
 
 
 def check_only(p: dict) -> bool:
@@ -773,7 +780,7 @@ def to_line(pipeline: dict, pipelines: list[dict] | None = None, route: dict[str
         entry = {"type": m["type"], "id": m["id"], "on_fail": "" if to_bin else fail_to,
                  "scrap_bin": to_bin, "scrap_to": fail_to if to_bin else ""}
         for key in ("name", "gate", "prompt", "timeout_seconds", "auto_approve", "scrap_when", "options", "rules",
-                    "retries", "model", "effort", "enabled"):
+                    "retries", "agent", "model", "effort", "enabled", "filter"):
             if m.get(key) not in (None, ""):
                 entry[key] = m[key]
         if is_sorter(m):  # only the outputs that have a belt can be chosen
@@ -795,17 +802,59 @@ def rules_problem(rules) -> str | None:
         if r["port"] in ports:
             return f"it has two rules for output {r['port'][-1]}"
         ports.add(r["port"])
-        value = str(r.get("value", "") or "")
-        if len(value) > 300:
-            return f"the rule on output {r['port'][-1]} is too long"
-        if r["when"] == "risk" and value.rstrip("+") not in ("low", "medium", "high"):
-            return f"the rule on output {r['port'][-1]} needs a risk (low, medium or high)"
-        if r["when"] == "result" and value.partition(":")[0].strip() not in ("pass", "fail"):
-            return f"the rule on output {r['port'][-1]} needs passed or failed"
-        if r["when"] == "size" and not value.strip().isdigit():
-            return f"the rule on output {r['port'][-1]} needs a number of changed lines"
-        if r["when"] in ("source", "repo", "text", "files") and not value.strip():
-            return f"the rule on output {r['port'][-1]} needs something to match"
+        problem = _rule_value_problem(r["when"], str(r.get("value", "") or ""))
+        if problem:
+            return f"the rule on output {r['port'][-1]} {problem}"
+    return None
+
+
+def _rule_value_problem(kind: str, value: str) -> str | None:
+    """What's wrong with a rule's value (said after "the rule ..."), or None."""
+    if len(value) > 300:
+        return "is too long"
+    if kind == "risk" and value.rstrip("+") not in ("low", "medium", "high"):
+        return "needs a risk (low, medium or high)"
+    if kind == "result" and value.partition(":")[0].strip() not in ("pass", "fail"):
+        return "needs passed or failed"
+    if kind == "size" and not value.strip().isdigit():
+        return "needs a number of changed lines"
+    if kind in ("source", "repo", "text", "files") and not value.strip():
+        return "needs something to match"
+    return None
+
+
+# A filter on a machine that can be switched off: {"match": "any" | "all", "rules": [{"when":
+# <kind>, "value": "..."}]}, with the sorter's rule kinds. Crates that match are worked on as
+# usual; the rest go straight out of its green port, as if it were switched off. No rules
+# (or no filter) means it works on every crate.
+FILTER_KINDS = tuple(k for k in RULE_KINDS if k != "otherwise")
+MAX_FILTER_RULES = 6
+
+
+def filter_rules(m: dict | None) -> list[dict]:
+    """A machine's filter rules (those with a kind), or [] when it works on every crate."""
+    f = m.get("filter") if isinstance(m, dict) else None
+    rules = f.get("rules") if isinstance(f, dict) else None
+    return [r for r in rules if isinstance(r, dict) and r.get("when")] if isinstance(rules, list) else []
+
+
+def filter_problem(f) -> str | None:
+    """What's wrong with a machine's filter, or None."""
+    if f is None or f == {}:
+        return None
+    if not isinstance(f, dict) or not isinstance(f.get("rules", []), list):
+        return "its filter is muddled"
+    if f.get("match", "any") not in ("any", "all"):
+        return "its filter must match any or all of its rules"
+    rules = [r for r in f.get("rules", []) if not (isinstance(r, dict) and not r.get("when"))]
+    if len(rules) > MAX_FILTER_RULES:
+        return f"its filter has more than {MAX_FILTER_RULES} rules"
+    for n, r in enumerate(rules, 1):
+        if not isinstance(r, dict) or r.get("when") not in FILTER_KINDS:
+            return f"its filter has a rule it doesn't understand ({r!r})"
+        problem = _rule_value_problem(r["when"], str(r.get("value", "") or ""))
+        if problem:
+            return f"filter rule {n} {problem}"
     return None
 
 
@@ -1025,6 +1074,8 @@ def _validate_pipeline(catalog: dict[str, MachineConfig], p: dict, pname: str,
     for mid in names:
         m = everywhere[mid]
         problem = rules_problem(m.get("rules")) if is_sorter(m) else None
+        if problem is None and m.get("filter") and m.get("type") in catalog and catalog[m["type"]].can_switch_off:
+            problem = filter_problem(m.get("filter"))
         if problem:
             return f"{pname}: {names[mid]}: {problem}"
 
@@ -1102,6 +1153,12 @@ def _check_path(catalog: dict[str, MachineConfig], p: dict, pname: str, order: l
                             f"fails at the {names[prev]} doesn't have what the {names[mid]} needs. Delete that red "
                             f"belt, or run it back to an earlier machine or into a bin")
             return f"{pname}: {names[mid]} needs {', '.join(need_words(n) for n in missing)} before it"
+        if base.can_switch_off:
+            for r in filter_rules(m):
+                need = RULE_NEEDS.get(r.get("when"))
+                if need and need not in have:
+                    return (f"{pname}: {names[mid]} filters by {RULE_WORDS[r['when']]}, so it needs "
+                            f"{need_words(need)} before it")
         if is_sorter(m):
             for r in m.get("rules", []) or []:
                 need = RULE_NEEDS.get(r.get("when"))

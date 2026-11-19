@@ -73,6 +73,7 @@ class Factory:
         shutil.copytree(BACKEND / "scripts", self.backend / "scripts",
                         ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copy(BACKEND / "machines.toml", self.backend / "machines.toml")
+        shutil.copytree(BACKEND / "prompts", self.backend / "prompts")
         self.state.mkdir()
         bin_dir = self.root / "bin"
         bin_dir.mkdir()

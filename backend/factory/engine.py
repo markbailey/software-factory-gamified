@@ -26,7 +26,7 @@ from typing import Awaitable, Callable
 
 from dataclasses import dataclass
 
-from . import accounts, agents, attribution, branch_names, config, formats, graph, janitor, plans, review_types, runner, stats, triage, workspace
+from . import accounts, agents, docs, paths, attribution, branch_names, config, formats, graph, janitor, plans, review_types, runner, stats, triage, workspace
 from .config import Config, MachineConfig, RepoConfig, StepConfig, is_agent_step
 from .health import AgentHealth
 from .hub import Hub
@@ -42,6 +42,15 @@ RISK_RE = re.compile(r"^RISK\s+(low|medium|high)\b\s*(.*)$", re.I)
 WAITING_RE = re.compile(r"^WAITING(?:\s+(.*))?$")
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 REVIEW_POLL_SECONDS = 20
+PR_PARTS_RE = re.compile(r"^https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+# Shipped crates' PRs are checked again until they're merged or closed: every PR_REFRESH_SECONDS,
+# and when the dashboard opens (at most once a PR_REFRESH_MIN_GAP). One GitHub call per
+# PR_BATCH PRs, so it stays cheap however many crates are waiting on a merge.
+PR_REFRESH_SECONDS = 300.0
+PR_REFRESH_MIN_GAP = 30.0
+PR_BATCH = 50
+PR_REFRESH_LIMIT = 200  # the newest this many crates with an unsettled PR
+PR_SETTLED = ("merged", "closed")
 TOOL_CHECK_SECONDS = 30  # between checks of a broken tool
 FAILURE_TAIL_LINES = 60
 FAILURE_TAIL_CHARS = 6000
@@ -124,6 +133,10 @@ BELTS_FILE = config.BACKEND_DIR / "belts.json"
 REPOS_FILE = config.BACKEND_DIR / "repos.json"  # the factory's repo list (Factory settings, Repos)
 DEFAULT_BELT_SPEED = 1.5  # cells a second
 BELT_SPEEDS = (0.5, 6.0)  # slowest and fastest you can set (faster strobes at 60 fps)
+# Longest a machine waits, past the belt time the factory already allows, for a game client to say
+# the crate has arrived (it may still be riding a long belt, or out of a storage). Keeps the
+# factory moving if a client never says so.
+ARRIVAL_WAIT_MAX = 20.0
 
 
 def _read_belt_speed() -> float:
@@ -210,10 +223,16 @@ def load_pipelines(cfg: Config) -> list[dict]:
         if not error:
             if graph.saved_version() < 6:
                 _name_old_default(cfg, saved)
+            if drop_default_prompts(cfg.catalog, saved):  # saved before prompts had their own files
+                print("[factory] machines left on their default prompt now follow backend/prompts/")
+                try:
+                    graph.write(saved)
+                except OSError as exc:
+                    print(f"[factory] could not save pipelines.json: {exc}")
             return saved
         print(f"[factory] pipelines.json is not usable ({error}); using the line instead")
     entries = [{"type": m.type, "id": m.id, "name": m.name, "gate": m.gate, "prompt": m.prompt
-                if m.has_prompt() else "", "on_fail": m.on_fail} for m in cfg.machines]
+                if m.has_prompt() and not m.is_default_prompt() else "", "on_fail": m.on_fail} for m in cfg.machines]
     pipelines = [graph.from_line(entries)]
     pipelines[0]["sources"] = ["game", "github", "jira"]
     if "doc_writer" in cfg.catalog:
@@ -290,13 +309,16 @@ class Factory:
             print(f"[factory] this line can't run until you fix it in build mode: {why}")
         self.locks = self._make_locks()  # one crate per machine at a time
         self.tasks: set[asyncio.Task] = set()
+        self.item_tasks: dict[int, asyncio.Task] = {}  # each crate's running _process, for Scrap now
+        self.running_on: dict[int, str] = {}  # crate -> the machine running its steps right now
         self.notifiers: list[Notifier] = []
         self.decisions: dict[int, asyncio.Future] = {}  # crates waiting at a gate
         self.outputs: dict[int, list[str]] = {}  # each crate's output from its current step
         self.no_rework: set[int] = set()  # crates whose failing step said NO_REWORK
         self.failed_at: dict[int, int] = {}  # crate -> index of the step that failed last
-        self.run_spend: dict[int, list] = {}  # crate -> [Claude cost, turns] of its current machine run
-        self.run_agent: dict[int, tuple[str, str]] = {}  # crate -> (model, effort) its current run's Claude used
+        self.run_spend: dict[int, list] = {}  # crate -> [agent cost, turns, tokens] of its current machine run
+        # crate -> (agent, model, effort) its current run's agent used (agents.py)
+        self.run_agent: dict[int, tuple[str, str, str]] = {}
         self.wrong_machine: dict[int, str] = {}  # crate -> machine type its last Claude reply asked for
         self.carried: dict[int, int] = {}  # crate -> times a worker carried it to another machine
         self.retried: dict[tuple[int, str], int] = {}  # (crate, machine) -> times it ran it again by itself
@@ -315,6 +337,10 @@ class Factory:
         self.belt_speed = _read_belt_speed()  # cells a second: crates ride belts at the belts' own speed
         self._pause_changed = asyncio.Event()
         self._tool_task: asyncio.Task | None = None
+        # crate -> where the game last said it finished riding to (cleared each time it moves)
+        self.settled: dict[int, str] = {}
+        self._arrivals: dict[int, asyncio.Event] = {}  # crates a machine is waiting on
+        self.arrival_wait_max = ARRIVAL_WAIT_MAX
 
     # Public ----------------------------------------------------------------
     def _use(self, pipelines: list[dict]) -> dict[str, Line]:
@@ -333,8 +359,9 @@ class Factory:
             base = self.cfg.catalog.get(m.get("type"))
             summary = base.summary() if base else {}
             if base and isinstance(m.get("options"), dict):
-                summary["options"] = {**base.options, **{k: bool(v) for k, v in m["options"].items()
-                                                         if k in base.options}}
+                summary["options"] = {**base.options, **{k: str(v) if isinstance(base.options[k], str) else bool(v)
+                                                         for k, v in m["options"].items() if k in base.options}}
+                summary["steps"] = base.step_names(summary["options"])
             machines.append({**summary, **{k: v for k, v in m.items() if v not in (None, "") and k != "options"}})
         p["machines"] = machines
         p["order"] = []
@@ -412,13 +439,14 @@ class Factory:
 
     def account_choice(self, item: dict, service: str) -> str:
         """The account a crate's machines work as on this service: the pick of the storage it came
-        out of (a Jira storage's for Jira, any other storage's for GitHub), else its line's, else
+        out of (a Jira storage's for Jira, a Notion storage's for Notion, any other storage's for
+        GitHub), else its line's, else
         "" (the factory's default)."""
         line = self.lines.get(str(item.get("pipeline") or ""))
         if line is None:
             return ""
         st = next((s for s in graph.storages_of(line.graph) if s.get("id") == item.get("storage")), {})
-        if st.get("account") and (st.get("source") == "jira") == (service == "jira"):
+        if st.get("account") and graph.storage_service(str(st.get("source", ""))) == service:
             return str(st["account"])
         return graph.account_of(line.graph, service)
 
@@ -486,6 +514,7 @@ class Factory:
         if error:
             return error
         clean = [_clean_pipeline(p) for p in pipelines]
+        drop_default_prompts(self.cfg.catalog, clean)
         old = (self.layout, self.problems)
         lines = self._use(clean)
         error = await self.prepare_repos(lines.values())
@@ -837,6 +866,8 @@ class Factory:
         """Approve, reject (send back for rework, or scrap if the machine has nowhere to send
         it) or scrap a crate waiting at a gate. Returns an error message, or None."""
         future = self.decisions.get(item_id)
+        if (future is None or future.done()) and decision == "scrap":
+            return await self.scrap_now(item_id, note)  # Scrap now: wherever it is
         if future is None or future.done():
             return f"crate #{item_id} is not waiting for approval"
         held = (self.store.get_item(item_id) or {}).get("state") == "held"
@@ -847,6 +878,45 @@ class Factory:
         if note:
             self.store.update_item(item_id, notes=note)
         future.set_result(decision)
+        return None
+
+    async def scrap_now(self, item_id: int, note: str = "") -> str | None:
+        """Scrap a crate wherever it is (on a belt, in a machine, at the intake): its work is
+        stopped, with the command it's running, and it goes into its line's scrap bin. Its PR is
+        closed if the bin's rules say so. Returns an error message, or None."""
+        try:
+            item = self.store.get_item(item_id)
+        except TypeError:
+            item = None
+        if not item:
+            return f"no crate #{item_id}"
+        if item.get("state") in ("shipped", "scrapped"):
+            return f"crate #{item_id} has already {item['state']}"
+        where = str(item.get("location", "") or "")
+        # A machine id, or "<line>@<route>:<machine>" on a line with sorters.
+        at = self.running_on.get(item_id) or where.rsplit(":", 1)[-1]
+        machine = next((m for line in self.lines.values() for m in line.machines if m.id == at), None)
+        # The machine running its steps (whatever the crate's state says): told it stopped, so
+        # the game doesn't show it working for ever.
+        running = self.running_on.get(item_id) or (machine.id if machine is not None and item.get("state") == "running" else "")
+        task = self.item_tasks.get(item_id)
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=20)
+            except BaseException:  # cancelled (or slow to stop): it's scrapped either way
+                pass
+        self.item_tasks.pop(item_id, None)
+        self.running_on.pop(item_id, None)
+        if running:
+            await self.hub.emit({"type": "job_failed", "item_id": item_id, "machine": running,
+                                 "exit_code": -1, "step": "Scrapped"})
+        if note:
+            self.store.update_item(item_id, notes=note)
+        self.store.update_item(item_id, waiting_for="")
+        name = machine.name if machine is not None else "the line"
+        await self._log(item_id, "factory", f"[factory] Scrap now: you scrapped it while it was at {name}")
+        await self._scrap(item_id, f"{name}: scrapped by you", note, "work_failed")
         return None
 
     async def retry(self, item_id: int, note: str = "") -> str | None:
@@ -940,23 +1010,40 @@ class Factory:
         await self.hub.broadcast({"type": "repos", "repos": self.repo_list()})
         return None
 
-    async def _with_agent_choice(self, item_id: int, machine: MachineConfig, resolved: list[str]) -> list[str]:
-        """A claude step's command with the machine's model and effort (or the factory default's)."""
-        default = agents.defaults()
-        model, effort = machine.model or default["model"], machine.effort or default["effort"]
-        resolved, notes = await asyncio.to_thread(agents.with_choice, resolved, model, effort)
-        self.run_agent[item_id] = agents.used_choice(resolved)
+    def agent_of(self, machine: MachineConfig) -> str:
+        """The agent (claude, gemini, antigravity, copilot) a machine's agent steps run."""
+        return agents.resolve_choice(machine.agent, machine.model, machine.effort)[0]
+
+    async def _agent_command(self, item_id: int, machine: MachineConfig, argv: list[str],
+                             stdin_text: str | None) -> tuple[str, list[str], str | None]:
+        """An agent step's command for the machine's agent, model and effort (or the factory
+        default's), resolved against the allowlist: (agent, resolved argv, stdin)."""
+        agent, model, effort = agents.resolve_choice(machine.agent, machine.model, machine.effort)
+        notes: list[str] = []
+        if agent == "claude":
+            resolved = runner.resolve(argv, self.cfg.allowed_commands)
+            resolved, notes = await asyncio.to_thread(agents.with_choice, resolved, model, effort)
+        else:
+            provider = agents.PROVIDERS[agent]
+            # The agent CLIs are allowed wherever claude is: the step is a claude step translated.
+            found = runner.resolve([provider.exe], [*self.cfg.allowed_commands, provider.exe])
+            flags = await asyncio.to_thread(agents._cli_flags, found[0])
+            translated, stdin_text, notes = agents.translate(agent, argv, stdin_text, model, effort, flags)
+            resolved = [found[0], *translated[1:]]
+        used_model, used_effort = agents.used_choice(resolved)  # what the command names ("default" if not)
+        self.run_agent[item_id] = (agent, used_model, used_effort)
         for note in notes:
             await self._log(item_id, machine.id, f"[factory] {note}")
-        if model or effort:
-            await self._log(item_id, machine.id, f"[factory] Claude: {model or 'CLI default model'}, "
+        label = agents.PROVIDERS[agent].label
+        if model or effort or agent != "claude":
+            await self._log(item_id, machine.id, f"[factory] {label}: {model or 'its default model'}, "
                             f"{effort or 'default'} effort")
-        return resolved
+        return agent, resolved, stdin_text
 
-    async def set_agent_defaults(self, model, effort) -> str | None:
-        """The factory-wide Claude model and effort under the gear: machines left on Default use it."""
+    async def set_agent_defaults(self, model, effort, agent=None) -> str | None:
+        """The factory-wide agent, model and effort under the gear: machines left on Default use it."""
         try:
-            agents.set_defaults(model, effort)
+            agents.set_defaults(model, effort, agent)
         except OSError as exc:
             return f"could not save the Claude defaults: {exc}"
         await self.hub.broadcast({"type": "agent_defaults", **agents.defaults()})
@@ -1072,6 +1159,45 @@ class Factory:
                     return max(1, len(path)) / self.belt_speed
         return None
 
+    def crate_arrived(self, item_id, location) -> None:
+        """A game client says the crate finished riding to `location`."""
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            return
+        self.settled[item_id] = str(location)
+        event = self._arrivals.get(item_id)
+        if event:
+            event.set()
+
+    async def _await_arrival(self, item_id: int) -> None:
+        """While a game client is watching, wait until it shows the crate where the factory last
+        sent it, so a machine doesn't start with the crate still on the belt. Never longer than
+        arrival_wait_max; no wait at all with no client connected."""
+        if not self.hub.arrival_clients:
+            return
+        item = self.store.get_item(item_id)
+        target = str(item.get("location", "")) if item else ""
+        if not target or self.settled.get(item_id) == target:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.arrival_wait_max
+        event = self._arrivals[item_id] = asyncio.Event()
+        try:
+            while self.settled.get(item_id) != target and self.hub.arrival_clients:
+                left = deadline - loop.time()
+                if left <= 0:
+                    print(f"[factory] crate #{item_id}: no arrival at {target} from the game; carrying on",
+                          flush=True)
+                    return
+                event.clear()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    # Wake now and then to notice the client going away.
+                    await asyncio.wait_for(event.wait(), min(left, 1.0))
+        finally:
+            if self._arrivals.get(item_id) is event:
+                del self._arrivals[item_id]
+
     async def _move(self, item_id: int, to: str, duration: float = 0.0, state: str | None = None,
                     wait: bool = True) -> None:
         if duration > 0 and ":belt_" in to:
@@ -1079,6 +1205,7 @@ class Factory:
         fields = {"location": to}
         if state:
             fields["state"] = state
+        self.settled.pop(item_id, None)  # on its way: the game says again when it gets there
         self.store.update_item(item_id, **fields)
         event = {"type": "item_moved", "item_id": item_id, "to": to, "duration": duration}
         if state:
@@ -1093,6 +1220,9 @@ class Factory:
 
     async def _process(self, item_id: int, start: int = 0, resume_gate: bool = False,
                        resume_hold: bool = False, rework: bool = False) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self.item_tasks[item_id] = task
         travel = self.cfg.travel_seconds
         line = self._line_of(self.store.get_item(item_id))
         if start == 0 and not resume_gate and not resume_hold and graph.max_crates(line.graph) > 0:
@@ -1133,6 +1263,8 @@ class Factory:
             if not (resume_gate and i == start):
                 if not await self._wait_unpaused(item_id, line, machine):
                     continue  # a new layout came while it waited: find its place in it
+                # The crate may still be riding the belt in the game (long belts, out of a storage).
+                await self._await_arrival(item_id)
             if machine.kind == "merger":
                 # Straight through: every belt in, one belt out.
                 await self._move(item_id, machine.id, 0.3, state="running")
@@ -1157,11 +1289,19 @@ class Factory:
                                  state="waiting" if i + 1 < len(machines) else "moving")
                 i += 1
                 continue
+            skip = ""  # why the machine lets this crate straight through, untouched
             if machine.switched_off:
-                # Switched off in the game: runs nothing, and the crate goes straight out of its
-                # green port, as if it passed.
-                await self._log(item_id, machine.id, f"[factory] {machine.name} is switched off; "
-                                "passing straight through")
+                skip = f"{machine.name} is switched off; passing straight through"
+            elif machine.filter and not (resume_gate and i == start):
+                hit, why = await self._filter_match(item_id, machine)
+                if hit:
+                    await self._log(item_id, machine.id, f"[factory] {machine.name}: matches its filter ({why})")
+                else:
+                    skip = f"{machine.name}: doesn't match its filter ({why}); passing straight through"
+            if skip:
+                # Switched off in the game, or the crate isn't one its filter picks: it runs
+                # nothing, and the crate goes straight out of its green port, as if it passed.
+                await self._log(item_id, machine.id, f"[factory] {skip}")
                 await self._move(item_id, machine.id, 0.3, state="running")
                 self.arrived[item_id] = ("pass", machine.id, machine.name, machine.type)
                 await self._move(item_id, belt(i + 1), travel, state="waiting" if i + 1 < len(machines) else "moving")
@@ -1210,12 +1350,16 @@ class Factory:
                         return  # rolled back into the scrap bin
                     i, rework = moved
                     continue
-                if failed is not None and self._leads_on(line, i):
-                    # Its red belt leads on: the crate carries on along it.
+                if failed is not None and self._leads_on(line, i) and await self._red_belt_allowed(item_id, line, i, *failed):
+                    # Its red belt leads on: the crate carries on along it (counted as a loop).
                     line = await self._take_red_belt(item_id, line, i, *failed)
                     machines, belt = line.machines, line.belt
-                    i, rework = i + 1, False
+                    # Work it already has (its branch, or the PR it came in with) is fixed, not
+                    # started again: first-pass-only steps such as TDD's failing tests are skipped.
+                    i, rework = i + 1, self._has_work(item_id)
                     continue
+                if failed is not None and self._leads_on(line, i):
+                    return  # round the red belt too often: _red_belt_allowed scrapped it
                 if failed is not None:
                     # Out of the machine (so the next crate can use it): scrapped, or held here.
                     if await self._scrap_or_hold(item_id, line, i, *failed) != "retry":
@@ -1358,8 +1502,9 @@ class Factory:
             await self._broadcast_tools()
 
     async def _wait_for_agent(self, item_id: int, machine: MachineConfig) -> None:
-        """Hold the crate on the belt in front of a Claude machine while Claude is unavailable."""
-        if self.health is None or self.health.available:
+        """Hold the crate on the belt in front of a Claude machine while Claude is unavailable.
+        (The check asks Claude, so machines on another agent carry on.)"""
+        if self.health is None or self.health.available or self.agent_of(machine) != "claude":
             return
         await self._log(item_id, machine.id, f"[factory] Claude is unavailable ({self.health.reason.rstrip('.')}); "
                         f"waiting here until it's back")
@@ -1379,9 +1524,7 @@ class Factory:
             self.split_turns[machine.id] = turn + 1
             return ports[turn % len(ports)], "taking turns"
         changes: tuple[list[str], int] | None = None
-        line = self.lines.get(item.get("pipeline", ""))
-        crate = dict(item, repo=item.get("repo") or (line.repo.github if line else "") or "")  # blank: the line's repo
-        crate["arrived"] = self._arrived_as(item, machine)
+        crate = self._crate_for_rules(item, machine)
         for rule in sorted(machine.rules, key=lambda r: r["port"]):
             kind, value = rule["when"], rule.get("value", "")
             if kind in ("files", "size") and changes is None:
@@ -1394,6 +1537,25 @@ class Factory:
         return None, (f"no output's rule matches this crate (risk {risk}, from {item.get('source') or 'game'}, "
                       f"repo {crate['repo'] or 'unknown'}, {arrived}). "
                       f"Change the sorter's rules, or give an output \"everything else\"")
+
+    def _crate_for_rules(self, item: dict, machine: MachineConfig) -> dict:
+        """The crate as sorter and filter rules see it: its repo (blank: the line's) and how it
+        arrived at this machine."""
+        line = self.lines.get(item.get("pipeline", ""))
+        crate = dict(item, repo=item.get("repo") or (line.repo.github if line else "") or "")
+        crate["arrived"] = self._arrived_as(item, machine)
+        return crate
+
+    async def _filter_match(self, item_id: int, machine: MachineConfig) -> tuple[bool, str]:
+        """(whether a machine's filter picks this crate, its rules in words)."""
+        item = self.store.get_item(item_id)
+        rules = machine.filter.get("rules", [])
+        changes = await self._changes(item) if any(r["when"] in ("files", "size") for r in rules) else None
+        crate = self._crate_for_rules(item, machine)
+        hits = [_rule_matches(r["when"], r.get("value", ""), crate, changes) for r in rules]
+        every = machine.filter.get("match") == "all"
+        words = (" and " if every else " or ").join(_rule_words(r["when"], r.get("value", "")) for r in rules)
+        return (all(hits) if every else any(hits)), words
 
     def _arrived_as(self, item: dict, sorter: MachineConfig) -> tuple[str, str, str, str]:
         """How a crate came into a sorter: ("pass" | "fail", machine id, name, type) of the last
@@ -1462,6 +1624,33 @@ class Factory:
                             f"[factory] already sent back {loops} times (max_rework); scrapping instead")
             return None
         return ids.index(target)
+
+    def _has_work(self, item_id: int) -> bool:
+        """The crate already has code to fix: its worktree, or a pull request (one it opened, or
+        one it came in with from an Open PRs storage)."""
+        item = self.store.get_item(item_id) or {}
+        return self._has_worktree(item_id) or bool(item.get("pr_url"))
+
+    async def _red_belt_allowed(self, item_id: int, line: Line, at: int, kind: str, reason: str,
+                                output: str) -> bool:
+        """A failed crate may ride a red belt that leads on (say Merger -> Coder for merge
+        conflicts) at most max_rework times, like a send-back. Past that it's scrapped with a
+        clear note, so a crate can't go round Coder -> ... -> Merger for ever. Counts the ride in
+        loops; returns False once it has scrapped the crate."""
+        machine = line.machines[at]
+        loops = int((self.store.get_item(item_id) or {}).get("loops", 0) or 0)
+        if loops >= self.cfg.max_rework:
+            note = (f"Scrapped: the {machine.name} failed it again ({reason}) after it had already been "
+                    f"sent round for rework {loops} times (max_rework = {self.cfg.max_rework}). "
+                    f"It needs a person to look at it.")
+            self.store.update_item(item_id, notes=note)
+            await self._log(item_id, machine.id, f"[factory] {note}")
+            await self._scrap(item_id, f"{reason}: failed {loops + 1} times, over max_rework", output, kind)
+            return False
+        self.store.update_item(item_id, loops=loops + 1)
+        await self._log(item_id, machine.id, f"[factory] rework {loops + 1} of {self.cfg.max_rework} "
+                        f"(after that it goes to the scrap bin)")
+        return True
 
     def _leads_on(self, line: Line, at: int) -> bool:
         """Does machine `at`'s red belt lead on (not back for rework, not into a bin)?"""
@@ -1659,6 +1848,93 @@ class Factory:
 
         if todo:
             self._spawn(run())
+
+    def _unsettled_prs(self) -> dict[str, list[int]]:
+        """PR url -> crates (out of the line) whose PR wasn't merged or closed when last checked."""
+        out: dict[str, list[int]] = {}
+        for i in self.store.list_items(log_tail=0):
+            url = str(i.get("pr_url") or "")
+            if url and i["state"] not in janitor.LIVE and str(i.get("pr_state") or "").lower() not in PR_SETTLED:
+                out.setdefault(url, []).append(int(i["id"]))
+        return dict(list(out.items())[-PR_REFRESH_LIMIT:])
+
+    async def refresh_pr_states(self, force: bool = False) -> int:
+        """Check again the PRs of crates that shipped (or were scrapped) with a PR that was still
+        open, so the dashboard shows Merged or Closed once someone merges or closes it on GitHub.
+        Batched: one GitHub call for up to PR_BATCH PRs. Returns how many crates changed."""
+        loop = asyncio.get_running_loop()
+        if not force and loop.time() - getattr(self, "_pr_refreshed_at", -1e9) < PR_REFRESH_MIN_GAP:
+            return 0
+        self._pr_refreshed_at = loop.time()
+        todo = self._unsettled_prs()
+        if not todo:
+            return 0
+        urls = list(todo)
+        states: dict[str, str] = {}
+        for start in range(0, len(urls), PR_BATCH):
+            chunk = urls[start:start + PR_BATCH]
+            try:
+                states.update(await asyncio.to_thread(self._pr_states_batch, chunk))
+            except Exception as exc:  # gh down or no GraphQL: leave them as they were, try next time
+                print(f"[factory] couldn't check {len(chunk)} PR(s) on GitHub: {exc}")
+        changed = 0
+        for url, state in states.items():
+            if not state or state == "unknown":
+                continue
+            for item_id in todo.get(url, []):
+                item = self.store.get_item(item_id)
+                if not item or str(item.get("pr_state") or "").lower() == state:
+                    continue
+                self.store.update_item(item_id, pr_state=state)
+                await self.hub.emit({"type": "pr_state", "item_id": item_id, "url": url, "state": state})
+                changed += 1
+        if changed:
+            print(f"[factory] {changed} shipped crate(s) have a PR that's now merged or closed")
+        return changed
+
+    async def poll_pr_states(self, seconds: float = PR_REFRESH_SECONDS, first_delay: float | None = None) -> None:
+        """Forever: refresh_pr_states every `seconds` (the first after first_delay, if given)."""
+        delay = seconds if first_delay is None else first_delay
+        while True:
+            await asyncio.sleep(delay)
+            delay = seconds
+            try:
+                await self.refresh_pr_states(force=True)
+            except Exception as exc:
+                print(f"[factory] checking shipped crates' PRs failed: {exc}")
+
+    def _pr_states_batch(self, urls: list[str]) -> dict[str, str]:
+        """url -> "open", "merged" or "closed" for each GitHub PR url, in one gh api graphql call.
+        A url that isn't a GitHub PR, or that GitHub doesn't know, is left out."""
+        parts: list[str] = []
+        aliases: dict[str, str] = {}
+        for n, url in enumerate(urls):
+            m = PR_PARTS_RE.match(url.strip())
+            if not m:
+                continue
+            owner, name, number = m.group(1), m.group(2), int(m.group(3))
+            alias = f"p{n}"
+            aliases[alias] = url
+            parts.append(f'{alias}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) '
+                         f'{{ pullRequest(number: {number}) {{ state }} }}')
+        if not parts:
+            return {}
+        query = "query { " + " ".join(parts) + " }"
+        argv = runner.resolve(["gh", "api", "graphql", "-f", f"query={query}"], self.cfg.allowed_commands)
+        r = subprocess.run(argv, cwd=self.cfg.workspace, capture_output=True, text=True, encoding="utf-8", timeout=60)
+        # GraphQL answers what it can even when one PR is missing (with errors beside the data).
+        try:
+            data = (json.loads(r.stdout or "{}") or {}).get("data") or {}
+        except ValueError:
+            data = {}
+        if r.returncode != 0 and not data:
+            raise RuntimeError((r.stderr or r.stdout).strip() or f"gh exited {r.returncode}")
+        out: dict[str, str] = {}
+        for alias, url in aliases.items():
+            pr = ((data.get(alias) or {}).get("pullRequest") or {})
+            if pr.get("state"):
+                out[url] = str(pr["state"]).lower()
+        return out
 
     async def _stamp_pr_state(self, item_id: int) -> None:
         """A shipping crate's PR as it really is on GitHub (merged, open or closed), so the dock
@@ -1965,7 +2241,7 @@ class Factory:
                            rework: bool = False) -> tuple[bool, str, str]:
         """Run a machine's steps, and record the run: how long it took, what Claude cost."""
         started = time.time()
-        self.run_spend[item_id] = [0.0, 0]
+        self.run_spend[item_id] = [0.0, 0, 0]
         self.run_agent.pop(item_id, None)
         outcome, failed_step = "stopped", ""
         try:
@@ -1973,11 +2249,13 @@ class Factory:
             outcome = "ok" if ok else "failed"
             return ok, failed_step, output
         finally:
-            cost, turns = self.run_spend.pop(item_id, [0.0, 0])
-            model, effort = self.run_agent.pop(item_id, ("", ""))
+            self.running_on.pop(item_id, None)
+            cost, turns, tokens = self.run_spend.pop(item_id, None) or [0.0, 0, 0]
+            agent, model, effort = self.run_agent.pop(item_id, ("", "", ""))
             item = self.store.get_item(item_id) or {}
             self.store.record_run(item_id, str(item.get("pipeline", "")), machine.id, machine.type, started,
-                                  outcome, failed_step if outcome == "failed" else "", cost, turns, model, effort)
+                                  outcome, failed_step if outcome == "failed" else "", cost, turns, model, effort,
+                                  agent=agent, tokens=tokens)
             if outcome != "stopped":
                 await self.hub.emit({"type": "item_cost", "item_id": item_id, **self._cost_of(item_id)})
 
@@ -2029,6 +2307,7 @@ class Factory:
         """Run a machine's steps. Returns (ok, failed step name, the output tail of the failed
         step, or of the last step when all passed)."""
         steps = machine.steps
+        self.running_on[item_id] = machine.id  # for Scrap now: the machine to stop
         await self.hub.emit({"type": "job_started", "item_id": item_id, "machine": machine.id,
                              "command": [s.name for s in steps]})
         values = self._values(self.store.get_item(item_id), machine)
@@ -2059,7 +2338,8 @@ class Factory:
                 await self._log(item_id, machine.id, f"[factory] not {machine.name} work; skipping its other steps")
                 self.outputs.pop(item_id, None)
                 return False, step.name, ""
-            if code != 0 and is_agent_step(step) and self.health and not await self.health.check_now():
+            if (code != 0 and is_agent_step(step) and self.health and self.agent_of(machine) == "claude"
+                    and not await self.health.check_now()):
                 # Claude went away mid-step: not the crate's fault. Run the step again later.
                 await self._log(item_id, machine.id, f"[factory] Claude is unavailable ({self.health.reason.rstrip('.')}); "
                                 f"'{step.name}' will run again when it's back")
@@ -2100,19 +2380,22 @@ class Factory:
         total = len(machine.steps)
         argv = [expand(part, values) for part in step.command]
         cwd = Path(expand(step.cwd, values))
-        stdin_text = expand(step.stdin, values) if step.stdin is not None else None
+        stdin_text = expand(step.stdin_text(), values) if step.stdin is not None else None
         if stdin_text is not None and is_agent_step(step) and machine.type in self.cfg.catalog:
             stdin_text += self._wrong_machine_hint(machine)
         self.wrong_machine.pop(item_id, None)
         fmt = formats.FORMATTERS.get(step.log_format, formats.FORMATTERS["text"])
+        parser = None  # an agent step's output reader (agents.py)
         log = lambda line: self._log(item_id, machine.id, line)  # noqa: E731
 
         await log(f"== {machine.name} {index + 1}/{total}: {step.name} ==")
         await log("$ " + " ".join(argv))
         try:
-            resolved = runner.resolve(argv, self.cfg.allowed_commands)
             if is_agent_step(step):
-                resolved = await self._with_agent_choice(item_id, machine, resolved)
+                agent, resolved, stdin_text = await self._agent_command(item_id, machine, argv, stdin_text)
+                parser = agents.parser_for(agent)
+            else:
+                resolved = runner.resolve(argv, self.cfg.allowed_commands)
             if not cwd.is_dir():
                 raise FileNotFoundError(f"working folder does not exist: {cwd}")
             repo = self.repo_of(self.store.get_item(item_id)).path
@@ -2156,21 +2439,28 @@ class Factory:
                 return
             if sniff_pr:
                 pr_urls.extend(PR_URL_RE.findall(line))
-            if step.log_format == "claude-stream-json" and '"type":"result"' in line.replace(" ", ""):
-                with contextlib.suppress(ValueError, TypeError, AttributeError):
-                    result = json.loads(line)
-                    spend = self.run_spend.setdefault(item_id, [0.0, 0])
-                    spend[0] += float(result.get("total_cost_usd") or 0)
-                    spend[1] += int(result.get("num_turns") or 0)
-                with contextlib.suppress(ValueError, AttributeError):
-                    values["agent_result"] = str(json.loads(line).get("result", "")).strip()
-                    self.store.update_item(item_id, review=values["agent_result"])
-                    wanted = self._wanted_type(values["agent_result"], machine)
-                    if wanted:
-                        self.wrong_machine[item_id] = wanted
-            for out in fmt(line):
+            if parser is not None:
+                had = parser.result
+                shown = parser.feed(line)
+                if parser.result is not None and parser.result is not had:
+                    take_result(parser.result)
+            else:
+                shown = fmt(line)
+            for out in shown:
                 output.append(out)
                 await log(out)
+
+        def take_result(result: agents.Result) -> None:
+            """The agent's final answer: what it cost, and the text later steps use."""
+            spend = self.run_spend.setdefault(item_id, [0.0, 0, 0])
+            spend[0] += result.cost_usd
+            spend[1] += result.turns
+            spend[2] += result.tokens
+            values["agent_result"] = result.text
+            self.store.update_item(item_id, review=values["agent_result"])
+            wanted = self._wanted_type(values["agent_result"], machine)
+            if wanted:
+                self.wrong_machine[item_id] = wanted
 
         if step.cwd.strip() == "{repo}":
             # The shared checkout (fetch, worktree add): one git command at a time in it, so
@@ -2181,6 +2471,8 @@ class Factory:
         else:
             code = await runner.run(resolved, cwd, on_line, stdin_text=stdin_text, timeout=step.timeout_seconds,
                                     env=self.account_env(item_id))
+        if parser is not None and parser.result is None and parser.finish() is not None:
+            take_result(parser.result)  # an agent that printed its answer as plain text
         if (self.store.get_item(item_id) or {}).get("waiting_for"):
             await self._set_waiting(item_id, machine.id, "")
         if code == 0 and step.save_result_as == "pr_body" and values.get("agent_result", "").strip():
@@ -2248,7 +2540,8 @@ class Factory:
             "base": base,
             "base_ref": f"origin/{base}" if repo.remote else base,
             # A Document writer before the Packager writes these; otherwise the plain ones.
-            "pr_title": (item.get("pr_title") or "").strip() or f"Crate #{item_id}: {summary}",
+            # Led by the crate's ticket (ABC-123 or #12) when it has one; never the crate number.
+            "pr_title": _pr_title(item, summary),
             "pr_body": attribution.with_line(
                 ((item.get("pr_body") or "").strip() + "\n\n" + _pr_links(item)).strip()
                 if (item.get("pr_body") or "").strip() else _pr_body(item), attrib["pr"]),
@@ -2271,7 +2564,7 @@ class Factory:
             "risk_note": (f"The Risk analyser rated this change {item['risk']} risk"
                           + (f": {item['risk_reason']}" if item.get("risk_reason") else ".")
                           if item.get("risk") else ""),
-            "python": sys.executable,
+            "python": paths.python_command(),
             "scripts": str(self.cfg.scripts_dir),
             "source": item.get("source", "") or "game",
             "source_ref": item.get("source_ref", "") or "",
@@ -2299,10 +2592,15 @@ class Factory:
         if "review_type" in machine.options:  # the Reviewer: what kind of review, and the files it reads
             values["review_focus"] = review_types.focus(machine.options)
             values["reference_files"] = review_types.reference_files(machine.options)
-        prompt = machine.prompt
+        prompt = machine.current_prompt()  # a default prompt is read from its file each run
         if values.get("review_focus") and "{review_focus}" not in prompt:  # a prompt saved before review types
             prompt = prompt.rstrip() + "\n\n{review_focus}\n"
+        # The reference docs this machine reads (its "Reference docs" setting; docs.toml), from the cache.
+        values["reference_docs"] = docs.reference_context(machine.type or machine.id,
+                                                          str(machine.options.get("reference_docs") or ""))
         values["prompt"] = expand(prompt, values).strip() + "\n"
+        if values["reference_docs"] and "{reference_docs}" not in prompt:
+            values["prompt"] += "\n" + values["reference_docs"] + "\n"
         return values
 
 
@@ -2406,6 +2704,29 @@ def _split_pr_text(text: str) -> tuple[str, str]:
     return title, "\n".join(lines).strip()
 
 
+def _ticket(item: dict) -> str:
+    """The crate's ticket as people know it: the Jira key (ABC-123) or the GitHub issue (#12), or ""."""
+    ref = str(item.get("source_ref") or "").strip()
+    if not ref:
+        return ""
+    if item.get("source") == "jira":
+        return ref
+    if item.get("source") == "github":
+        return "#" + ref.rsplit("#", 1)[-1].lstrip("#")
+    return ""
+
+
+def _pr_title(item: dict, summary: str) -> str:
+    """The PR title: a Document writer's, else the spec's first line, led by the ticket if there is
+    one ("ABC-123: Fix the login"). Crate numbers stay out: the factory finds its PRs by their link
+    and branch, not their title."""
+    title = (item.get("pr_title") or "").strip() or summary.strip() or "Software Factory change"
+    ticket = _ticket(item)
+    if ticket and not re.search(r"(?<![\w-])" + re.escape(ticket) + r"(?![\w-])", title, re.IGNORECASE):
+        title = f"{ticket}: {title}"
+    return title
+
+
 def _pr_body(item: dict) -> str:
     """The PR body when the repo has no PR template."""
     lines = ["Opened by the Software Factory.", "", "## Spec", "", item["text"].strip(), ""]
@@ -2458,10 +2779,23 @@ def _pr_template(worktree: Path) -> str:
     return ""
 
 
+def drop_default_prompts(catalog: dict[str, MachineConfig], pipelines: list) -> bool:
+    """Take out of saved machines a prompt that is just their type's default, so they keep
+    following its file in backend/prompts/ (edits there then reach them). True if any changed."""
+    changed = False
+    for p in pipelines:
+        for m in (p.get("machines") or []) if isinstance(p, dict) else []:
+            base = catalog.get(m.get("type")) if isinstance(m, dict) else None
+            if base and m.get("prompt") and (not base.has_prompt() or base.is_default_prompt(str(m["prompt"]))):
+                del m["prompt"]
+                changed = True
+    return changed
+
+
 def _clean_pipeline(p: dict) -> dict:
     """Keep only the fields a pipeline is saved with (the game sends extra drawing details)."""
     machine_keys = ("id", "type", "name", "pos", "gate", "prompt", "timeout_seconds", "auto_approve", "scrap_when",
-                    "options", "rules", "retries", "model", "effort")
+                    "options", "rules", "retries", "agent", "model", "effort", "filter")
     # "enabled": false only, on a machine you switched off (one whose type can be).
     off = {"enabled": False}
     return {
@@ -2483,8 +2817,8 @@ def _clean_pipeline(p: dict) -> dict:
         **({"repo": graph.repo_settings(p)} if graph.repo_settings(p) else {}),
         **({"queries": graph.queries_of(p)} if graph.queries_of(p) and "storages" not in p else {}),
         **({"check_only": True} if graph.check_only(p) else {}),
-        **({"accounts": {k: graph.account_of(p, k) for k in ("github", "jira") if graph.account_of(p, k)}}
-           if any(graph.account_of(p, k) for k in ("github", "jira")) else {}),
+        **({"accounts": {k: graph.account_of(p, k) for k in ("github", "jira", "notion") if graph.account_of(p, k)}}
+           if any(graph.account_of(p, k) for k in ("github", "jira", "notion")) else {}),
         **({"max_crates": graph.max_crates(p)} if graph.max_crates(p) else {}),
         "bins": [{"id": str(b["id"]), "pos": list(b["pos"]), **_rot(b), **_bin_extras(b)} for b in p.get("bins", [])],
         **({"docks": [{"id": str(d["id"]), "pos": list(d["pos"]), **_rot(d)} for d in p.get("docks", [])]} if p.get("docks") else {}),

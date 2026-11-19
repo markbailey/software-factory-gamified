@@ -4,6 +4,7 @@
 [defaults]
 github = "factory-bot"   # the account each service uses unless a line or storage picks another;
 jira = "acme"            # "" or "@machine" for this machine's own sign-in
+notion = "docs"
 
 [[github]]
 id = "factory-bot"
@@ -18,3 +19,9 @@ name = "Acme Jira bot"
 base_url = ""    # e.g. https://your-site.atlassian.net
 email = ""       # the Atlassian account's email
 token = ""       # its API token (id.atlassian.com > Security > API tokens)
+
+[[notion]]
+id = "docs"
+name = "Docs bot"
+token = ""       # a Notion internal integration's secret (notion.so/profile/integrations); share
+                 # each page or database with it (the page's ... menu > Connections)

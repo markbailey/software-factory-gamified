@@ -10,12 +10,14 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import paths, prompts
+
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover
     import tomli as tomllib
 
-BACKEND_DIR = Path(__file__).resolve().parent.parent
+BACKEND_DIR = paths.BACKEND_DIR  # beside the exe when built with build_exe.py
 DEFAULT_CONFIG = BACKEND_DIR / "factory.toml"
 CATALOG_FILE = BACKEND_DIR / "machines.toml"
 LINE_FILE = BACKEND_DIR / "line.json"
@@ -42,6 +44,13 @@ class StepConfig:
     # a placeholder's name (not empty), e.g. "pr_template". "!name" means while it's off or
     # empty, and "a,b" means both.
     when: str = ""
+    # stdin_file = "coder/write_tests.md" in machines.toml: stdin comes from that file under
+    # backend/prompts/, read again each run (see prompts.py); stdin holds its text at start.
+    stdin_file: str = ""
+
+    def stdin_text(self) -> str | None:
+        """What the step sends on stdin now (its prompt file as it is now, if it has one)."""
+        return prompts.read(self.stdin_file, self.stdin or "") if self.stdin_file else self.stdin
 
 
 # What a machine can need before it, in words for "needs X before it". A need written
@@ -69,6 +78,11 @@ class MachineConfig:
     name: str
     steps: list[StepConfig] = field(default_factory=list)
     prompt: str = "{text}"
+    # prompt_file = "coder/prompt.md" in machines.toml: the default prompt is that file under
+    # backend/prompts/ (see prompts.py), and default_prompt is its text at start. While prompt is
+    # still the default (not one you edited in the game), the file is read again on each run.
+    prompt_file: str = ""
+    default_prompt: str = ""
     # After its steps, a gate machine holds the crate until you approve or reject it.
     gate: bool = False
     # Whether you choose that in the game: "choice" (the "wait for my approval" tick), "always"
@@ -105,6 +119,9 @@ class MachineConfig:
     # its green port.
     can_switch_off: bool = False
     switched_off: bool = False
+    # Only for types that can be switched off: {"match": "any" | "all", "rules": [{"when", "value"}]}
+    # (graph.filter_problem). Crates that don't match pass straight through. Empty: every crate.
+    filter: dict = field(default_factory=dict)
     # Scrapping: a machine only drops a crate in the scrap bin when its fail belt runs to the
     # bin (scrap_bin) and the reason is one of scrap_when (triage kinds). Any other crate it
     # can't send back is held at the machine until you run it again or scrap it.
@@ -128,27 +145,36 @@ class MachineConfig:
     prompt_label: str = ""
     prompt_when: str = ""
     prompt_notes: dict[str, str] = field(default_factory=dict)
-    # The Claude model and effort level its claude steps use, picked in the game (agents.py).
-    # "" follows the factory-wide default under the gear.
+    # The agent (claude, gemini, antigravity, copilot), model and effort level its agent steps
+    # use, picked in the game (agents.py). "" follows the factory-wide default under the gear.
+    agent: str = ""
     model: str = ""
     effort: str = ""
+
+    def step_names(self, options: dict | None = None) -> list[str]:
+        """The names of the steps the game lists: all of them, less those its settings turn off
+        (e.g. a Coder in TDD mode doesn't list "Write code" or "Write tests")."""
+        options = self.options if options is None else options
+        return [s.name for s in self.steps if step_on_for(s.when, options)]
 
     def summary(self) -> dict:
         """What the game needs to know about this machine."""
         return {"id": self.id, "type": self.type, "name": self.name, "description": self.description,
-                "sprite": self.sprite, "steps": [s.name for s in self.steps], "gate": self.gate,
+                "sprite": self.sprite, "steps": self.step_names(), "gate": self.gate,
+                "step_list": [{"name": s.name, "when": s.when} for s in self.steps],
                 "gate_setting": self.gate_setting,
-                "prompt": self.prompt if self.has_prompt() else "", "has_prompt": self.has_prompt(),
+                "prompt": self.current_prompt() if self.has_prompt() else "", "has_prompt": self.has_prompt(),
                 "needs": self.needs, "provides": self.provides, "unique": self.unique,
                 "on_fail": self.on_fail, "uses_agent": self.uses_agent(), "parallel": self.parallel,
                 "rework_here": self.rework_here,
                 "auto_approve": self.auto_approve, "can_auto_approve": self.can_auto_approve,
                 "can_switch_off": self.can_switch_off, "switched_off": self.switched_off,
+                "can_filter": self.can_switch_off, "filter": self.filter,
                 "scrap_bin": self.scrap_bin, "scrap_when": self.scrap_when,
                 "option_specs": self.option_specs, "options": self.options,
                 "sorter": self.sorter, "rules": self.rules, "kind": self.kind,
                 "prompt_label": self.prompt_label, "prompt_when": self.prompt_when,
-                "prompt_notes": self.prompt_notes, "model": self.model, "effort": self.effort}
+                "prompt_notes": self.prompt_notes, "agent": self.agent, "model": self.model, "effort": self.effort}
 
     def uses_agent(self) -> bool:
         """True if one of its steps runs Claude (so it pauses while Claude is unavailable)."""
@@ -156,6 +182,19 @@ class MachineConfig:
 
     def has_prompt(self) -> bool:
         return any("{prompt}" in (st.stdin or "") for st in self.steps)
+
+    def is_default_prompt(self, text: str | None = None) -> bool:
+        """Whether text (default: this machine's prompt) is its type's default prompt, as it was
+        at start or as its file is now."""
+        text = self.prompt if text is None else text
+        return prompts.same(text, self.default_prompt) or bool(
+            self.prompt_file and prompts.same(text, prompts.read(self.prompt_file, self.default_prompt)))
+
+    def current_prompt(self) -> str:
+        """The prompt to use now: yours if you edited it in the game, else its file as it is now."""
+        if self.prompt_file and prompts.same(self.prompt, self.default_prompt):
+            return prompts.read(self.prompt_file, self.default_prompt)
+        return self.prompt
 
 
 # What a scrapped crate's issue is labelled with when it's handed back, by scrap kind
@@ -291,7 +330,8 @@ def _step(raw: dict) -> StepConfig:
         name=raw["name"],
         command=list(raw["command"]),
         cwd=raw.get("cwd", "{worktree}"),
-        stdin=raw.get("stdin"),
+        stdin=prompts.load(str(raw["stdin_file"])) if raw.get("stdin_file") else raw.get("stdin"),
+        stdin_file=str(raw.get("stdin_file", "")),
         log_format=raw.get("log_format", "text"),
         timeout_seconds=float(raw.get("timeout_seconds", 900)),
         allow_failure=bool(raw.get("allow_failure", False)),
@@ -301,12 +341,27 @@ def _step(raw: dict) -> StepConfig:
     )
 
 
+# Every machine that runs an agent gets this setting: the reference docs it reads (docs.py).
+REFERENCE_DOCS_OPTION = {"id": "reference_docs", "label": "Reference docs", "type": "text", "default": "",
+                         "placeholder": "docs.toml library ids, e.g. guidelines (blank: its defaults; none: none)"}
+
+
 def _machine(raw: dict) -> MachineConfig:
+    m = _machine_base(raw)
+    if m.uses_agent() and "reference_docs" not in m.options:
+        m.option_specs.append(dict(REFERENCE_DOCS_OPTION))
+        m.options["reference_docs"] = ""
+    return m
+
+
+def _machine_base(raw: dict) -> MachineConfig:
     return MachineConfig(
         id=raw["id"],
         name=raw["name"],
         steps=[_step(s) for s in raw.get("steps", [])],
-        prompt=raw.get("prompt", "{text}"),
+        prompt=(prompt := prompts.load(str(raw["prompt_file"])) if raw.get("prompt_file") else raw.get("prompt", "{text}")),
+        prompt_file=str(raw.get("prompt_file", "")),
+        default_prompt=prompt,
         gate=bool(raw.get("gate", False)) if raw.get("gate_setting") != "never" else False,
         gate_setting=raw.get("gate_setting") if raw.get("gate_setting") in ("always", "never") else "choice",
         parallel=bool(raw.get("parallel", False)),
@@ -423,8 +478,8 @@ def build_line(catalog: dict[str, MachineConfig], entries: list[dict]) -> list[M
         if "gate" in entry and m.gate_setting == "choice":
             m.gate = bool(entry["gate"])
             m.github_review = m.github_review and m.gate
-        if entry.get("prompt") and m.has_prompt():
-            m.prompt = str(entry["prompt"])
+        if entry.get("prompt") and m.has_prompt() and not m.is_default_prompt(str(entry["prompt"])):
+            m.prompt = str(entry["prompt"])  # edited in the game (a copy of the default follows its file)
         if "on_fail" in entry:
             m.on_fail = str(entry["on_fail"] or "")
         if "auto_approve" in entry:
@@ -432,6 +487,7 @@ def build_line(catalog: dict[str, MachineConfig], entries: list[dict]) -> list[M
         if not (m.can_auto_approve and m.gate):
             m.auto_approve = ""
         m.switched_off = m.can_switch_off and entry.get("enabled", True) is False
+        m.filter = _filter(entry.get("filter")) if m.can_switch_off else {}
         m.scrap_bin = bool(entry.get("scrap_bin", False))
         m.scrap_to = str(entry.get("scrap_to") or "scrap")
         if isinstance(entry.get("options"), dict):
@@ -459,10 +515,11 @@ def build_line(catalog: dict[str, MachineConfig], entries: list[dict]) -> list[M
             m.retries = 0
         if m.uses_agent():
             from . import agents  # agents imports config
+            m.agent = agents.clean_agent(entry.get("agent", m.agent))
             m.model = agents.clean_model(entry.get("model", m.model))
             m.effort = agents.clean_effort(entry.get("effort", m.effort))
         else:
-            m.model = m.effort = ""
+            m.agent = m.model = m.effort = ""
         if entry.get("timeout_seconds"):
             for st in m.steps:  # one limit for each of the machine's steps, set in the game
                 st.timeout_seconds = float(entry["timeout_seconds"])
@@ -547,3 +604,36 @@ def load(path: Path = DEFAULT_CONFIG) -> Config:
             cfg.github, enabled=True, label=str(prd.get("label", "prd")),
             poll_seconds=float(prd.get("poll_seconds", cfg.github.poll_seconds)))
     return cfg
+
+
+def _filter(raw) -> dict:
+    """A machine's saved filter, cleaned up: {} when it has no rules (it works on every crate)."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("rules"), list):
+        return {}
+    rules = [{"when": str(r.get("when", "")), "value": str(r.get("value", "") or "").strip()}
+             for r in raw["rules"] if isinstance(r, dict) and r.get("when")]
+    if not rules:
+        return {}
+    return {"match": "all" if raw.get("match") == "all" else "any", "rules": rules}
+
+
+def step_on_for(when: str, options: dict) -> bool:
+    """Whether a step with this `when` can run with these machine options. Only terms naming one
+    of the options count; placeholders (known only once a crate is there) count as on. Matches
+    engine._skip_reason."""
+    for term in [t.strip() for t in (when or "").split(",") if t.strip()]:
+        negate = term.startswith("!")
+        name = term.lstrip("!")
+        wanted = None
+        if "=" in name:
+            name, _, wanted = name.partition("=")
+            name = name.strip()
+        if name not in options:
+            continue
+        if wanted is not None:
+            on = str(options[name]).strip() in [w.strip() for w in wanted.split("|")]
+        else:
+            on = bool(options[name])
+        if on == negate:
+            return False
+    return True

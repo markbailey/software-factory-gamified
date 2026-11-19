@@ -1,4 +1,4 @@
-"""The factory's own accounts: any number of named GitHub accounts and Jira accounts, so the
+"""The factory's own accounts: any number of named GitHub, Jira and Notion accounts, so the
 factory can work as bot accounts instead of whoever is signed in on this machine, and different
 lines or storages can work as different accounts.
 
@@ -6,7 +6,8 @@ They live in backend/accounts.toml, which is gitignored; tokens are never sent t
 only learns whether one is set). Choosing an account, in a line's settings or a storage's:
     ""          the factory's default for that service (set in the Accounts window)
     "@machine"  this machine's own sign-in (gh auth login, git's credential manager, the
-                JIRA_API_TOKEN variable with factory.toml's site and email)
+                JIRA_API_TOKEN variable with factory.toml's site and email, the NOTION_TOKEN
+                variable)
     an id       that account (one that's since been removed means the default)
 
 A command run as a GitHub account gets GH_TOKEN, a git credential helper for github.com that hands
@@ -38,8 +39,11 @@ ACCOUNTS_FILE = BACKEND_DIR / "accounts.toml"
 MACHINE = "@machine"
 GITHUB_HELPER_KEY = "credential.https://github.com.helper"
 PLACEHOLDER_SITES = ("your-site.atlassian.net",)
-SERVICES = ("github", "jira")
-FIELDS = {"github": ("token", "git_name", "git_email"), "jira": ("base_url", "email", "token")}
+SERVICES = ("github", "jira", "notion")
+FIELDS = {"github": ("token", "git_name", "git_email"), "jira": ("base_url", "email", "token"),
+          "notion": ("token",)}
+# The env var a Notion token is read from for this machine's own sign-in ("@machine").
+NOTION_TOKEN_ENV = "NOTION_TOKEN"
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 # The env var a Jira token is handed to scripts in (verify_issue.py, label_issue.py).
 JIRA_TOKEN_VAR = "FACTORY_JIRA_TOKEN"
@@ -53,7 +57,7 @@ _current: dict = {}  # the accounts in use (load() result)
 
 
 def empty() -> dict:
-    return {"github": [], "jira": [], "defaults": {"github": "", "jira": ""}}
+    return {"github": [], "jira": [], "notion": [], "defaults": {"github": "", "jira": "", "notion": ""}}
 
 
 def _slug(name: str, taken: set[str]) -> str:
@@ -118,7 +122,8 @@ def save(accounts: dict, path: Path | None = None) -> None:
              '# defaults: the account each service uses unless a line or storage picks another; "" or',
              '# "@machine" for this machine\'s own sign-in.', "",
              "[defaults]", f"github = {q(accounts['defaults'].get('github', ''))}",
-             f"jira = {q(accounts['defaults'].get('jira', ''))}", ""]
+             f"jira = {q(accounts['defaults'].get('jira', ''))}",
+             f"notion = {q(accounts['defaults'].get('notion', ''))}", ""]
     for service in SERVICES:
         for acc in accounts.get(service, []):
             lines.append(f"[[{service}]]")
@@ -247,6 +252,24 @@ def jira_ready(creds: JiraCreds) -> str:
             " in Accounts (the gear in the top bar), or pick another Jira account.")
 
 
+def notion_token(choice: str = "") -> str:
+    """The Notion integration token a choice means: the account's, or for this machine's own
+    sign-in the NOTION_TOKEN variable."""
+    acc = account("notion", choice)
+    if acc is None:
+        return os.environ.get(NOTION_TOKEN_ENV, "")
+    return acc.get("token", "")
+
+
+def notion_ready(choice: str = "") -> str:
+    """"" if there's a Notion token to use, or what's missing."""
+    if notion_token(choice):
+        return ""
+    who = label("notion", choice)
+    return (f"Notion isn't set up for {who}: add an integration token in Accounts (the gear in the top bar), "
+            "or pick another Notion account.")
+
+
 def jira_env(choice: str = "") -> dict[str, str | None]:
     return {JIRA_TOKEN_VAR: jira_creds(choice).token or None}
 
@@ -280,6 +303,17 @@ def use(accounts: dict, jira: JiraIntakeConfig) -> None:
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+            if v == "" and os.name == "nt":
+                _keep_empty(k)
+
+
+def _keep_empty(name: str) -> None:
+    """Windows' C runtime deletes a variable set to "" (os.environ keeps it, the real process
+    environment doesn't), so a child that inherits the environment (subprocess without env=)
+    saw GIT_CONFIG_COUNT but no GIT_CONFIG_VALUE_<n> and git died: "missing config value".
+    Put the empty value into the process environment directly."""
+    import ctypes
+    ctypes.windll.kernel32.SetEnvironmentVariableW(name, "")
 
 
 def summary(accounts: dict) -> dict:
@@ -292,9 +326,12 @@ def summary(accounts: dict) -> dict:
         "jira": [{"id": a["id"], "name": a["name"], "token_set": bool(a.get("token")),
                   "base_url": a.get("base_url", ""), "email": a.get("email", "")}
                  for a in accounts.get("jira", [])],
+        "notion": [{"id": a["id"], "name": a["name"], "token_set": bool(a.get("token"))}
+                   for a in accounts.get("notion", [])],
         "defaults": dict(accounts.get("defaults", {})),
         "machine": {"jira_site": machine.base_url, "jira_email": machine.email,
-                    "jira_ready": jira_ready(machine) == ""},
+                    "jira_ready": jira_ready(machine) == "",
+                    "notion_ready": bool(os.environ.get(NOTION_TOKEN_ENV))},
         "file": str(ACCOUNTS_FILE),
     }
 
@@ -331,9 +368,23 @@ def _check_jira(choice: str) -> dict:
     return {"ok": True, "login": name, "message": f"Signed in to {creds.base_url} as {name}."}
 
 
+def _check_notion(choice: str) -> dict:
+    missing = notion_ready(choice)
+    if missing:
+        return {"ok": False, "message": missing}
+    from .docs import NotionAdapter
+    try:
+        name = NotionAdapter(notion_token(choice)).whoami()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"Could not sign in to Notion: {exc}"[:400]}
+    return {"ok": True, "login": name, "message": f"Signed in to Notion as {name}."}
+
+
 def check(accounts: dict) -> dict:
     """Who each account (and this machine's sign-in) is on its service (blocking: run in a thread)."""
     return {"github": {a["id"]: _check_github(a["id"]) for a in accounts.get("github", [])} |
                       {MACHINE: _check_github(MACHINE)},
             "jira": {a["id"]: _check_jira(a["id"]) for a in accounts.get("jira", [])} |
-                    {MACHINE: _check_jira(MACHINE)}}
+                    {MACHINE: _check_jira(MACHINE)},
+            "notion": {a["id"]: _check_notion(a["id"]) for a in accounts.get("notion", [])} |
+                      {MACHINE: _check_notion(MACHINE)}}

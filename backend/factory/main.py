@@ -10,7 +10,7 @@ import asyncio
 import copy
 import dataclasses
 
-from . import accounts, config, graph, health, intake, janitor, runner, workspace
+from . import accounts, config, docs, docs_intake, graph, health, intake, janitor, runner, workspace
 from .alerts import Alerts
 from .engine import Factory
 from .hub import Hub
@@ -78,6 +78,9 @@ def _want_storages(line, wanted: dict) -> None:
             # when that's on, or its own feed with that JQL when it isn't.
             jql = query or cfg.jira.jql
             wanted[key] = (source, line, dataclasses.replace(cfg.jira, jql=jql), jql, only)
+        elif source in docs_intake.SOURCE_KIND:  # a docs storage (Notion): its filter is the pages it watches
+            settings = docs_intake.DocsStorageConfig(query=query, kind=docs_intake.SOURCE_KIND[source])
+            wanted[key] = (source, line, settings, query, False)
 
 
 def _tag_storage(key: str, adapter) -> None:
@@ -87,7 +90,7 @@ def _tag_storage(key: str, adapter) -> None:
     adapter.storage = key.split(":")[2]  # crates remember the storage they came out of
     line = factory.lines.get(key.split(":")[1])
     st = next((s for s in graph.fed_storages(line.graph) if s.get("id") == adapter.storage), {}) if line else {}
-    if adapter.source == "jira":
+    if adapter.source in ("jira", *docs_intake.SOURCE_KIND):
         adapter.work_repo = graph.github_name(str(st.get("repo") or ""))
     if adapter.source == "github_pr":  # read on every save, so the tick needs no restart of the feed
         adapter.include_factory_prs = graph.includes_factory_prs(st)
@@ -96,7 +99,7 @@ def _tag_storage(key: str, adapter) -> None:
 def want_account(key: str) -> str:
     """The account a feed works as: its storage's pick, else its line's, else "" (the default)."""
     source, _, rest = key.partition(":")
-    service = "jira" if source == "jira" else "github"
+    service = graph.storage_service(source)
     pid, _, sid = rest.partition(":")
     line = factory.lines.get(pid)
     if line is None:
@@ -183,6 +186,10 @@ def sync_feeds() -> None:
     for key, (source, line, settings, query, only) in wanted.items():
         if key in feeds:
             continue
+        if source in docs_intake.SOURCE_KIND:
+            _start_feed(key, docs_intake.DocsPrdIntake(settings, factory, pipeline=line.id), settings.poll_seconds)
+            print(f"[intake] {line.name}: watching Notion pages: {query or '(none yet)'}")
+            continue
         if source == "jira":
             _start_feed(key, intake.JiraIntake(settings, factory, pipeline=line.id, check_only=only),
                         settings.poll_seconds)
@@ -223,7 +230,8 @@ async def lifespan(app: FastAPI):
         print(f"[factory] {error}" if error else f"[factory] {line.name} works on {line.repo.github or line.repo.path}"
               f" ({line.repo.base_branch})")
     print(f"[accounts] {len(factory_accounts['github'])} GitHub and {len(factory_accounts['jira'])} Jira account(s); "
-          f"by default GitHub uses {accounts.label('github')} and Jira {accounts.label('jira')}")
+          f"by default GitHub uses {accounts.label('github')} and Jira {accounts.label('jira')}"
+          + (f"; {len(factory_accounts['notion'])} Notion account(s)" if factory_accounts.get("notion") else ""))
     pollers = []
     adapters = []
     if cfg.jira.enabled:
@@ -235,6 +243,11 @@ async def lifespan(app: FastAPI):
         print(f"[intake] watching pull requests waiting for review by {reviews.reviewer}")
     pollers.append(asyncio.create_task(factory.health.run()))
     pollers.append(asyncio.create_task(custom_queue_loop()))
+    library = docs.load_library()
+    if library.entries:  # reference docs (docs.toml) for the machines, synced into docs_cache/
+        print(f"[docs] syncing {len(library.entries)} reference doc entr{'y' if len(library.entries) == 1 else 'ies'} "
+              f"every {library.sync_minutes:g} min")
+    pollers.append(asyncio.create_task(docs.sync_loop()))
     if store.queue_keys():
         print(f"[intake] {sum(len(store.queue_list(p, s)) for p, s in store.queue_keys())} change(s) "
               "queued in Custom storages go onto their lines as they take them")
@@ -253,6 +266,9 @@ async def lifespan(app: FastAPI):
     if scrapped:
         print(f"[factory] {len(scrapped)} crate(s) left on a line that can't run now went to its scrap bin")
     factory.backfill_pr_states()
+    # Shipped crates' PRs that were still open: check them now and every few minutes, so the
+    # dashboard shows Merged once someone merges one on GitHub.
+    pollers.append(asyncio.create_task(factory.poll_pr_states(first_delay=20.0)))
     if waiting:
         print(f"[factory] {waiting} crate(s) still waiting for your approval")
     print(f"[factory] game should connect to ws://{cfg.host}:{cfg.port}/ws")
@@ -609,6 +625,13 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 task = asyncio.create_task(intake_command(ws, msg))
                 background.add(task)
                 task.add_done_callback(background.discard)
+            elif kind == "crate_arrivals":  # this client will say when crates arrive
+                if msg.get("on", True):
+                    hub.arrival_clients.add(ws)
+                else:
+                    hub.arrival_clients.discard(ws)
+            elif kind == "crate_arrived":
+                factory.crate_arrived(msg.get("item_id"), msg.get("location", ""))
             elif kind == "check_tools":
                 task = asyncio.create_task(factory.check_tools())
                 background.add(task)
@@ -616,11 +639,15 @@ async def ws_endpoint(ws: WebSocket) -> None:
             elif kind == "belt_speed":
                 error = await factory.set_belt_speed(msg.get("speed"))
             elif kind == "agent_defaults":
-                error = await factory.set_agent_defaults(msg.get("model"), msg.get("effort"))
+                error = await factory.set_agent_defaults(msg.get("model"), msg.get("effort"), msg.get("agent"))
             elif kind == "force_delete":
                 error = await factory.set_force_delete(msg.get("on"))
             elif kind == "branch_pattern":
                 error = await factory.set_branch_pattern(msg.get("pattern"))
+            elif kind == "refresh_pr_states":  # the dashboard opened: check shipped crates' open PRs
+                task = asyncio.create_task(factory.refresh_pr_states())
+                background.add(task)
+                task.add_done_callback(background.discard)
             elif kind in ("worktrees", "worktrees_clean"):  # the dashboard's Worktrees & branches tab
                 task = asyncio.create_task(factory.worktrees_command(ws, msg))
                 background.add(task)

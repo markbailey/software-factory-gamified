@@ -36,22 +36,55 @@ CRATE_DIR_RE = re.compile(r"^crate-(\d+)$")
 CRATE_BRANCH_RE = re.compile(r"^crate/(\d+)$")
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+def _git(repo: Path, *args: str, warn: bool = True) -> subprocess.CompletedProcess:
+    """git in repo. A failure that says why is logged in one line (warn=False: the caller expects
+    some, e.g. rev-parse --verify, or reports them itself)."""
     git = shutil.which("git") or "git"
-    return subprocess.run([git, *args], cwd=repo, capture_output=True, text=True)
+    try:
+        proc = subprocess.run([git, *args], cwd=repo, capture_output=True, text=True)
+    except OSError as exc:  # no such folder, or no git
+        proc = subprocess.CompletedProcess([git, *args], 1, "", str(exc))
+    if warn and proc.returncode != 0 and (proc.stderr or "").strip():
+        print(f"[janitor] git {' '.join(args[:2])} in {repo} failed ({proc.returncode}): {_err(proc)}")
+    return proc
+
+
+def _gitdir(worktree: Path) -> str:
+    try:
+        text = (worktree / ".git").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    return text.removeprefix("gitdir:").strip().replace("\\", "/") if text.startswith("gitdir:") else ""
 
 
 def _owner(worktree: Path, repos: list[Path]) -> Path | None:
     """The repo a worktree belongs to, from its .git file ("gitdir: <repo>/.git/worktrees/<name>")."""
-    try:
-        text = (worktree / ".git").read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
+    gitdir = _gitdir(worktree)
+    if not gitdir:
         return None
-    gitdir = text.removeprefix("gitdir:").strip().replace("\\", "/")
     for repo in repos:
         if gitdir.lower().startswith((str(repo).replace("\\", "/") + "/.git/").lower()):
             return repo
     return None
+
+
+def _gitdir_repo(worktree: Path) -> Path | None:
+    """The repo named by a worktree's .git file, whether or not it's one of the lines' repos
+    (only if that repo is still there)."""
+    gitdir = _gitdir(worktree)
+    at = gitdir.lower().rfind("/.git/worktrees/")
+    if at <= 0:
+        return None
+    repo = Path(gitdir[:at])
+    return repo if (repo / ".git").exists() else None
+
+
+def _unique(paths: list[Path]) -> list[Path]:
+    """paths without repeats (a repo listed twice, under another spelling)."""
+    seen: dict[str, Path] = {}
+    for p in paths:
+        seen.setdefault(_norm(p), p)
+    return list(seen.values())
 
 
 def force_delete_on() -> bool:
@@ -73,18 +106,21 @@ def remove_args(path: Path, force: bool) -> list[list[str]]:
     return [["worktree", "remove", "--force", str(path)]]
 
 
-def force_remove(path: Path, stubborn: bool = False) -> None:
+def force_remove(path: Path, stubborn: bool = False, stop: bool | None = None) -> None:
     """Delete a folder even when Windows marks files read-only (git objects, node_modules).
-    stubborn (force delete): first stop programs running from inside it, use long paths on
-    Windows (node_modules goes past 260 characters), and retry while files are still held open."""
+    stubborn: use long paths on Windows (node_modules goes past 260 characters) and retry while
+    files are still held open; and, unless stop is False, first stop programs running from inside
+    it (stop defaults to stubborn: force delete)."""
     def make_writable(func, p, _exc):
         os.chmod(p, stat.S_IWRITE)
         func(p)
     if not path.exists():
         return
+    stop = stubborn if stop is None else stop
     target = path
     if stubborn:
-        stop_processes_in(path)
+        if stop:
+            stop_processes_in(path)
         if os.name == "nt" and not str(path).startswith("\\\\?\\"):
             target = Path("\\\\?\\" + str(path.resolve()))
     tries = FORCE_RETRIES if stubborn else 1
@@ -103,7 +139,7 @@ def force_remove(path: Path, stubborn: bool = False) -> None:
                     raise
                 return
             time.sleep(0.5 * (attempt + 1))  # Windows lets go of a file a moment after its program ends
-            if attempt == 1:
+            if attempt == 1 and stop:
                 stop_processes_in(path)  # something may have started again
 
 
@@ -171,29 +207,34 @@ def sweep(cfg: Config, items: dict[int, dict], keep_scrapped_hours: float,
     one if none). Returns what was removed."""
     removed: list[str] = []
     force = force_delete_on()
-    paths = [r.path for r in (repos or [cfg.default_repo]) if (r.path / ".git").exists()]
-    if not paths:
-        return removed
+    paths = _unique([r.path for r in (repos or [cfg.default_repo]) if r is not None and (r.path / ".git").exists()])
+    others: list[Path] = []  # repos named by a crate folder's .git file but not in the list
 
+    # Only direct children of the worktrees folder named crate-<n>, whose crate isn't live.
     if cfg.worktrees.exists():
         for path in sorted(cfg.worktrees.iterdir()):
             m = CRATE_DIR_RE.match(path.name)
             if not m or not path.is_dir():
                 continue
-            if not _removable(items.get(int(m.group(1))), keep_scrapped_hours):
+            item = items.get(int(m.group(1)))
+            if (item is not None and item.get("state") in LIVE) or not _removable(item, keep_scrapped_hours):
                 continue
-            owner = _owner(path, paths)
+            owner = _owner(path, paths) or _gitdir_repo(path)
             if owner is not None:
+                if _norm(owner) not in {_norm(p) for p in paths + others}:
+                    others.append(owner)
                 for args in remove_args(path, force):
-                    _git(owner, *args)
+                    _git(owner, *args, warn=False)  # git may not know it any more
             try:
-                force_remove(path, stubborn=force)
+                # Long paths and retries always; stopping programs only with Force delete.
+                force_remove(path, stubborn=True, stop=force)
             except OSError as exc:
                 print(f"[janitor] could not delete {path}: {exc}"
                       + ("" if force else " (tick Force delete under the gear in the game to stop what holds it)"))
                 continue
             removed.append(f"worktree {path.name}")
 
+    paths += others
     for repo in paths:
         _git(repo, "worktree", "prune")
 
@@ -217,7 +258,7 @@ def sweep(cfg: Config, items: dict[int, dict], keep_scrapped_hours: float,
             crate = branch_names.crate_of(branch, owners)
             if crate is None or not _removable(items.get(crate), keep_scrapped_hours):
                 continue
-            if _git(repo, "branch", "-D", branch).returncode == 0:
+            if _git(repo, "branch", "-D", branch, warn=False).returncode == 0:
                 removed.append(f"branch {branch}" + ("" if repo == paths[0] else f" in {repo.name}"))
     return removed
 
@@ -269,16 +310,16 @@ def _base_ref(repo: RepoConfig) -> str:
     """The ref "merged" is measured against: origin/<base> when it's there (it's newer), else <base>."""
     base = repo.base_branch
     if not base:
-        head = _git(repo.path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").stdout.strip()
+        head = _git(repo.path, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", warn=False).stdout.strip()
         base = head.removeprefix("origin/") if head else ""
     if not base:
         for guess in ("main", "master"):
-            if _git(repo.path, "rev-parse", "--verify", "--quiet", f"refs/heads/{guess}").returncode == 0:
+            if _git(repo.path, "rev-parse", "--verify", "--quiet", f"refs/heads/{guess}", warn=False).returncode == 0:
                 base = guess
                 break
     if not base:
         return ""
-    if _git(repo.path, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}").returncode == 0:
+    if _git(repo.path, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}", warn=False).returncode == 0:
         return f"origin/{base}"
     return base
 
@@ -330,7 +371,11 @@ def _idle_reason(last: float, now: float) -> list[str]:
 def inventory(cfg: Config, items: dict[int, dict], repos: list[RepoConfig] | None = None) -> dict:
     """Every worktree and local branch, with whether it's stale and why (see above)."""
     now = time.time()
-    repos = [r for r in (repos or [cfg.default_repo]) if (r.path / ".git").exists()]
+    unique: dict[str, RepoConfig] = {}  # a repo listed twice is scanned once
+    for r in (repos or [cfg.default_repo]):
+        if r is not None and (r.path / ".git").exists():
+            unique.setdefault(_norm(r.path), r)
+    repos = list(unique.values())
     worktrees: list[dict] = []
     branches: list[dict] = []
     known: set[str] = set()
@@ -427,6 +472,17 @@ def inventory(cfg: Config, items: dict[int, dict], repos: list[RepoConfig] | Non
                 row.update(facts, in_use=in_use)
                 if in_use:
                     row["reasons"] = []
+            # Whose it was: the repo its .git file names, else the crate's repo.
+            owner = _gitdir_repo(path)
+            if owner is not None:
+                known_repo = unique.get(_norm(owner))
+                row["repo"] = (known_repo.github if known_repo else "") or owner.name
+                row["repo_path"] = str(owner)
+            elif m and (items.get(int(m.group(1))) or {}).get("repo"):
+                label = str(items[int(m.group(1))]["repo"])
+                row["repo"] = label
+                match = [r for r in repos if (r.github or "").lower() == label.lower()]
+                row["repo_path"] = str(match[0].path) if match else ""
             worktrees.append(row)
 
     for row in worktrees + branches:
@@ -474,11 +530,11 @@ def clean(cfg: Config, items: dict[int, dict], repos: list[RepoConfig] | None, k
         repo = Path(row["repo_path"]) if row["repo_path"] else None
         if row["kind"] == "worktree":
             path = Path(row["path"])
-            ours = row["crate"] is not None or not row["repo_path"]  # a crate's, or a leftover folder
+            ours = row["crate"] is not None or row["key"].startswith("W||")  # a crate's, or a leftover folder
             if repo is not None and not row["missing"]:
                 if force or ours:
                     for args in remove_args(path, force):
-                        _git(repo, *args)
+                        _git(repo, *args, warn=False)  # a leftover git no longer knows
                 else:  # someone's own worktree: git refuses if it has uncommitted changes
                     proc = _git(repo, "worktree", "remove", str(path))
                     if proc.returncode != 0:

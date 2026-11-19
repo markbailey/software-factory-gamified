@@ -49,9 +49,13 @@ def test_flags_go_after_the_executable_only_when_the_cli_has_them(monkeypatch):
 
 def test_defaults_saved(tmp_path, monkeypatch):
     monkeypatch.setattr(agents, "AGENTS_FILE", tmp_path / "agents.json")
-    assert agents.defaults() == {"model": "", "effort": ""}
+    assert agents.defaults() == {"agent": "claude", "model": "", "effort": ""}
     agents.set_defaults("claude-fable-5-2", "XHIGH")
-    assert agents.defaults() == {"model": "claude-fable-5-2", "effort": "xhigh"}
+    assert agents.defaults() == {"agent": "claude", "model": "claude-fable-5-2", "effort": "xhigh"}
+    agents.set_defaults("flash", "", "Gemini")
+    assert agents.defaults() == {"agent": "gemini", "model": "flash", "effort": ""}
+    agents.set_defaults("", "")  # the agent is kept when the game sends only model and effort
+    assert agents.defaults()["agent"] == "gemini"
 
 
 def test_machines_run_claude_with_their_choice_or_the_default(make_factory):

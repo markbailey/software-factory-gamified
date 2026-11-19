@@ -10,9 +10,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Awaitable, Callable
+
+from . import paths
 
 TIMEOUT_EXIT_CODE = -9
 STOPPED_EXIT_CODE = -15  # stopped because the backend is shutting down
@@ -67,6 +70,9 @@ def resolve(argv: list[str], allowed: list[str]) -> list[str]:
     if not argv:
         raise CommandNotAllowed("empty command")
     exe = argv[0]
+    # Built as an exe with no Python on PATH, {python} is the exe itself (factory/paths.py).
+    if paths.FROZEN and Path(exe) == Path(sys.executable):
+        return [exe, *argv[1:]]
     if _base_name(exe) not in {a.lower() for a in allowed}:
         raise CommandNotAllowed(f"'{Path(exe).name}' is not on the allowlist")
     path = shutil.which(exe) or (exe if Path(exe).is_file() else None)
@@ -99,6 +105,11 @@ async def run(
     def emit(kind: str, value) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, (kind, value))
 
+    # The crate's work was stopped (Scrap now cancels its task): stop its command too, which
+    # would otherwise run on in its thread.
+    held: dict = {}
+    cancelled = threading.Event()
+
     def worker() -> None:
         code = -1
         timer = None
@@ -118,6 +129,9 @@ async def run(
             )
             with _live_lock:
                 _live.add(proc)
+            held["proc"] = proc
+            if cancelled.is_set():
+                _kill_tree(proc)
             timed_out = threading.Event()
             if timeout:
                 def kill() -> None:
@@ -150,8 +164,14 @@ async def run(
         emit("exit", code)
 
     threading.Thread(target=worker, daemon=True).start()
-    while True:
-        kind, value = await queue.get()
-        if kind == "exit":
-            return value
-        await on_line(value)
+    try:
+        while True:
+            kind, value = await queue.get()
+            if kind == "exit":
+                return value
+            await on_line(value)
+    except asyncio.CancelledError:
+        cancelled.set()
+        if held.get("proc") is not None:
+            _kill_tree(held["proc"])
+        raise

@@ -182,4 +182,12 @@ def crate_of(branch: str, owners: dict[str, int]) -> int | None:
 
 
 def owners(items: dict[int, dict]) -> dict[str, int]:
-    return {str(it["branch"]): int(cid) for cid, it in items.items() if it.get("branch")}
+    """Branch name -> the crate that owns it. Two crates can share one: a PR's branch, taken
+    in again from an Open PRs storage after its first crate shipped. The live one wins (then the
+    newest), so the janitor never deletes a branch a crate on the line is working on."""
+    done = ("shipped", "scrapped")
+    out: dict[str, int] = {}
+    for cid, it in sorted(items.items(), key=lambda kv: (kv[1].get("state") not in done, int(kv[0]))):
+        if it.get("branch"):
+            out[str(it["branch"])] = int(cid)
+    return out

@@ -54,7 +54,9 @@ class Store:
                 cost_usd REAL NOT NULL DEFAULT 0,
                 turns INTEGER NOT NULL DEFAULT 0,
                 model TEXT NOT NULL DEFAULT '',
-                effort TEXT NOT NULL DEFAULT ''
+                effort TEXT NOT NULL DEFAULT '',
+                agent TEXT NOT NULL DEFAULT '',
+                tokens INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS runs_by_item ON runs (item_id);
             CREATE INDEX IF NOT EXISTS runs_by_time ON runs (started_at);
@@ -77,7 +79,8 @@ class Store:
         have = {r["name"] for r in self.db.execute("PRAGMA table_info(items)")}
         for col in ("source", "source_ref", "source_url", "pr_url", "notes", "review", "pipeline",
                     "head_sha", "risk", "risk_reason", "outcome", "scrap_kind", "waiting_for", "spec", "route", "pr_state",
-                    "pr_title", "pr_body", "repo", "storage", "branch"):
+                    "pr_title", "pr_body", "repo", "storage", "branch",
+                    "intake_sha"):  # intake_sha: an Open PRs crate's PR head when it came in
             if col not in have:
                 self.db.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         if "loops" not in have:  # how many times the crate has been sent back for rework
@@ -87,9 +90,11 @@ class Store:
         # Which Claude model and effort a run used ("" on runs from before this was recorded,
         # and on runs that started no Claude).
         have_runs = {r["name"] for r in self.db.execute("PRAGMA table_info(runs)")}
-        for col in ("model", "effort"):
+        for col in ("model", "effort", "agent"):  # agent: claude, gemini, antigravity, copilot
             if col not in have_runs:
                 self.db.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        if "tokens" not in have_runs:  # what the agent reported using (the others report no cost)
+            self.db.execute("ALTER TABLE runs ADD COLUMN tokens INTEGER NOT NULL DEFAULT 0")
         # Before pipelines, there was one line and places had no pipeline prefix.
         self.db.execute("UPDATE items SET pipeline = 'build' WHERE pipeline = ''")
         self.db.execute(
@@ -141,14 +146,16 @@ class Store:
     # Machine runs: how long each took, what Claude cost, how it ended ------------------
     def record_run(self, item_id: int, pipeline: str, machine: str, machine_type: str, started_at: float,
                    outcome: str, failed_step: str = "", cost_usd: float = 0.0, turns: int = 0,
-                   model: str = "", effort: str = "") -> None:
-        """outcome: "ok", "failed" or "stopped" (the backend stopped mid-run). model/effort: what its
-        Claude steps ran with ("default" = the CLI's own), "" when it ran no Claude."""
+                   model: str = "", effort: str = "", agent: str = "", tokens: int = 0) -> None:
+        """outcome: "ok", "failed" or "stopped" (the backend stopped mid-run). agent/model/effort: what
+        its agent steps ran with (agent: claude, gemini, antigravity or copilot; "default" = the CLI's
+        own), "" when it ran no agent. tokens: what the agent reported (Claude also reports cost)."""
         self.db.execute(
             "INSERT INTO runs (item_id, pipeline, machine, machine_type, started_at, ended_at, outcome,"
-            " failed_step, cost_usd, turns, model, effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " failed_step, cost_usd, turns, model, effort, agent, tokens)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (item_id, pipeline, machine, machine_type, started_at, time.time(), outcome, failed_step,
-             float(cost_usd), int(turns), str(model or ""), str(effort or "")))
+             float(cost_usd), int(turns), str(model or ""), str(effort or ""), str(agent or ""), int(tokens or 0)))
         self.db.commit()
 
     def runs_since(self, since: float) -> list[dict]:

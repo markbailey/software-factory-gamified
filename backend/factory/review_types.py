@@ -14,9 +14,11 @@ from the Reviewer's settings, as in the built-in text.
 """
 from pathlib import Path
 
+from . import paths
+
 GENERAL = "general"
 
-PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts" / "reviewer"
+PROMPTS_DIR = paths.BACKEND_DIR / "prompts" / "reviewer"
 
 # value: (label in the drop-down, what Claude is asked to do)
 TYPES: dict[str, tuple[str, str]] = {

@@ -110,18 +110,23 @@ def compute(store: Store, names: dict[str, dict], days: int = 7) -> dict:
 
 
 def by_agent(runs: list[dict]) -> list[dict]:
-    """Runs, cost and time per Claude model and effort. Runs that started no Claude are left out;
-    older runs from before the model was recorded, that still cost something, show as "unknown"."""
-    groups: dict[tuple[str, str], dict] = {}
+    """Runs, cost, tokens and time per agent, model and effort. Runs that started no agent are left
+    out; older runs from before the model was recorded, that still cost something, show as
+    "unknown"; runs from before the agent was recorded ran Claude."""
+    groups: dict[tuple[str, str, str], dict] = {}
     for r in runs:
         model, effort = r.get("model") or "", r.get("effort") or ""
+        agent = r.get("agent") or ""
         if not model and not effort:
             if r["cost_usd"] <= 0:
-                continue  # no Claude in this run
+                continue  # no agent in this run
             model = effort = "unknown"
-        g = groups.setdefault((model, effort), {"model": model, "effort": effort, "runs": 0, "failed": 0,
-                                                "seconds": 0.0, "cost_usd": 0.0, "turns": 0})
+        agent = agent or "claude"
+        g = groups.setdefault((agent, model, effort), {"agent": agent, "model": model, "effort": effort, "runs": 0,
+                                                       "failed": 0, "seconds": 0.0, "cost_usd": 0.0, "turns": 0,
+                                                       "tokens": 0})
         g["cost_usd"] += r["cost_usd"]
+        g["tokens"] += int(r.get("tokens") or 0)
         if r["outcome"] == "stopped":
             continue
         g["runs"] += 1

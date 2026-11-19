@@ -79,6 +79,8 @@ for label, color in ((args.label, "0E8A16"), (PLAN_LABEL, "5319E7")):
                    capture_output=True, text=True)
 
 prd = f"#{args.source_ref}" if args.source == "prd" and args.source_ref else ""
+if args.source == "notion" and args.source_ref:  # a PRD page in Notion: link the page
+    prd = f"[the PRD in Notion](https://www.notion.so/{args.source_ref.replace('-', '')})"
 # One issue needs no tracking issue to list it (a record from before keeps the one it has).
 single = len(plan["issues"]) == 1 and not record.get("tracking")
 if not single and not record.get("tracking"):
@@ -127,7 +129,7 @@ for issue in order:
 
 if single:
     t = tasks[plan["issues"][0]["key"]]
-    if prd and not record.get("commented"):
+    if prd and args.source == "prd" and not record.get("commented"):
         run("issue", "comment", args.source_ref, "--repo", args.repo, "--body-file", "-",
             stdin=f"The Software Factory wrote this up as #{t['number']}"
                   + (f", labelled `{args.label}` for the build line.\n" if t["labelled"] else ".\n"))
@@ -146,7 +148,7 @@ body = (f"Planned by the Software Factory{' from ' + prd if prd else ''}.\n\n## 
         + "\n".join(lines) + f"\n\n{markdown}\n")
 run("issue", "edit", str(tracking), "--repo", args.repo, "--body-file", "-", stdin=body)
 
-if prd and not record.get("commented"):
+if prd and args.source == "prd" and not record.get("commented"):
     run("issue", "comment", args.source_ref, "--repo", args.repo, "--body-file", "-",
         stdin=f"The Software Factory planned this in #{tracking}: {len(issues)} issue"
               f"{'' if len(issues) == 1 else 's'}. Ready ones are labelled `{args.label}` and go to the "

@@ -1,0 +1,31 @@
+# The reference library: pages in your documentation system (Notion for now) that agent
+# machines read as context, such as coding guidelines or architecture notes.
+#
+# The backend syncs them into backend/docs_cache/ as Markdown when it starts and then every
+# sync_minutes (only pages that changed are fetched again), so a crate never waits on Notion.
+# Sync now with:  python -m factory.docs sync   (from backend/)
+#
+# Which machines read an entry: list machine types under `machines` (every machine of that
+# type reads it), or set "Reference docs" in one machine's settings in the game to the entry
+# ids it reads (comma-separated; "none" for none), which wins over `machines`.
+#
+# The Notion token comes from Accounts (the gear in the top bar; accounts.toml), never from
+# here. Share each page or database with your integration in Notion: the page's ... menu >
+# Connections > your integration.
+
+sync_minutes = 30
+
+# [[library]]
+# id = "guidelines"                    # what a machine's "Reference docs" setting names
+# name = "Coding guidelines"
+# source = "notion"
+# account = ""                         # a Notion account id from Accounts; "" the default
+# pages = ["https://www.notion.so/acme/Coding-guidelines-0123456789abcdef0123456789abcdef"]
+# machines = ["coder", "reviewer"]
+#
+# [[library]]
+# id = "architecture"
+# name = "Architecture decisions"
+# pages = ["https://www.notion.so/acme/0123456789abcdef0123456789abcdef"]   # a database: all its pages
+# where = "Status = Accepted"          # optional: only the database's pages with this property value
+# machines = ["planner", "reviewer"]

@@ -48,3 +48,11 @@ def test_test_writer_only_writes_no_code():
     assert steps_run(m) == ["Sync", "Make branch", "Bring in the base branch", "Write tests",
                             "Stage changes", "Check for changes", "Commit"]
     assert m.prompt_when == "coder_mode=implement|tdd" and "test_only" in m.prompt_notes
+
+
+def test_the_game_lists_only_the_steps_the_mode_runs():
+    for mode in ["implement", "tdd", "test_only"]:
+        m = coder({"coder_mode": mode})
+        assert m.summary()["steps"] == steps_run(m), mode
+    assert "Write tests" not in coder({"coder_mode": "tdd"}).summary()["steps"]
+    assert "Write code" not in coder({"coder_mode": "tdd"}).summary()["steps"]

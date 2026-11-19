@@ -10,6 +10,9 @@ class Hub:
     def __init__(self, store: Store):
         self.store = store
         self.clients: set[WebSocket] = set()
+        # Game clients that say when a crate has finished riding to where the factory sent it
+        # (crate_arrivals). While one is connected, machines wait for the crate to arrive.
+        self.arrival_clients: set[WebSocket] = set()
         # Called with every event (alerts outside the game listen here). Must not block.
         self.listeners: list = []
 
@@ -18,6 +21,7 @@ class Hub:
 
     def remove(self, ws: WebSocket) -> None:
         self.clients.discard(ws)
+        self.arrival_clients.discard(ws)
 
     async def emit(self, event: dict) -> None:
         await self.broadcast({**event, "seq": self.store.append_event(event)})

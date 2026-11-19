@@ -21,7 +21,7 @@ def test_named_accounts_and_choosing_one(tmp_path):
     a, acme = accounts.upsert(a, "jira", {"name": "Acme", "base_url": "acme.atlassian.net/",
                                          "email": "bot@acme.com", "token": "jt"})
     assert (bot, other, acme) == ("factory-bot", "work-bot", "acme")
-    assert a["defaults"] == {"github": "factory-bot", "jira": "acme"}  # the first of each
+    assert a["defaults"] == {"github": "factory-bot", "jira": "acme", "notion": ""}  # the first of each
     accounts.save(a, path)
     loaded = accounts.load(path)
     assert loaded == a

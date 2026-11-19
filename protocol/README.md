@@ -16,7 +16,7 @@ The backend owns the truth: the game only draws what events tell it and sends co
 | `check_accounts` | | Check who each account and this machine's sign-in is; answered by `accounts` with `check` |
 | `approve` | `item_id` | Let a crate waiting at a gate machine carry on |
 | `reject` | `item_id`, `note`? | At a machine with a fail belt, send the crate back for rework with the note; otherwise close its PR and scrap it |
-| `scrap` | `item_id`, `note`? | Close the PR of a crate waiting at a gate and scrap it |
+| `scrap` | `item_id`, `note`? | Scrap a crate: one waiting at a gate or held, or (Scrap now) one on a belt or in a machine, whose work and running command are stopped first. Its PR is closed if the bin says so |
 | `retry` | `item_id`, `note`? | Send a scrapped crate back to the Coder, with the note for Claude |
 | `intake_list` | `pipeline` | What the pipeline's intake sources have (answered by `intake_list`, to this game only) |
 | `intake_pull` | `pipeline`, `source`, `ref` | Make one issue a crate now (GitHub issues only; `ref` is the issue number). Answered by `item_created` and a fresh `intake_list`, or `error` |
@@ -25,7 +25,10 @@ The backend owns the truth: the game only draws what events tell it and sends co
 | `intake_close` | `pipeline`, `source`, `storage`, `refs[]`, `comment`?, `reason`?, `transition`? | Close issues or PRs sitting in a storage (`refs` are row `ref`s from `intake_list`: issue/PR numbers, PR urls for `pr_review`, Jira keys), as the account that storage works as. `comment` is posted first. GitHub issues: `reason` `completed` or `not planned`. Open PRs and PRs to review are closed (branch kept). Jira: moved through `transition` (its name or target status), or by default the transition into a done-category status (Done/Closed/Resolved first). Answered by `intake_closed` and a fresh `intake_list` without them, or `error`. Closing is outward-facing: the game confirms first |
 | `intake_close_options` | `pipeline`, `source`, `storage`, `refs[]` | How `intake_close` would close these: answered by `intake_close_options` |
 | `check_agent` | | Check now whether Claude is available (answered by `agent_status`) |
+| `refresh_pr_states` | | Check again on GitHub the PRs of crates out of the line (shipped or scrapped) whose PR wasn't merged or closed when last checked, and send `pr_state` for each that changed. Batched (one GitHub call per 50 PRs) and at most once every 30 seconds; the backend also does it every 5 minutes. The dashboard sends it when it opens |
 | `check_tools` | | Check the broken tools again now (answered by `tool_status`). A problem no check can see (a crashed factory script) is taken as fixed, and its step runs again |
+| `crate_arrivals` | `on`? (default true) | This client will send `crate_arrived`. While at least one such client is connected, a crate waits on the belt until it is shown there before the machine starts on it (at most 20 seconds past the belt time). With none connected there is no wait |
+| `crate_arrived` | `item_id`, `location` | The crate finished riding to `location` (the `to` of its last `item_moved`, or where the snapshot put it) |
 | `save_pipelines` | `pipelines[]` (see Pipeline) | Replace every pipeline (build mode). Refused with an `error` if one is invalid or crates are still in the factory; on success every game gets a new `snapshot` |
 | `save_line` | `machines[]` of `{type, id?, name?, gate?, prompt?, on_fail?}` | Older games: replace the first pipeline with a straight line |
 

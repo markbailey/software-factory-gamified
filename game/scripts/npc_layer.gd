@@ -492,7 +492,11 @@ func _place_worker(key: String, machine: String, loop: String) -> void:
 	npc.key = key
 	npc.set_band(_accent(machine))
 	_workers[key] = npc
-	var spot := _stand_spot(machine, _free_slot(machine))
+	var spot := _worker_spot(machine, _nearest_door(machine), npc)
+	if spot.is_empty():
+		spot = _stand_spot(machine, _free_slot(machine))
+	npc.set_meta("slot", _free_slot(machine))
+	npc.set_meta("machine", machine)
 	npc.position = spot["point"]
 	npc.set_meta("approach", spot["approach"])
 	npc.walk([], loop, spot["face"])
@@ -621,7 +625,11 @@ func _spawn(kind: String, machine := "") -> Npc:
 	npc.rotation = -PI / 2.0
 	if _doors.is_empty():
 		# No doors: they appear (fading in) where they will work.
-		var spot := _stand_spot(machine, 0) if factory_floor.footprints.has(machine) else {}
+		var spot := {}
+		if factory_floor.footprints.has(machine):
+			spot = _worker_spot(machine, factory_floor.cell_at(_machine_mid(machine)), npc) if kind == "worker" else {}
+			if spot.is_empty():
+				spot = _stand_spot(machine, 0)
 		var at: Vector2i = spot.get("approach", factory_floor.cell_at(_machine_mid(machine)))
 		npc.position = factory_floor.cell_center(at)
 		npc.set_meta("approach", at)
@@ -709,7 +717,6 @@ func _nearest_door_from(c: Vector2i) -> Vector2i:
 
 ## slot >= 0: a worker spot; -1: the mechanic's spot; -2: the janitor's (a bin).
 func _walk_to_machine(npc: Npc, key: String, slot: int, loop: String, run: bool) -> void:
-	var spot := _stand_spot(key, slot)
 	var from: Vector2i = npc.get_meta("approach", _door_of(npc))
 	var points: Array = []
 	if npc.is_walking():
@@ -718,6 +725,9 @@ func _walk_to_machine(npc: Npc, key: String, slot: int, loop: String, run: bool)
 			from = npc.get_meta("approach", _door_of(npc))
 	else:
 		points.append(factory_floor.cell_center(from))
+	var spot := _worker_spot(key, from, npc) if slot >= 0 else {}
+	if spot.is_empty():
+		spot = _stand_spot(key, slot)
 	var cells := _path_cells(from, spot["approach"])
 	points.append_array(_centres(cells))
 	var face: float = spot["face"]
@@ -734,6 +744,74 @@ func _walk_to_machine(npc: Npc, key: String, slot: int, loop: String, run: bool)
 	npc.set_meta("machine", key)
 	npc.set_meta("slot", slot)
 	npc.walk(points, loop, face, run)
+
+
+## Where a worker stands at machine `key`: the free floor cell next to its 2x2 footprint
+## (sides, ends or corners) with the shortest walk from `from`. Cells with a belt, wall, door,
+## machine or another person's spot are skipped. The cells right above and below the machine
+## (where its name and progress bar are drawn) count as a little further away, so a side or
+## corner wins when the walk is about the same. Empty when no free cell can be walked to: the
+## caller falls back to _stand_spot. `npc` is the walker itself (its own spot is not "taken").
+func _worker_spot(key: String, from: Vector2i, npc: Npc) -> Dictionary:
+	if not factory_floor.footprints.has(key):
+		return {}
+	var tl: Vector2i = factory_floor.footprints[key]
+	var mid := Vector2(tl) * CELL + Vector2(CELL, CELL)
+	var taken := _taken_cells(npc)
+	var can_walk := _astar.is_in_boundsv(from) and not _astar.is_point_solid(from)
+	var best := {}
+	var best_cost := INF
+	for dy in range(-1, 3):
+		for dx in range(-1, 3):
+			var off := Vector2i(dx, dy)
+			if dx >= 0 and dx <= 1 and dy >= 0 and dy <= 1:
+				continue  # the machine itself
+			var c := tl + off
+			if not _walkable(c) or taken.has(c) or _doors.has(c) or factory_floor.belt_cells.has(c):
+				continue
+			var cost: float
+			if c == from:
+				cost = 0.0
+			elif can_walk:
+				var path := _astar.get_id_path(from, c, false)
+				if path.is_empty():
+					continue  # can't get there without crossing a belt or wall
+				cost = 0.0
+				for i in range(1, path.size()):
+					cost += Vector2(path[i] - path[i - 1]).length()
+			elif _reachable(c):
+				cost = Vector2(c - from).length()  # walking from off the grid: straight line decides
+			else:
+				continue
+			var side_x := dx == -1 or dx == 2
+			var side_y := dy == -1 or dy == 2
+			if side_y and not side_x:
+				cost += 1.5  # right over the name or the progress bar
+			if cost < best_cost:
+				best_cost = cost
+				var centre := factory_floor.cell_center(c)
+				var nudge := Vector2((1.0 if dx == -1 else -1.0) if side_x else 0.0,
+						(1.0 if dy == -1 else -1.0) if side_y else 0.0)
+				var point := centre + nudge * (12.0 if nudge.x == 0.0 or nudge.y == 0.0 else 8.0)
+				best = {"point": point, "approach": c, "face": (mid - point).angle()}
+	return best
+
+
+## Cells someone else is standing at, or walking to, to work (workers, mechanic, janitor).
+func _taken_cells(me: Npc) -> Dictionary:
+	var out := {}
+	var people: Array = _workers.values()
+	if _mechanic != null:
+		people.append(_mechanic)
+	if _janitor != null:
+		people.append(_janitor)
+	for p in people:
+		if p == me or not is_instance_valid(p) or p.is_leaving() or not p.has_meta("machine"):
+			continue
+		var a = p.get_meta("approach", null)
+		if a is Vector2i:
+			out[a] = true
+	return out
 
 
 ## Where someone stands to work at a machine or station (2x2 footprint): just outside one of

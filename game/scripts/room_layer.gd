@@ -85,7 +85,7 @@ const TOOLS := [
 	["bridge", "Footbridge", "Click or drag along a straight belt to put footbridges over it. People cross belts only at footbridges; erase removes them."],
 	["staff", "Worker door", "Click free floor to put a worker door there; add as many as you like. Workers come in through the door nearest their machine and leave by it; erase removes one (the first staff door too)."],
 	["floor", "Floor", "Drag a rectangle to lay floor."],
-	["label", "Name", "Click the floor to name a room. Click a name to rename it, drag it to move it; clear the text to remove it."],
+	["label", "Name", "Click the floor to name a room. Click a name to rename it, drag it to move it; drag its left or right edge to make the sign wider or narrower; clear the text to remove it."],
 	["erase", "Erase", "Drag over walls, floor, names, footbridges and doors (the staff door too) to remove them."],
 ]
 
@@ -94,7 +94,8 @@ var npc_layer: Node2D  # optional: doors open when its people come near
 
 var walls := {}  # Vector2i -> "wall" | "window" | "door" | "port"
 var floors := {}  # Vector2i -> floor style id
-var labels := {}  # Vector2i -> a room's name, drawn as a sign centred on that cell
+var labels := {}  # Vector2i -> a room's name, drawn as a sign on that cell's row (see _label_edges)
+var label_sizes := {}  # Vector2i -> [left, right] grid lines from that cell (missing means just wide enough, centred)
 var bridges := {}  # Vector2i -> true: a footbridge over the belt on that cell
 var staff_doors := {}  # Vector2i -> true: a worker door on that floor cell
 var staff_door_on := true  # false once you remove the first staff door (npc_layer.gd's own)
@@ -108,6 +109,8 @@ var tool := ""
 var floor_style := "plate"
 var _drag := {}  # {"from": Vector2i, "to": Vector2i} while the left button is held
 var _hover := Vector2i(-99999, -99999)
+var _resize := {}  # {"cell", "before", "side"} while a sign's edge handle is dragged
+var _label_hover = null  # the sign (its cell) under the mouse with the Name tool, or null
 var _door_open := {}  # door cell -> 0..1
 var _tiles := {}
 
@@ -143,8 +146,11 @@ func _load() -> void:
 		if row is Array and row.size() == 3 and FLOORS.has(str(row[2])):
 			floors[Vector2i(int(row[0]), int(row[1]))] = str(row[2])
 	for row in data.get("labels", []):
-		if row is Array and row.size() == 3 and str(row[2]).strip_edges() != "":
-			labels[Vector2i(int(row[0]), int(row[1]))] = str(row[2])
+		if row is Array and row.size() >= 3 and str(row[2]).strip_edges() != "":
+			var lc := Vector2i(int(row[0]), int(row[1]))
+			labels[lc] = str(row[2])
+			if row.size() >= 4:
+				_load_size(lc, row[3])
 	for row in data.get("bridges", []):
 		if row is Array and row.size() >= 2:
 			bridges[Vector2i(int(row[0]), int(row[1]))] = true
@@ -158,6 +164,7 @@ func _load() -> void:
 ## Everything you can build here, copied (for undo and for Cancel).
 func _state() -> Dictionary:
 	return {"walls": walls.duplicate(), "floors": floors.duplicate(), "labels": labels.duplicate(),
+			"label_sizes": label_sizes.duplicate(),
 			"bridges": bridges.duplicate(), "staff_doors": staff_doors.duplicate(), "staff_door": staff_door_on}
 
 
@@ -165,6 +172,7 @@ func _set_state(st: Dictionary) -> void:
 	walls = (st.get("walls", {}) as Dictionary).duplicate()
 	floors = (st.get("floors", {}) as Dictionary).duplicate()
 	labels = (st.get("labels", {}) as Dictionary).duplicate()
+	label_sizes = (st.get("label_sizes", {}) as Dictionary).duplicate()
 	bridges = (st.get("bridges", {}) as Dictionary).duplicate()
 	staff_doors = (st.get("staff_doors", {}) as Dictionary).duplicate()
 	staff_door_on = bool(st.get("staff_door", true))
@@ -233,6 +241,7 @@ func erase_cells(cells: Array) -> void:
 		walls.erase(c)
 		floors.erase(c)
 		labels.erase(c)
+		label_sizes.erase(c)
 		bridges.erase(c)
 		staff_doors.erase(c)
 	if _state() != before:
@@ -249,13 +258,17 @@ func can_shift(cells: Array, shift: Vector2i, landing: Dictionary) -> bool:
 		picked[c] = true
 	for c in cells:
 		var to: Vector2i = c + shift
-		if landing.has(to):
+		# Floor and name signs may lie under a machine; walls, doors and footbridges may not.
+		var solid := walls.has(c) or bridges.has(c) or staff_doors.has(c)
+		if solid and landing.has(to):
 			return false
 		if not picked.has(to) and (walls.has(to) or bridges.has(to) or staff_doors.has(to)):
 			return false
 		if staff_doors.has(c) and factory_floor.belt_cells.has(to):
 			return false
-		if bridges.has(c) and _straight_belt(to) == "":
+		# A footbridge dragged on its own has to land over a straight belt. Moved with the rest
+		# of a picked room, it goes with that room's belts (laid again once they've moved).
+		if bridges.has(c) and cells.size() == 1 and _straight_belt(to) == "":
 			return false
 	return true
 
@@ -263,8 +276,9 @@ func can_shift(cells: Array, shift: Vector2i, landing: Dictionary) -> bool:
 ## Move the blocks on `cells` by `shift` (the build panel records the undo step, as above).
 func shift_cells(cells: Array, shift: Vector2i) -> void:
 	var before := _state()
-	var moved := {"walls": {}, "floors": {}, "labels": {}, "bridges": {}, "staff_doors": {}}
-	var maps := {"walls": walls, "floors": floors, "labels": labels, "bridges": bridges, "staff_doors": staff_doors}
+	var moved := {"walls": {}, "floors": {}, "labels": {}, "label_sizes": {}, "bridges": {}, "staff_doors": {}}
+	var maps := {"walls": walls, "floors": floors, "labels": labels, "label_sizes": label_sizes, "bridges": bridges,
+			"staff_doors": staff_doors}
 	for name in maps:
 		var m: Dictionary = maps[name]
 		for c in cells:
@@ -277,6 +291,76 @@ func shift_cells(cells: Array, shift: Vector2i) -> void:
 		_push_quiet(before)
 	_apply()
 	_refresh_ui()
+
+
+## Copy what is built on `cells` (the build panel's Copy and blueprints): rows like the save
+## file's, counted from `origin`.
+func copy_cells(cells: Array, origin: Vector2i) -> Dictionary:
+	var out := {"walls": [], "floors": [], "labels": [], "bridges": [], "staff_doors": []}
+	for c in cells:
+		var d: Vector2i = c - origin
+		if walls.has(c):
+			out["walls"].append([d.x, d.y, walls[c]])
+		if floors.has(c):
+			out["floors"].append([d.x, d.y, floors[c]])
+		if labels.has(c):
+			out["labels"].append([d.x, d.y, labels[c]] + ([label_sizes[c]] if label_sizes.has(c) else []))
+		if bridges.has(c):
+			out["bridges"].append([d.x, d.y])
+		if staff_doors.has(c):
+			out["staff_doors"].append([d.x, d.y])
+	return out
+
+
+## Whether copied blocks (copy_cells) could go down with their top-left at `at`: walls, doors
+## and footbridges not under a machine (or `landing`, where pasted machines go) or on another
+## block. Floor and name signs go anywhere.
+func can_paste(rows: Dictionary, at: Vector2i, landing: Dictionary) -> bool:
+	for kind in ["walls", "bridges", "staff_doors"]:
+		for row in rows.get(kind, []):
+			var c := at + Vector2i(int(row[0]), int(row[1]))
+			if landing.has(c) or _under_machine(c) or walls.has(c) or bridges.has(c) or staff_doors.has(c):
+				return false
+			if kind == "staff_doors" and factory_floor.belt_cells.has(c):
+				return false
+	return true
+
+
+## Put copied blocks down with their top-left at `at`. The build panel records the undo step
+## (as for erase_cells). Returns whether anything changed.
+func paste_cells(rows: Dictionary, at: Vector2i) -> bool:
+	var before := _state()
+	for row in rows.get("walls", []):
+		if row is Array and row.size() == 3 and str(row[2]) in WALL_KINDS:
+			walls[at + Vector2i(int(row[0]), int(row[1]))] = str(row[2])
+	for row in rows.get("floors", []):
+		if row is Array and row.size() == 3 and FLOORS.has(str(row[2])):
+			floors[at + Vector2i(int(row[0]), int(row[1]))] = str(row[2])
+	for row in rows.get("labels", []):
+		if row is Array and row.size() >= 3 and str(row[2]).strip_edges() != "":
+			var lc := at + Vector2i(int(row[0]), int(row[1]))
+			labels[lc] = str(row[2])
+			label_sizes.erase(lc)
+			if row.size() >= 4:
+				_load_size(lc, row[3])
+	for row in rows.get("bridges", []):
+		if row is Array and row.size() >= 2:
+			bridges[at + Vector2i(int(row[0]), int(row[1]))] = true
+	for row in rows.get("staff_doors", []):
+		if row is Array and row.size() >= 2:
+			staff_doors[at + Vector2i(int(row[0]), int(row[1]))] = true
+	var changed := _state() != before
+	if changed:
+		_push_quiet(before)
+	_apply()
+	_refresh_ui()
+	return changed
+
+
+## Whether a block a plain click picks in the build panel stands on `c`: a wall, window, door,
+## belt port, name sign or worker door (not floor or footbridges, so a drag there still pans).
+func block_at(c: Vector2i) -> bool:
+	return walls.has(c) or labels.has(c) or door_at(c)
 
 
 ## Whether a door people use stands on `c`: a worker door, or the first staff door.
@@ -346,7 +430,7 @@ func _save() -> void:
 	var file := FileAccess.open(SAVE_FILE, FileAccess.WRITE)
 	var l: Array = []
 	for c in labels:
-		l.append([c.x, c.y, labels[c]])
+		l.append([c.x, c.y, labels[c]] + ([label_sizes[c]] if label_sizes.has(c) else []))
 	var b: Array = []
 	for c in bridges:
 		b.append([c.x, c.y])
@@ -594,6 +678,7 @@ func _commit(from: Vector2i, to: Vector2i) -> void:
 				walls.erase(c)
 				floors.erase(c)
 				labels.erase(c)
+				label_sizes.erase(c)
 	changed = _state() != before
 	if changed:
 		_undo.append(before)
@@ -628,6 +713,8 @@ func set_tool(id: String) -> void:
 	_close_editor(true)
 	tool = id
 	_drag = {}
+	_resize = {}
+	_label_hover = null
 	for t in _buttons:
 		(_buttons[t] as Button).set_pressed_no_signal(t == id)
 	_refresh_ui()
@@ -641,11 +728,17 @@ func _set_label(c: Vector2i, text: String, move_to = null) -> void:
 	var before := _state()
 	if move_to is Vector2i:
 		var name: String = labels.get(c, "")
+		var s = label_sizes.get(c)
 		labels.erase(c)
+		label_sizes.erase(c)
 		if name != "":
 			labels[move_to] = name
+			label_sizes.erase(move_to)
+			if s != null:
+				label_sizes[move_to] = s
 	elif text.strip_edges() == "":
 		labels.erase(c)
+		label_sizes.erase(c)
 	else:
 		labels[c] = text.strip_edges()
 	if _state() != before:
@@ -657,17 +750,155 @@ func _set_label(c: Vector2i, text: String, move_to = null) -> void:
 	queue_redraw()
 
 
+const LABEL_PAD := 14.0
+const LABEL_H := 44.0
+const LABEL_MAX_CELLS := 48
+
+## The narrowest the sign for the name on `c` can be: just wide enough for its name.
+func _label_min_width(c: Vector2i) -> float:
+	var size := ThemeDB.fallback_font.get_string_size(str(labels.get(c, "")), HORIZONTAL_ALIGNMENT_LEFT, -1, LABEL_SIZE)
+	return size.x + LABEL_PAD * 2.0
+
+
+## How many cells wide the name on `c` needs its sign to be.
+func _label_min_cells(c: Vector2i) -> int:
+	return maxi(1, ceili(_label_min_width(c) / CELL))
+
+
+## The sign's edges `n` cells wide, as near centred on its cell as the grid allows.
+static func _centred_edges(n: int) -> Array:
+	var l := -floori((n - 1) / 2.0)
+	return [l, l + n]
+
+
+## A sign's left and right edges: grid lines counted from its cell's left edge ([0, 1] is just
+## that cell). Signs always sit on grid lines; missing from label_sizes means just wide enough
+## for the name (in whole cells), centred.
+func _label_edges(c: Vector2i) -> Array:
+	var need := _label_min_cells(c)
+	var e = label_sizes.get(c)
+	if e is Array and e.size() == 2 and int(e[1]) - int(e[0]) >= need:
+		return [int(e[0]), int(e[1])]
+	return _centred_edges(need)
+
+
+## Set a sign's edges. Its usual size (just wide enough, centred) is left out of the save.
+func _put_edges(c: Vector2i, l: int, r: int) -> void:
+	if [l, r] == _centred_edges(_label_min_cells(c)):
+		label_sizes.erase(c)
+	else:
+		label_sizes[c] = [l, r]
+
+
+## A saved size: [left, right] grid lines, or from older saves a width in pixels (or, 4 or
+## less, a scale for the whole sign), which becomes the nearest whole cells, centred.
+func _load_size(c: Vector2i, v) -> void:
+	label_sizes.erase(c)
+	if v is Array and v.size() == 2:
+		_put_edges(c, int(v[0]), int(v[1]))
+		return
+	var px := float(v) if (v is float or v is int) else 0.0
+	if px <= 0.0:
+		return
+	if px <= 4.0:
+		px *= _label_min_width(c)
+	var n := clampi(roundi(px / CELL), _label_min_cells(c), LABEL_MAX_CELLS)
+	var e := _centred_edges(n)
+	_put_edges(c, e[0], e[1])
+
+
+## The sign for the name on `c`, drawn on `at`'s row and grid lines (its own cell unless it is
+## being dragged).
+func _label_plate(c: Vector2i, at = null) -> Rect2:
+	var a: Vector2i = at if at is Vector2i else c
+	var e := _label_edges(c)
+	var y := factory_floor.cell_center(a).y
+	return Rect2(Vector2((a.x + int(e[0])) * CELL, y - LABEL_H / 2.0), Vector2((int(e[1]) - int(e[0])) * CELL, LABEL_H))
+
+
+## The handles on a sign's left and right edges that make it wider or narrower.
+func _label_handles(plate: Rect2) -> Array:
+	var y := plate.position.y + plate.size.y / 2.0 - 13.0
+	return [Rect2(plate.position.x - 7.0, y, 14.0, 26.0), Rect2(plate.end.x - 7.0, y, 14.0, 26.0)]
+
+
+func _on_handle(plate: Rect2, at: Vector2) -> bool:
+	return _handle_side(plate, at) != ""
+
+
+## Which edge handle of `plate` is at `at`: "l", "r" or "".
+func _handle_side(plate: Rect2, at: Vector2) -> String:
+	var hs := _label_handles(plate)
+	if (hs[0] as Rect2).grow(3.0).has_point(at):
+		return "l"
+	if (hs[1] as Rect2).grow(3.0).has_point(at):
+		return "r"
+	return ""
+
+
+## The sign under the world point `at` (its cell), or null. The one drawn on top wins.
+func _label_under(at: Vector2):
+	var found = null
+	for c in labels:
+		var p := _label_plate(c)
+		if p.has_point(at) or _on_handle(p, at):
+			found = c
+	return found
+
+
+## An edge is being dragged: it snaps to the nearest grid line and the other edge stays put.
+## The sign stays at least as wide as its name.
+func _resize_to(at: Vector2) -> void:
+	var c: Vector2i = _resize["cell"]
+	var e := _label_edges(c)
+	var l: int = e[0]
+	var r: int = e[1]
+	var need := _label_min_cells(c)
+	var g := roundi(at.x / CELL) - c.x
+	if _resize.get("side", "r") == "l":
+		l = clampi(g, r - LABEL_MAX_CELLS, r - need)
+	else:
+		r = clampi(g, l + need, l + LABEL_MAX_CELLS)
+	# Keep the sign's cell under the sign (Erase and picking work on that cell).
+	var shift := 0
+	if l > 0:
+		shift = l
+	elif r <= 0:
+		shift = r - 1
+	if shift != 0 and not labels.has(c + Vector2i(shift, 0)):
+		var to := c + Vector2i(shift, 0)
+		labels[to] = labels[c]
+		labels.erase(c)
+		label_sizes.erase(c)
+		l -= shift
+		r -= shift
+		_resize["cell"] = to
+		if _label_hover == c:
+			_label_hover = to
+		c = to
+	_put_edges(c, l, r)
+	queue_redraw()
+
+
 func _open_editor(c: Vector2i) -> void:
 	_editor_cell = c
 	_editor.text = labels.get(c, "")
 	_editor.placeholder_text = "Room name"
-	var screen := get_viewport().get_canvas_transform() * factory_floor.cell_center(c)
+	var screen := get_viewport().get_canvas_transform() * (_label_plate(c).get_center() if labels.has(c) else factory_floor.cell_center(c))
 	_editor.size = Vector2(220, 0)
 	_editor.position = screen - Vector2(110, 18)
 	_editor.visible = true
 	_editor.grab_focus()
 	_editor.select_all()
 	queue_redraw()
+
+
+## Esc while typing a name: keep the old name (a new sign is simply not made).
+func _editor_key(e: InputEvent) -> void:
+	var k := e as InputEventKey
+	if k and k.pressed and k.keycode == KEY_ESCAPE:
+		_editor.accept_event()
+		_close_editor(false)
 
 
 ## keep: true writes what was typed, false throws it away.
@@ -716,26 +947,55 @@ func _unhandled_input(event: InputEvent) -> void:
 		if not factory_floor.ghost.is_empty():
 			set_tool("")  # the build panel is placing or moving a machine
 			return
+		if tool == "label":
+			if not _resize.is_empty():
+				_resize_to(at)
+				return
+			var under = _label_under(at) if _drag.is_empty() else _label_hover
+			if under != _label_hover:
+				_label_hover = under
+				queue_redraw()
 		if c != _hover:
 			_hover = c
 			if not _drag.is_empty():
-				_drag["to"] = c
+				var grab: Vector2i = _drag.get("grab", Vector2i.ZERO)
+				_drag["to"] = c - grab
 			queue_redraw()
 		return
 	var button := event as InputEventMouseButton
-	if button == null or button.button_index != MOUSE_BUTTON_LEFT:
+	if button == null:
+		return
+	if button.button_index != MOUSE_BUTTON_LEFT:
 		return
 	if tool == "label":
 		if button.pressed:
 			_close_editor(true)
-			_drag = {"from": c, "to": c}
+			var under = _label_under(at)
+			if under is Vector2i and _on_handle(_label_plate(under), at):
+				_resize = {"cell": under, "before": _state(), "side": _handle_side(_label_plate(under), at)}
+			elif under is Vector2i:
+				var sign_cell: Vector2i = under
+				_drag = {"from": sign_cell, "to": sign_cell, "grab": c - sign_cell}  # a press anywhere on it
+			else:
+				_drag = {"from": c, "to": c}
+		elif not _resize.is_empty():
+			var before: Dictionary = _resize["before"]
+			_resize = {}
+			if _state() != before:
+				_undo.append(before)
+				undo_pushed.emit()
+				if _undo.size() > UNDO_MAX:
+					_undo.pop_front()
+				_refresh_ui()
 		elif not _drag.is_empty():
 			var from: Vector2i = _drag["from"]
+			var to: Vector2i = _drag["to"]
 			_drag = {}
-			if labels.has(from) and c != from:
-				_set_label(from, "", c)  # moved
+			if labels.has(from) and to != from:
+				_set_label(from, "", to)  # moved
 			else:
 				_open_editor(from)
+			_label_hover = _label_under(at)
 		queue_redraw()
 		get_viewport().set_input_as_handled()
 		return
@@ -901,20 +1161,24 @@ func _draw_labels() -> void:
 		if _editor != null and _editor.visible and c == _editor_cell:
 			continue
 		var text: String = labels[c]
-		var size := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, LABEL_SIZE)
-		var center := factory_floor.cell_center(c)
-		var plate := Rect2(center - Vector2(size.x / 2.0 + 14, 22), Vector2(size.x + 28, 44))
+		var at = c
 		if not _drag.is_empty() and picking and _drag["from"] == c and _drag["to"] != c:
-			plate.position += factory_floor.cell_center(_drag["to"]) - center
-			center = factory_floor.cell_center(_drag["to"])
+			at = _drag["to"]
+		var plate := _label_plate(c, at)
+		var center := plate.get_center()
 		draw_rect(Rect2(plate.position + Vector2(4, 5), plate.size), COLOR_SHADOW)
 		draw_rect(plate.grow(2), COLOR_OUTLINE)
 		draw_rect(plate, Color(0.11, 0.12, 0.14, 0.92))
-		draw_rect(plate.grow(-3), COLOR_WALL_TOP, false, 1.0)
-		draw_string(font, Vector2(plate.position.x + 14, center.y + LABEL_SIZE * 0.36), text,
+		draw_rect(plate.grow(-3.0), COLOR_WALL_TOP, false, 1.0)
+		var tw := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, LABEL_SIZE).x
+		draw_string(font, Vector2(center.x - tw / 2.0, center.y + LABEL_SIZE * 0.36), text,
 				HORIZONTAL_ALIGNMENT_LEFT, -1, LABEL_SIZE, Color("E6E9EF"))
-		if picking and c == _hover:
+		var active: bool = picking and (c == _label_hover or (not _resize.is_empty() and _resize["cell"] == c))
+		if active:
 			draw_rect(plate.grow(5), COLOR_ACCENT, false, 2.0)
+			for handle in _label_handles(plate):
+				draw_rect(handle, COLOR_ACCENT)
+				draw_rect(handle, COLOR_OUTLINE, false, 2.0)
 
 
 func _arm(o: Vector2, d: String) -> Rect2:
@@ -1037,6 +1301,8 @@ func _door_leaf(r: Rect2, edge: String) -> void:
 func _draw_preview() -> void:
 	if tool == "" or factory_floor == null or not factory_floor.editing:
 		return
+	if tool == "label" and (_label_hover != null or not _resize.is_empty() or not _drag.is_empty()):
+		return  # the sign itself is lit up (or being moved or resized)
 	if _drag.is_empty():
 		var r := Rect2(Vector2(_hover) * CELL, Vector2(CELL, CELL))
 		draw_rect(r.grow(-2), COLOR_ACCENT if tool != "erase" else COLOR_FAIL, false, 2.0)
@@ -1161,6 +1427,9 @@ func _build_ui() -> void:
 	_ui.add_child(_editor)
 	_editor.text_submitted.connect(func(_t: String) -> void: _close_editor(true))
 	_editor.focus_exited.connect(func() -> void: _close_editor(true))
+	# Esc while typing: throw the edit away. Caught here, before the LineEdit or the
+	# rest of build mode sees it, so the same press doesn't also drop the tool.
+	_editor.gui_input.connect(_editor_key)
 	_refresh_ui()
 
 

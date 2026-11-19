@@ -74,6 +74,12 @@ static func storages_of(p: Dictionary) -> Array:
 	return (raw as Array).filter(func(s) -> bool: return s is Dictionary) if raw is Array else []
 
 
+## Whether a storage is switched on. One switched off ("enabled": false) stays belted in, but
+## isn't checked and brings nothing in.
+static func storage_on(st: Dictionary) -> bool:
+	return st.get("enabled", true) != false
+
+
 ## The storages whose belt runs into this pipeline's intake.
 static func fed_storages(p: Dictionary) -> Array:
 	var into := {}
@@ -103,13 +109,13 @@ static func bins_of(p: Dictionary) -> Array:
 		if b is Dictionary:
 			out.append(str(b.get("id", "")))
 	return out
-const STORAGE_NAMES := {"github": "GitHub issues", "jira": "Jira issues", "github_pr": "Open PRs",
+const STORAGE_NAMES := {"custom": "Custom", "github": "GitHub issues", "jira": "Jira issues", "github_pr": "Open PRs",
 		"pr_review": "PRs to review", "prd": "PRDs"}
-const STORAGE_ICONS := {"github": "icon_github", "jira": "icon_jira", "github_pr": "icon_pr",
+const STORAGE_ICONS := {"custom": "icon_crate", "github": "icon_github", "jira": "icon_jira", "github_pr": "icon_pr",
 		"pr_review": "icon_review_request", "prd": "icon_prd"}
-const STORAGE_DEFAULT_FILTERS := {"github": "labelled factory", "jira": "the factory's JQL",
+const STORAGE_DEFAULT_FILTERS := {"custom": "click to describe a change", "github": "labelled factory", "jira": "the factory's JQL",
 		"github_pr": "author:@me", "pr_review": "waiting for my review", "prd": "labelled prd"}
-const SOURCE_SHORT := {"game": "Typed", "github": "GitHub", "jira": "Jira", "pr_review": "PR reviews", "prd": "PRDs", "github_pr": "Open PRs"}
+const SOURCE_SHORT := {"custom": "Custom", "game": "Typed", "github": "GitHub", "jira": "Jira", "pr_review": "PR reviews", "prd": "PRDs", "github_pr": "Open PRs"}
 const ROUTE_MARGIN := 5  # how far outside the machines a belt may wander
 const BRIDGE_COST := 4  # a belt bridges over another only when going round costs more
 
@@ -144,6 +150,7 @@ var pipelines: Array = []  # the graphs being shown (belt paths are filled in by
 var catalog := {}  # type -> catalogue summary (sprite, steps, description...)
 var points := {}  # location -> Vector2 (world position where crates sit)
 var footprints := {}  # machine id or "<pid>:<station>" -> Vector2i top-left cell
+var rotations := {}  # footprint key -> quarter turns clockwise (0: inputs west, outputs east)
 var owner_of := {}  # footprint key -> pipeline id
 var machines := {}  # id -> {name, sprite, steps, gate, state, progress, step, waiting, pipeline}
 var order := {}  # pipeline id -> machine ids in travel order (following pass belts, up to a sorter)
@@ -175,6 +182,9 @@ var group_cells := {}  # room block cells picked with them (Vector2i -> true)
 var select_box := Rect2()  # the box being dragged to pick them (world), or empty
 var ghost := {}  # {"pos": Vector2i, "ok": bool} where a machine is being placed or moved
 var wire := {}  # {"from": Vector2, "to": Vector2, "kind": "pass"|"fail"} a belt being dragged
+## Ports with a belt on them: "out:<key>:<port>" or "in:<key>:<kind>" -> "link" (a belt that
+## carries crates) or "conveyor" (a free conveyor attached there, not linked yet). Drawn lit.
+var attached := {}
 
 var _machine_layer: CanvasItem
 var _textures := {}
@@ -238,6 +248,7 @@ func set_pipelines(pipeline_list: Array, catalog_list: Array = []) -> void:
 	var old := machines
 	points.clear()
 	footprints.clear()
+	rotations.clear()
 	owner_of.clear()
 	order.clear()
 	machines = {}
@@ -249,18 +260,22 @@ func set_pipelines(pipeline_list: Array, catalog_list: Array = []) -> void:
 				continue  # a line can ship and scrap into another line's dock and bin
 			var key := "%s:%s" % [pid, station]
 			footprints[key] = _cell(p[station].get("pos", [0, 0]))
+			rotations[key] = turns_of(p[station])
 			owner_of[key] = pid
 		for b in p.get("bins", []) + p.get("docks", []):
 			var key := "%s:%s" % [pid, str(b.get("id", ""))]
 			footprints[key] = _cell(b.get("pos", [0, 0]))
+			rotations[key] = turns_of(b)
 			owner_of[key] = pid
 		for st in storages_of(p):
 			var key := "%s:%s" % [pid, str(st.get("id", ""))]
 			footprints[key] = _cell(st.get("pos", [0, 0]))
+			rotations[key] = turns_of(st)
 			owner_of[key] = pid
 		for m in p.get("machines", []):
 			var id := str(m.get("id", ""))
 			footprints[id] = _cell(m.get("pos", [0, 0]))
+			rotations[id] = turns_of(m)
 			owner_of[id] = pid
 			var base: Dictionary = catalog.get(str(m.get("type", "")), {})
 			var previous: Dictionary = old.get(id, {})
@@ -271,6 +286,8 @@ func set_pipelines(pipeline_list: Array, catalog_list: Array = []) -> void:
 				"sprite": str(m.get("sprite", base.get("sprite", "coder"))),
 				"steps": steps.size() if steps is Array else 0,
 				"gate": gated(m, base),
+				# Switched off in build mode: runs nothing, crates pass straight through.
+				"off": bool(base.get("can_switch_off", false)) and m.get("enabled", true) == false,
 				"auto_approve": str(m.get("auto_approve", "")),
 				"uses_agent": bool(m.get("uses_agent", base.get("uses_agent", false))),
 				"sorter": bool(m.get("sorter", base.get("sorter", false))),
@@ -289,6 +306,37 @@ func set_pipelines(pipeline_list: Array, catalog_list: Array = []) -> void:
 	_route_all()
 	_place_points()
 	_redraw()
+
+
+## How far a node is turned: quarter turns clockwise from the usual way round (belts in on the
+## west side, out on the east). Saved as "rot" on the machine or station.
+static func turns_of(node: Dictionary) -> int:
+	var raw = node.get("rot", 0)
+	return posmod(int(raw), 4) if (raw is int or raw is float) else 0
+
+
+func rot_of(key: String) -> int:
+	return int(rotations.get(key, 0))
+
+
+## A cell of a 2x2 footprint (or just outside it), from its top-left, turned r quarter turns
+## clockwise about the footprint's middle.
+static func turn_cell(c: Vector2i, r: int) -> Vector2i:
+	for i in posmod(r, 4):
+		c = Vector2i(1 - c.y, c.x)
+	return c
+
+
+## A point in a 2x2 footprint (pixels from its top-left), turned r quarter turns clockwise.
+static func turn_point(p: Vector2, r: int) -> Vector2:
+	for i in posmod(r, 4):
+		p = Vector2(2 * CELL - p.y, p.x)
+	return p
+
+
+## The way a belt runs into this node's inputs (index into DIR_NAMES): east unless it's turned.
+func in_dir(key: String) -> int:
+	return (1 + rot_of(key)) % 4
 
 
 func _cell(raw) -> Vector2i:
@@ -452,14 +500,14 @@ func node_key(pid: String, node: String) -> String:
 ## The cell just outside a node's output port, where a belt starts.
 func out_cell(key: String, port: String) -> Vector2i:
 	var tl: Vector2i = footprints.get(key, Vector2i.ZERO)
-	if SORTER_PORTS.has(port):
-		return tl + SORTER_PORTS[port][0]
-	return tl + Vector2i(2, 1 if port == "fail" else 0)
+	var local: Vector2i = SORTER_PORTS[port][0] if SORTER_PORTS.has(port) else Vector2i(2, 1 if port == "fail" else 0)
+	return tl + turn_cell(local, rot_of(key))
 
 
-## The way a belt leaves this port (index into DIR_NAMES): east, or a sorter's side.
-func port_dir(port: String) -> int:
-	return int(SORTER_PORTS[port][1]) if SORTER_PORTS.has(port) else 1
+## The way a belt leaves this port (index into DIR_NAMES): east, or a sorter's side, turned
+## with the node (key) it's on.
+func port_dir(port: String, key := "") -> int:
+	return ((int(SORTER_PORTS[port][1]) if SORTER_PORTS.has(port) else 1) + rot_of(key)) % 4
 
 
 ## True if the cell is under a machine, station, bin or storage.
@@ -473,14 +521,25 @@ func under_node(c: Vector2i) -> bool:
 ## The cell just outside a node's input, where a belt ends.
 func in_cell(key: String, kind: String) -> Vector2i:
 	var tl: Vector2i = footprints.get(key, Vector2i.ZERO)
-	return tl + Vector2i(-1, 1 if kind == "fail" else 0)
+	return tl + turn_cell(Vector2i(-1, 1 if kind == "fail" else 0), rot_of(key))
 
 
 ## World positions of a node's output ports: {port: Vector2}. Used to draw and to grab them.
 func output_ports(key: String) -> Dictionary:
+	var out := _output_ports_unturned(key)
+	if out.is_empty():
+		return out
+	var tl := Vector2(footprints[key]) * CELL
+	for port in out:
+		out[port] = tl + turn_point(out[port], rot_of(key))
+	return out
+
+
+## Where a node's output ports are on it before it's turned (pixels from its top-left).
+func _output_ports_unturned(key: String) -> Dictionary:
 	if not footprints.has(key):
 		return {}
-	var tl := Vector2(footprints[key]) * CELL
+	var tl := Vector2.ZERO
 	if key.ends_with(":intake") or is_storage(key):
 		return {"out": tl + Vector2(2 * CELL, 0.5 * CELL)}
 	if is_dock(key) or is_bin(key):
@@ -496,11 +555,54 @@ func output_ports(key: String) -> Dictionary:
 	return {"pass": tl + Vector2(2 * CELL, 0.5 * CELL), "fail": tl + Vector2(2 * CELL, 1.5 * CELL)}
 
 
+## The inputs a node takes belts at: "pass" (its upper west cell) and "fail" (the lower one).
+## An intake takes only the upper one (from storages); a storage has none.
+func input_kinds(key: String) -> Array:
+	if not footprints.has(key) or is_storage(key):
+		return []
+	if key.ends_with(":intake"):
+		return ["pass"]
+	return ["pass", "fail"]
+
+
+## World positions of a node's inputs, on its west edge: {kind: Vector2}.
+func input_ports(key: String) -> Dictionary:
+	var out := {}
+	for kind in input_kinds(key):
+		out[kind] = Vector2(footprints[key]) * CELL \
+				+ turn_point(Vector2(0, (1.5 if kind == "fail" else 0.5) * CELL), rot_of(key))
+	return out
+
+
+## The output whose belt starts on cell c: [footprint key, port], or [].
+func output_at_cell(c: Vector2i) -> Array:
+	for key in footprints:
+		for port in output_ports(key):
+			if out_cell(key, port) == c:
+				return [key, port]
+	return []
+
+
+## The input whose belt ends on cell c: [footprint key, kind], or [].
+func input_at_cell(c: Vector2i) -> Array:
+	for key in footprints:
+		for kind in input_kinds(key):
+			if in_cell(key, kind) == c:
+				return [key, kind]
+	return []
+
+
+## The side of a port's belt cell that the port is on (a belt runs in from there).
+func port_side(port: String, key := "") -> String:
+	return OPPOSITE[DIR_NAMES[port_dir(port, key)]]
+
+
 # Routing ---------------------------------------------------------------------
 
 func _route_all() -> void:
 	routes.clear()
 	belt_cells.clear()
+	attached.clear()
 	var solid := {}  # cells under machines and stations
 	var first := true
 	for key in footprints:
@@ -525,7 +627,8 @@ func _route_all() -> void:
 	for joining in [false, true]:  # ones that run into another's side after the rest
 		for p in pipelines:
 			for conv in conveyors_of(p):
-				if bool(conv.get("join", false)) == joining:
+				if bool(conv.get("join", false)) == joining and not conv.get("feeds", false) \
+						and not conv.get("onto_link", false):
 					_lay_conveyor(str(p.get("id", "")), conv, solid)
 
 	for p in pipelines:
@@ -535,13 +638,39 @@ func _route_all() -> void:
 		var belts: Array = p.get("belts", [])
 		for b in belts:
 			var kind := "fail" if str(b.get("port", "")) == "fail" else "pass"
+			var to_key := node_key(pid, str(b.get("to", "")))
+			var laid_to := _laid_into(b, to_key)
 			reserved[out_cell(node_key(pid, str(b.get("from", ""))), str(b.get("port", "")))] = true
-			reserved[in_cell(node_key(pid, str(b.get("to", ""))), kind)] = true
+			reserved[in_cell(to_key, laid_to if laid_to != "" else kind)] = true
 		# Pass belts first, in travel order, then the rework belts, then the belts into bins.
 		var sorted := belts.duplicate()
 		sorted.sort_custom(func(a, b) -> bool: return _belt_rank(pid, a) < _belt_rank(pid, b))
 		for b in sorted:
 			_route_belt(pid, b, solid, reserved)
+
+	# Free conveyors that run into the start of a link (the part of a belt laid past a
+	# machine's output before it reached the port), or into a link's side: after the links.
+	for p in pipelines:
+		for conv in conveyors_of(p):
+			if conv.get("feeds", false) or conv.get("onto_link", false):
+				_lay_conveyor(str(p.get("id", "")), conv, solid)
+
+	# Ports with a link on them are lit.
+	for r in routes:
+		if not r["ok"] or str(r.get("from", "")).is_empty():
+			continue
+		var from_key := node_key(r["pid"], r["from"])
+		var to_key := node_key(r["pid"], r["to"])
+		attached["out:%s:%s" % [from_key, r["port"]]] = "link"
+		var cells: Array = r["cells"]
+		if not cells.is_empty() and cells[-1] == in_cell(to_key, str(r.get("in_kind", r["kind"]))):
+			attached["in:%s:%s" % [to_key, str(r.get("in_kind", r["kind"]))]] = "link"
+		elif not cells.is_empty():
+			# Joined another belt into the same place: that belt's input is the one lit.
+			for kind in input_kinds(to_key):
+				var owner := int(belt_cells.get(in_cell(to_key, kind), {}).get("route", -1))
+				if owner >= 0 and owner < routes.size() and node_key(routes[owner]["pid"], routes[owner]["to"]) == to_key:
+					attached["in:%s:%s" % [to_key, kind]] = "link"
 
 
 ## A pipeline's free conveyors: [{"id": "conv_1", "cells": [[x, y], ...], "loop": bool}]. Belt
@@ -560,7 +689,8 @@ func _lay_conveyor(pid: String, conv: Dictionary, solid: Dictionary) -> void:
 				break  # a machine or wall landed on it since: it stops short
 			cells.append(cell)
 	# It may bridge straight over another conveyor; anywhere else on one, it stops short.
-	var joins := bool(conv.get("join", false))
+	var joins := bool(conv.get("join", false)) or bool(conv.get("feeds", false)) \
+			or bool(conv.get("onto_link", false))
 	for i in cells.size():
 		if joins and i == cells.size() - 1 and i > 0 and belt_cells.has(cells[i]):
 			break  # runs into another conveyor's side there
@@ -579,8 +709,34 @@ func _lay_conveyor(pid: String, conv: Dictionary, solid: Dictionary) -> void:
 	elif cells.size() > 1:
 		route["entry"] = _side(cells[0], cells[0] - (cells[1] - cells[0]))
 		route["exit"] = _side(cells[-1], cells[-1] + (cells[-1] - cells[-2]))
+	if not loop:
+		# Laid from a machine's output: it runs out of the port. Laid to an input: into it.
+		var src := output_at_cell(cells[0])
+		if not src.is_empty():
+			route["entry"] = port_side(src[1], src[0])
+			attached["out:%s:%s" % [src[0], src[1]]] = "conveyor"
+		var dst := input_at_cell(cells[-1])
+		if not dst.is_empty() and not (joins and cells.size() > 1 and belt_cells.has(cells[-1])):
+			route["exit"] = DIR_NAMES[in_dir(dst[0])]  # into the input, the way the node faces
+			attached["in:%s:%s" % [dst[0], dst[1]]] = "conveyor"
 	routes.append(route)
-	_mark_cells(routes.size() - 1, route)
+	var index := routes.size() - 1
+	_mark_cells(index, route)
+	# Running past a machine's output on the way (or round a loop): the port feeds onto it
+	# from the side, as a merge piece, and is lit.
+	for i in cells.size():
+		if not loop and (i == 0 or i == cells.size() - 1):
+			continue
+		var past := output_at_cell(cells[i])
+		if past.is_empty():
+			continue
+		var cell: Dictionary = belt_cells.get(cells[i], {})
+		var side := port_side(past[1], past[0])
+		if int(cell.get("route", -1)) != index or cell.has("over") or str(cell["out"]) == side:
+			continue
+		if not side in cell["in"]:
+			(cell["in"] as Array).append(side)
+		attached["out:%s:%s" % [past[0], past[1]]] = "conveyor"
 	for c in cells:
 		bounds = bounds.merge(Rect2i(c, Vector2i.ONE))
 
@@ -588,7 +744,12 @@ func _lay_conveyor(pid: String, conv: Dictionary, solid: Dictionary) -> void:
 func _belt_rank(pid: String, b: Dictionary) -> int:
 	var from := str(b.get("from", ""))
 	if is_storage(from):
-		return -2  # into the intake, before the line's own belts
+		# Into the intake, before the line's own belts (the intake's own is -1).
+		# Laid by hand first (where you put them), then ones laid by hand into another's side,
+		# then the ones that find their own way, which can join any of those.
+		if b.get("manual", false):
+			return -3 if b.get("join", false) else -4
+		return -2
 	var index := -1 if from == "intake" else int(depth.get(from, 900))
 	if b.get("join", false) and b.get("manual", false):
 		index += 5000  # laid by hand into another belt's side: after that belt
@@ -605,7 +766,7 @@ func _route_belt(pid: String, b: Dictionary, solid: Dictionary, reserved: Dictio
 	var port := str(b.get("port", "pass"))
 	var kind := "fail" if port == "fail" else "pass"
 	var route := {"pid": pid, "from": str(b.get("from", "")), "port": port, "to": str(b.get("to", "")),
-			"kind": kind, "cells": [], "ok": false, "belt": b, "dir": port_dir(port)}
+			"kind": kind, "cells": [], "ok": false, "belt": b, "dir": port_dir(port, from_key)}
 	if not footprints.has(from_key) or not footprints.has(to_key):
 		routes.append(route)
 		return
@@ -624,11 +785,13 @@ func _route_belt(pid: String, b: Dictionary, solid: Dictionary, reserved: Dictio
 	var cells := _stored_path(b)
 	if not _path_fits(cells, start, goal, joins, solid, reserved):
 		b.erase("manual")  # a belt laid by hand that no longer fits is routed like any other
-		cells = _find_path(start, goal, joins, solid, reserved, ROUTE_MARGIN, route["dir"])
+		cells = _find_path(start, goal, joins, solid, reserved, ROUTE_MARGIN, route["dir"], in_dir(to_key))
 		if cells.is_empty():  # boxed in nearby: look further out before giving up
-			cells = _find_path(start, goal, joins, solid, reserved, ROUTE_MARGIN * 4, route["dir"])
+			cells = _find_path(start, goal, joins, solid, reserved, ROUTE_MARGIN * 4, route["dir"], in_dir(to_key))
 	if not cells.is_empty():
 		route["cells"] = cells
+		if cells[-1] == goal:
+			route["exit"] = DIR_NAMES[in_dir(to_key)]  # its last piece turns into the input
 		route["ok"] = true
 		var saved: Array = []
 		for c in cells:
@@ -643,20 +806,19 @@ func _route_belt(pid: String, b: Dictionary, solid: Dictionary, reserved: Dictio
 
 
 ## Which input a belt goes into: a rework belt into the lower one, the rest into the upper.
-## A belt merger has two inputs alike: a belt laid by hand keeps the one it was laid to, and
-## the others share them out.
+## A belt laid by hand keeps the input it was laid to, whichever that is (into a dock or scrap
+## bin either input will do). A belt merger has two inputs alike: the others share them out.
 func _in_kind(_pid: String, b: Dictionary, to_key: String, kind: String) -> String:
-	if not is_merger(to_key):
-		return kind
 	var path := _stored_path(b)
-	if not path.is_empty():
+	if is_merger(to_key) and not path.is_empty():
 		var owner := int(belt_cells.get(path[-1], {}).get("route", -1))
 		if owner >= 0 and node_key(routes[owner]["pid"], routes[owner]["to"]) == to_key:
 			return str(routes[owner].get("in_kind", routes[owner]["kind"]))  # joins that belt
-		if path[-1] == in_cell(to_key, "fail"):
-			return "fail"
-		if path[-1] == in_cell(to_key, "pass"):
-			return "pass"
+	var laid_to := _laid_into(b, to_key)
+	if laid_to != "":
+		return laid_to
+	if not is_merger(to_key):
+		return kind
 	var upper := 0
 	var lower := 0
 	for other in routes:
@@ -666,6 +828,21 @@ func _in_kind(_pid: String, b: Dictionary, to_key: String, kind: String) -> Stri
 			else:
 				upper += 1
 	return "fail" if upper > lower else "pass"
+
+
+## The input ("pass" upper, "fail" lower) a belt laid by hand (or any into a merger) was laid
+## to, from where its saved path ends; "" if it doesn't end at one.
+func _laid_into(b: Dictionary, to_key: String) -> String:
+	if not (b.get("manual", false) or is_merger(to_key)):
+		return ""
+	var path := _stored_path(b)
+	if path.is_empty():
+		return ""
+	if path[-1] == in_cell(to_key, "fail"):
+		return "fail"
+	if path[-1] == in_cell(to_key, "pass"):
+		return "pass"
+	return ""
 
 
 func _stored_path(b: Dictionary) -> Array:
@@ -689,17 +866,28 @@ func _path_fits(cells: Array, start: Vector2i, goal: Vector2i, joins: Dictionary
 		var c: Vector2i = cells[i]
 		if i > 0 and (c - cells[i - 1]).length_squared() != 1:
 			return false
-		if room_walls.has(c) and (i == 0 or not _port_ok(c, c - cells[i - 1])
-				or (i < cells.size() - 1 and cells[i + 1] - c != c - cells[i - 1])):
+		if room_walls.has(c) and not _through_port(cells, i):
 			return false
 		var is_join := i == cells.size() - 1 and joins.has(c)
 		var bridges: bool = belt_cells.has(c) and not is_join and i > 0 and i < cells.size() - 1 \
 				and (cells[i + 1] - c) == (c - cells[i - 1]) and _can_bridge(c, _side(cells[i - 1], c))
 		if solid.has(c) or (belt_cells.has(c) and not is_join and not bridges):
 			return false
-		if reserved.has(c) and c != start and c != goal:
+		if reserved.has(c) and c != start and c != goal and not is_join:
 			return false
 	return true
+
+
+## Whether the belt along `cells` goes straight across the belt port at cells[i]. Its first cell
+## may be a port (a machine's output stands right at a room wall): that one by the way it leaves.
+func _through_port(cells: Array, i: int) -> bool:
+	var c: Vector2i = cells[i]
+	var came: Vector2i = c - cells[i - 1] if i > 0 else Vector2i.ZERO
+	var goes: Vector2i = cells[i + 1] - c if i < cells.size() - 1 else Vector2i.ZERO
+	if came != Vector2i.ZERO and goes != Vector2i.ZERO and came != goes:
+		return false  # turns on the port
+	var step := came if came != Vector2i.ZERO else goes
+	return step != Vector2i.ZERO and _port_ok(c, step)
 
 
 func _blocked(c: Vector2i, start: Vector2i, goal: Vector2i, joins: Dictionary, solid: Dictionary,
@@ -708,6 +896,8 @@ func _blocked(c: Vector2i, start: Vector2i, goal: Vector2i, joins: Dictionary, s
 		return true
 	if belt_cells.has(c) and not joins.has(c):
 		return true
+	if belt_cells.has(c) and joins.has(c):
+		return false  # onto a belt going the same place, even at its start (a storage boxed in behind another)
 	return reserved.has(c) and c != start and c != goal
 
 
@@ -716,7 +906,7 @@ func _blocked(c: Vector2i, start: Vector2i, goal: Vector2i, joins: Dictionary, s
 ## A state is Vector3i(x, y, d): the cell and the way it was entered (index into DIR_NAMES);
 ## d + 4 marks "at the goal, turned to face the machine".
 func _find_path(start: Vector2i, goal: Vector2i, joins: Dictionary, solid: Dictionary,
-		reserved: Dictionary, margin := ROUTE_MARGIN, dir := 1) -> Array:
+		reserved: Dictionary, margin := ROUTE_MARGIN, dir := 1, goal_dir := 1) -> Array:
 	if _blocked(start, start, goal, joins, solid, reserved):
 		return []
 	var area := bounds.merge(Rect2i(start, Vector2i.ONE)).merge(Rect2i(goal, Vector2i.ONE)).grow(margin)
@@ -738,7 +928,7 @@ func _find_path(start: Vector2i, goal: Vector2i, joins: Dictionary, solid: Dicti
 			if int(best.get(state, -1)) != cost:
 				continue
 			if c == goal:
-				if state.z == 1:  # already facing the machine
+				if state.z == goal_dir:  # already facing the machine's input
 					found = state
 					break
 				_push(buckets, cost + 1, Vector3i(c.x, c.y, state.z + 4))
@@ -892,10 +1082,12 @@ func _place_points() -> void:
 		# Shipped crates stack up just past the dock, scrapped ones beside the bin.
 		for dock in docks_of(p):
 			if footprints.has("%s:%s" % [pid, dock]):
-				points["%s:%s" % [pid, dock]] = cell_center(footprints["%s:%s" % [pid, dock]] + Vector2i(2, 1))
+				points["%s:%s" % [pid, dock]] = cell_center(footprints["%s:%s" % [pid, dock]]
+						+ turn_cell(Vector2i(2, 1), rot_of("%s:%s" % [pid, dock])))
 		for bin in bins_of(p):
 			if footprints.has("%s:%s" % [pid, bin]):
-				points["%s:%s" % [pid, bin]] = cell_center(footprints["%s:%s" % [pid, bin]] + Vector2i(2, 1))
+				points["%s:%s" % [pid, bin]] = cell_center(footprints["%s:%s" % [pid, bin]]
+						+ turn_cell(Vector2i(2, 1), rot_of("%s:%s" % [pid, bin])))
 		for id in chain:
 			points[id] = _center(footprints[id])
 		for id in machines:
@@ -941,12 +1133,17 @@ func _cells_of(pid: String, from: String, port: String) -> Array:
 ## World points along a belt, from its first cell to where it ends (following a join).
 func belt_points(pid: String, from: String, port: String) -> Array:
 	var r := _route_of(pid, from, port)
-	var out: Array = []
 	if not r.get("ok", false):
-		return out
+		return []
+	return _ride(r, 0)
+
+
+## World points along route r from its cell at index start, then on along whatever it joins.
+func _ride(r: Dictionary, start: int) -> Array:
+	var out: Array = []
 	var cells: Array = r["cells"]
-	for c in cells:
-		out.append(cell_center(c))
+	for k in range(start, cells.size()):
+		out.append(cell_center(cells[k]))
 	# Joined another belt (maybe one that joins a third): carry on along it to where it ends.
 	var used := [r]
 	var last: Vector2i = cells[-1]
@@ -971,6 +1168,32 @@ func belt_points(pid: String, from: String, port: String) -> Array:
 			out.append(cell_center(more[k]))
 		last = more[-1]
 	return out
+
+
+## Where a new crate rides from the storage it came out of to the intake that storage feeds:
+## from inside the storage (hidden under it), out of its port, along its belt and any conveyor
+## or belt that belt joins. Empty when the storage isn't on the floor or has no belt laid.
+func storage_path(pid: String, storage: String) -> Array:
+	var key := node_key(pid, storage)
+	if not footprints.has(key):
+		return []
+	var path := belt_points(pid, storage, "out")
+	if path.is_empty():
+		# Laid by hand as a free conveyor out of the port: ride whatever starts there.
+		var start := out_cell(key, "out")
+		for r in routes:
+			if r.get("ok", false) and (r["cells"] as Array).find(start) >= 0:
+				path = _ride(r, (r["cells"] as Array).find(start))
+				break
+	if path.is_empty():
+		return []
+	var box := Rect2(Vector2(footprints[key]) * CELL, Vector2(2, 2) * CELL)
+	var first: Vector2 = path[0]
+	var mid := box.get_center()
+	var inside := Vector2(mid.x, first.y) if absf(first.x - mid.x) >= absf(first.y - mid.y) \
+			else Vector2(first.x, mid.y)
+	path.push_front(inside.clamp(box.position, box.end))
+	return path
 
 
 ## The pipeline a location belongs to, and the place in it ("belt_2", "coder"...).
@@ -1300,6 +1523,26 @@ func set_ghost(value: Dictionary) -> void:
 	_redraw()
 
 
+## A copy or blueprint following the mouse (build_panel.gd's paste): each footprint with the
+## way it faces, its belts' and room blocks' cells, and a line round the lot.
+func _draw_paste_ghost(canvas: CanvasItem) -> void:
+	var col := Color(0.35, 0.75, 0.4, 0.35) if ghost.get("ok", false) else Color(0.9, 0.28, 0.3, 0.35)
+	for c in ghost.get("cells", []):
+		canvas.draw_rect(Rect2(Vector2(c) * CELL, Vector2(CELL, CELL)).grow(-6), Color(col, 0.2))
+	for part in ghost["parts"]:
+		var g := Rect2(Vector2(part["pos"]) * CELL, Vector2(2, 2) * CELL)
+		canvas.draw_rect(g, col)
+		canvas.draw_rect(g, col.lightened(0.3), false, 2.0)
+		var d := Vector2(DIRS[DIR_NAMES[(1 + int(part.get("rot", 0))) % 4]])
+		var mid := g.get_center()
+		var side := Vector2(-d.y, d.x) * 10.0
+		canvas.draw_line(mid - d * 24.0, mid + d * 12.0, Color(1, 1, 1, 0.75), 4.0)
+		canvas.draw_colored_polygon(PackedVector2Array([mid + d * 26.0, mid + d * 10.0 + side,
+				mid + d * 10.0 - side]), Color(1, 1, 1, 0.75))
+	var box := Rect2(Vector2(ghost["pos"]) * CELL, Vector2(ghost.get("size", Vector2i(2, 2))) * CELL)
+	canvas.draw_rect(box.grow(4), col.lightened(0.3), false, 1.5)
+
+
 func set_wire(value: Dictionary) -> void:
 	wire = value
 	_redraw()
@@ -1351,7 +1594,12 @@ func _draw() -> void:
 	for c in belt_cells:
 		var cell: Dictionary = belt_cells[c]
 		var frame := _return_frame if cell["kind"] == "fail" else _belt_frame
-		_draw_belt_cell(c, cell, frame)
+		# A free conveyor (laid by hand, not linking an output to an input) carries nothing: it
+		# uses the same art as a linked belt but stands still, so a moving belt stands out.
+		var ri := int(cell.get("route", -1))
+		var idle := ri >= 0 and ri < routes.size() and str(routes[ri].get("conveyor", "")) != "" \
+				and not cell.has("over")
+		_draw_belt_cell(c, cell, 0 if idle else frame)
 		if editing and int(cell["route"]) == highlighted_route:
 			draw_rect(Rect2(Vector2(c) * CELL, Vector2(CELL, CELL)).grow(-2), COLOR_AMBER, false, 3.0)
 
@@ -1383,6 +1631,16 @@ func _draw_belt_cell(c: Vector2i, cell: Dictionary, frame: int) -> void:
 		return
 	var ins: Array = cell["in"]
 	var out: String = cell["out"]
+	# Belts in from both sides (at right angles to the way out): with a belt from behind too
+	# that's a double merge, else two belts turning into one (a converge piece).
+	var sides: Array = ["n", "s"] if out in ["e", "w"] else ["e", "w"]
+	if sides[0] in ins and sides[1] in ins:
+		var both := ("merge_%s_from_%s%s" % [out, sides[0], sides[1]]) if OPPOSITE[out] in ins \
+				else ("converge_%s" % out)
+		var joined := _belt_texture(both, frame)
+		if joined:
+			draw_texture_rect(joined, r, false)
+			return
 	var main_in: String = OPPOSITE[out] if OPPOSITE[out] in ins else str(ins[0])
 	var piece := ("straight_%s" % out) if main_in == OPPOSITE[out] else ("corner_%s_%s" % [main_in, out])
 	var extra: Array = ins.filter(func(s) -> bool: return s != main_in)
@@ -1471,6 +1729,8 @@ func _draw_machines() -> void:
 						HORIZONTAL_ALIGNMENT_CENTER, badge.size.x, 14, Color("16181C"))
 	for id in machines:
 		_draw_machine(canvas, id)
+	for key in footprints:
+		_draw_port_art(canvas, key)
 	if editing:
 		_draw_ports(canvas)
 		for k in group:
@@ -1484,19 +1744,38 @@ func _draw_machines() -> void:
 		if select_box.size != Vector2.ZERO:
 			canvas.draw_rect(select_box, Color(0.35, 0.69, 1.0, 0.15))
 			canvas.draw_rect(select_box, Color("5AB0FF"), false, 2.0)
-		if not ghost.is_empty():
+		if not ghost.is_empty() and ghost.has("parts"):
+			_draw_paste_ghost(canvas)
+		elif not ghost.is_empty():
 			var g := Rect2(Vector2(ghost["pos"]) * CELL, Vector2(ghost.get("size", Vector2i(2, 2))) * CELL)
 			var col := Color(0.35, 0.75, 0.4, 0.35) if ghost.get("ok", false) else Color(0.9, 0.28, 0.3, 0.35)
 			canvas.draw_rect(g, col)
 			canvas.draw_rect(g, col.lightened(0.3), false, 2.0)
+			if ghost.has("rot"):
+				var d := Vector2(DIRS[DIR_NAMES[(1 + int(ghost["rot"])) % 4]])
+				var mid := g.get_center()
+				var tip := mid + d * 40.0
+				var side := Vector2(-d.y, d.x) * 16.0
+				canvas.draw_line(mid - d * 40.0, mid + d * 20.0, Color(1, 1, 1, 0.85), 6.0)
+				canvas.draw_colored_polygon(PackedVector2Array([tip, mid + d * 16.0 + side, mid + d * 16.0 - side]),
+						Color(1, 1, 1, 0.85))
 		if not wire.is_empty() and wire.has("cells"):
 			# A belt being laid by hand: the cells so far, with a line through them.
 			var col: Color = COLOR_FAIL if wire.get("kind", "") == "fail" else COLOR_PASS
 			var line := PackedVector2Array()
 			for c in wire["cells"]:
 				var r := Rect2(Vector2(c) * CELL, Vector2(CELL, CELL))
-				var free := not belt_cells.has(c) and not under_node(c)
-				canvas.draw_rect(r.grow(-4), Color(col, 0.25) if free else Color(0.9, 0.28, 0.3, 0.35))
+				# Open cells are tinted green whatever the belt's colour (a red rework belt from a
+				# fail port has a red line, but that's not "blocked"); a blocked cell is red with a
+				# cross through it, so the two never look alike.
+				var open := not belt_cells.has(c) and not under_node(c)
+				if open:
+					canvas.draw_rect(r.grow(-4), Color(COLOR_PASS, 0.22))
+				else:
+					var xr := r.grow(-8)
+					canvas.draw_rect(r.grow(-4), Color(0.9, 0.28, 0.3, 0.35))
+					canvas.draw_line(xr.position, xr.end, COLOR_FAIL, 3.0)
+					canvas.draw_line(Vector2(xr.end.x, xr.position.y), Vector2(xr.position.x, xr.end.y), COLOR_FAIL, 3.0)
 				line.append(r.get_center())
 			if line.size() > 1:
 				canvas.draw_polyline(line, col, 4.0)
@@ -1508,16 +1787,51 @@ func _draw_machines() -> void:
 			canvas.draw_circle(wire["to"], 6.0, col)
 
 
+## Outputs are dots on a node's edge (green pass, red fail) and inputs are notches on its west
+## side. One with a belt on it is lit: a glow round it and a bright ring. One without is dull.
 func _draw_ports(canvas: CanvasItem) -> void:
 	for key in footprints:
 		var ports := output_ports(key)
 		for port in ports:
 			var col := COLOR_FAIL if port == "fail" else COLOR_PASS
-			canvas.draw_circle(ports[port], 9.0, Color("16181C"))
-			canvas.draw_circle(ports[port], 6.0, col)
+			var lit := attached.has("out:%s:%s" % [key, port])
+			if lit:
+				_draw_glow(canvas, ports[port], col)
+				canvas.draw_circle(ports[port], 10.0, Color("16181C"))
+				canvas.draw_circle(ports[port], 8.0, col.lightened(0.25))
+				canvas.draw_arc(ports[port], 8.0, 0.0, TAU, 24, Color(1, 1, 1, 0.85), 1.5)
+			else:
+				canvas.draw_circle(ports[port], 9.0, Color("16181C"))
+				canvas.draw_circle(ports[port], 6.0, col.darkened(0.35))
 			if SORTER_PORTS.has(port) and not is_splitter(key):  # a sorter's outputs are numbered, as in its settings
 				canvas.draw_string(ThemeDB.fallback_font, ports[port] + Vector2(-3.5, 4.0), port.trim_prefix("out_"),
 						HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color("16181C"))
+		var inputs := input_ports(key)
+		var a := rot_of(key) * PI / 2.0  # notches point the way the belt runs in
+		for kind in inputs:
+			var at: Vector2 = inputs[kind]
+			var lit := attached.has("in:%s:%s" % [key, kind])
+			var rework: bool = kind == "fail" and not is_dock(key) and not is_bin(key) and not is_merger(key)
+			if rework and not lit and str(wire.get("kind", "")) != "fail":
+				continue  # one input on the art: the rework input shows only when it's in use or a red belt is being laid
+			var col := COLOR_FAIL if rework else COLOR_PASS
+			# A notch pointing into the node.
+			var tri := PackedVector2Array([at + Vector2(7, 0).rotated(a), at + Vector2(-5, -8).rotated(a), at + Vector2(-5, 8).rotated(a)])
+			if lit:
+				_draw_glow(canvas, at, col)
+				canvas.draw_colored_polygon(PackedVector2Array([at + Vector2(10, 0).rotated(a), at + Vector2(-7, -11).rotated(a), at + Vector2(-7, 11).rotated(a)]),
+						Color("16181C"))
+				canvas.draw_colored_polygon(tri, col.lightened(0.25))
+			else:
+				canvas.draw_colored_polygon(PackedVector2Array([at + Vector2(9, 0).rotated(a), at + Vector2(-6, -10).rotated(a), at + Vector2(-6, 10).rotated(a)]),
+						Color("16181C"))
+				canvas.draw_colored_polygon(tri, Color(0.5, 0.52, 0.56))
+
+
+## A soft glow round a lit port.
+func _draw_glow(canvas: CanvasItem, at: Vector2, col: Color) -> void:
+	for i in 3:
+		canvas.draw_circle(at, 17.0 - i * 3.0, Color(col, 0.12 + i * 0.08))
 
 
 ## The machine sprite for this moment: the running loop, the idle blink, or the static file.
@@ -1547,13 +1861,13 @@ func _draw_station(canvas: CanvasItem, key: String, sprite: String, label: Strin
 					else "scrap_bin_full"
 		if _texture("res://assets/machines/%s.svg" % variant):
 			sprite = variant
-	_draw_body(canvas, origin, sprite, Color("80858F"), false)
+	_draw_body(canvas, origin, sprite, Color("80858F"), false, false, "", rot_of(key))
 	if _bin_drops.has(key):  # a crate dropping in: the one-shot animation over the full bin
 		var frame := int((Time.get_ticks_msec() / 1000.0 - float(_bin_drops[key])) * DROP_FPS)
 		var drop := _texture("res://assets/machines/anim/scrap_bin_drop_f%d.svg" % frame) \
 				if frame < DROP_FRAMES else null
 		if drop:
-			canvas.draw_texture_rect(drop, Rect2(origin, Vector2(128, 128)), false)
+			_draw_turned(canvas, drop, origin, 0)
 		else:
 			_bin_drops.erase(key)
 	if count > 0:  # how many crates are in the bin
@@ -1582,7 +1896,7 @@ func _draw_storage(canvas: CanvasItem, key: String, st: Dictionary) -> void:
 		sprite = "storage_empty" if count == 0 else ("storage_some" if count <= 5 else "storage_full")
 	if not _texture("res://assets/machines/%s.svg" % sprite):
 		sprite = "storage" if _texture("res://assets/machines/storage.svg") else "intake"  # art not there yet
-	_draw_body(canvas, origin, sprite, Color("80858F"), false)
+	_draw_body(canvas, origin, sprite, Color("80858F"), false, false, "", rot_of(key))
 	var source := str(st.get("source", ""))
 	var icon := _texture("res://assets/ui/%s.svg" % str(STORAGE_ICONS.get(source, "icon_crate")))
 	if icon == null and source == "pr_review":
@@ -1606,6 +1920,13 @@ func _draw_storage(canvas: CanvasItem, key: String, st: Dictionary) -> void:
 	var repo := str(st.get("repo", "")).strip_edges().trim_prefix("https://").trim_prefix("github.com/")
 	if not repo.is_empty():  # its own repo: crates from it are worked on there
 		_label(canvas, origin + Vector2(CELL, 2 * CELL + 32), repo.left(36), 12, COLOR_TEXT)
+	elif source in ["pr_review", "github_pr"] and bool(st.get("listed_repos_only", false)):
+		_label(canvas, origin + Vector2(CELL, 2 * CELL + 32), "factory's repos only", 12, COLOR_TEXT)
+	if not storage_on(st):  # switched off: greyed out, with "Off" across it
+		var body := Rect2(origin, Vector2(128, 128))
+		canvas.draw_rect(body.grow(-4), Color(0.08, 0.09, 0.11, 0.7))
+		canvas.draw_rect(body.grow(-4), COLOR_QUIET, false, 2.0)
+		_label(canvas, body.get_center() + Vector2(0, 6), "Off", 18, COLOR_QUIET, 128.0)
 	if key == highlighted:
 		canvas.draw_rect(Rect2(origin, Vector2(128, 128)).grow(4), COLOR_AMBER, false, 3.0)
 
@@ -1617,15 +1938,22 @@ func _draw_machine(canvas: CanvasItem, id: String) -> void:
 	var col: Color = STATE_COLORS.get(state, STATE_COLORS["idle"])
 	_draw_body(canvas, origin, str(m["sprite"]), col, state == "running",
 			not editing and not (m.get("held", []) as Array).is_empty(),
-			"" if editing else _machine_result(m, state))
+			"" if editing else _machine_result(m, state), rot_of(id))
 	if OVERLAYS.has(state):
 		var overlay := _texture("res://assets/machines/%s.svg" % OVERLAYS[state])
 		if overlay:
-			canvas.draw_texture_rect(overlay, Rect2(origin, Vector2(128, 128)), false)
+			_draw_turned(canvas, overlay, origin, art_turns(str(m["sprite"]), rot_of(id)))
 	if id == highlighted:
 		canvas.draw_rect(Rect2(origin, Vector2(128, 128)).grow(4), COLOR_AMBER, false, 3.0)
 	var paused_why := "" if editing else machine_paused_why(id)
-	if not paused_why.is_empty():
+	if bool(m.get("off", false)):
+		# Switched off: greyed out, with "Off" across it and how crates go by.
+		var body := Rect2(origin, Vector2(128, 128))
+		canvas.draw_rect(body.grow(-4), Color(0.08, 0.09, 0.11, 0.7))
+		canvas.draw_rect(body.grow(-4), COLOR_QUIET, false, 2.0)
+		_label(canvas, body.get_center() + Vector2(0, 0), "Off", 18, COLOR_QUIET, 128.0)
+		_label(canvas, body.get_center() + Vector2(0, 20), "crates pass through", 12, COLOR_QUIET, 128.0)
+	elif not paused_why.is_empty():
 		# Paused by you: dimmed, with a blue pause sign and what's paused.
 		var body := Rect2(origin, Vector2(128, 128))
 		canvas.draw_rect(body.grow(-4), Color(0.08, 0.09, 0.11, 0.62))
@@ -1691,7 +2019,7 @@ func _text_width(text: String, size: int) -> float:
 
 
 func _draw_body(canvas: CanvasItem, origin: Vector2, sprite: String, lamp: Color, running: bool,
-		waiting := false, result := "") -> void:
+		waiting := false, result := "", turns := 0) -> void:
 	var tex: Texture2D = null
 	if waiting:  # crates held here waiting on GitHub: the machine's "waiting" loop, if it has one
 		var idle := int(_machine_tick * IDLE_FPS / RUN_FPS) % IDLE_FRAMES
@@ -1702,12 +2030,87 @@ func _draw_body(canvas: CanvasItem, origin: Vector2, sprite: String, lamp: Color
 	if not tex:
 		tex = _machine_texture(sprite, running)
 	var r := Rect2(origin, Vector2(128, 128))
+	var t := art_turns(sprite, turns)
 	if tex:
-		canvas.draw_texture_rect(tex, r, false)
+		_draw_turned(canvas, tex, origin, t)
 	else:
 		canvas.draw_rect(r.grow(-4), Color("454B56"))
 		canvas.draw_rect(r.grow(-4), Color("16181C"), false, 2.0)
-	canvas.draw_circle(origin + LAMP, 4.5, lamp)
+	canvas.draw_circle(origin + turn_point(LAMP, t), 4.5, lamp)
+
+
+## Sprites whose whole art turns with the node (belt junctions, with no up or down to them).
+## Every other body stays upright and only its ports turn, drawn on top by _draw_port_art
+## (the sprites have no port art of their own).
+const TURNING_SPRITES := ["merger", "splitter"]
+
+
+## How far to turn a sprite's art for a node turned `turns` quarter turns.
+static func art_turns(sprite: String, turns: int) -> int:
+	return posmod(turns, 4) if sprite in TURNING_SPRITES else 0
+
+
+## A 2x2 sprite at origin, turned `turns` quarter turns clockwise about its middle.
+func _draw_turned(canvas: CanvasItem, tex: Texture2D, origin: Vector2, turns: int) -> void:
+	var t := posmod(turns, 4)
+	if t == 0:
+		canvas.draw_texture_rect(tex, Rect2(origin, Vector2(128, 128)), false)
+		return
+	canvas.draw_set_transform(origin + Vector2(CELL, CELL), t * PI / 2.0, Vector2.ONE)
+	canvas.draw_texture_rect(tex, Rect2(-Vector2(CELL, CELL), Vector2(128, 128)), false)
+	canvas.draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
+
+## Each sprite's port arrow colour (inputs, and outputs unless they're pass/fail coloured).
+const PORT_COLORS := {"approver": "FF7A9E", "ci_monitor": "C4CBD6", "coder": "9B7BFF", "doc_writer": "F4E3B1",
+		"intake": "8CBFFF", "labeller": "4FE0B0", "linter": "5FD0D8", "merger": "E8C547", "packager": "C9975B",
+		"planner": "A8D84E", "pr_merger": "C06CF5", "refiner": "3FB8AF", "reviewer": "F08A4B",
+		"risk_analyser": "E86BB5", "shipping_dock": "5ABF66", "sorter": "E8C547", "splitter": "E8C547",
+		"storage": "CC8A14", "tester": "F2B84C", "verifier": "6B7CFF"}
+## Sprites whose pass output is drawn green and fail output red.
+const PASS_FAIL_SPRITES := ["approver", "labeller", "risk_analyser", "verifier"]
+
+
+## The port art on a node: a dark slot with an arrow on each output, and on each input it
+## takes (the lower rework input only while a belt is on it), on whichever edge the node's
+## turn puts them. A scrap bin takes belts on any side and has none.
+func _draw_port_art(canvas: CanvasItem, key: String) -> void:
+	if not footprints.has(key) or is_bin(key):
+		return
+	var sprite := "storage" if is_storage(key) else ("shipping_dock" if is_dock(key) else "")
+	if key.ends_with(":intake"):
+		sprite = "intake"
+	elif machines.has(key):
+		sprite = str(machines[key].get("sprite", ""))
+	var accent := Color(str(PORT_COLORS.get(sprite, PORT_COLORS.get(str(FALLBACK_SPRITES.get(sprite, "")), "C4CBD6"))))
+	var outs := output_ports(key)
+	for port in outs:
+		var col := accent
+		if sprite in PASS_FAIL_SPRITES and port in ["pass", "fail"]:
+			col = COLOR_FAIL if port == "fail" else COLOR_PASS
+		var d := Vector2(DIRS[DIR_NAMES[port_dir(port, key)]])
+		_draw_port_slot(canvas, outs[port], d, d, col)
+	var ins := input_ports(key)
+	var flow := Vector2(DIRS[DIR_NAMES[in_dir(key)]])
+	for kind in ins:
+		var rework: bool = kind == "fail" and not is_dock(key) and not is_merger(key)
+		if rework and not attached.has("in:%s:%s" % [key, kind]):
+			continue
+		_draw_port_slot(canvas, ins[kind], -flow, flow, accent)
+
+
+## One port: a slot set into the body at `at` (on its edge, `out` pointing away from the
+## body) with an arrow the way crates move through it.
+func _draw_port_slot(canvas: CanvasItem, at: Vector2, out: Vector2, flow: Vector2, col: Color) -> void:
+	var mid := at - out * 9.5
+	var along := Vector2(-out.y, out.x)
+	var slot := PackedVector2Array([mid - along * 15.0 - out * 4.5, mid + along * 15.0 - out * 4.5,
+			mid + along * 15.0 + out * 4.5, mid - along * 15.0 + out * 4.5])
+	canvas.draw_colored_polygon(slot, Color("111316"))
+	slot.append(slot[0])
+	canvas.draw_polyline(slot, Color("16181C"), 1.5)
+	var side := Vector2(-flow.y, flow.x) * 4.5
+	canvas.draw_colored_polygon(PackedVector2Array([mid + flow * 2.75, mid - flow * 2.75 + side, mid - flow * 2.75 - side]), col)
 
 
 func _label(canvas: CanvasItem, p: Vector2, text: String, size: int, col: Color, width := 240.0) -> void:

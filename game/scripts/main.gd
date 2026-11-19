@@ -11,6 +11,9 @@ const Inspector := preload("res://scripts/inspector.gd")
 const IntakeView := preload("res://scripts/intake_view.gd")
 const BinView := preload("res://scripts/bin_view.gd")
 const StatsView := preload("res://scripts/stats_view.gd")
+const AccountsView := preload("res://scripts/accounts_view.gd")
+const ApprovalsView := preload("res://scripts/approvals_view.gd")
+const DashboardView := preload("res://scripts/dashboard_view.gd")
 const INTAKE_REFRESH := 20.0  # seconds between refreshes of an open intake window
 const MACHINE_OUTPUT_LINES := 14
 
@@ -66,7 +69,6 @@ var hover_tip: PanelContainer
 var hover_label: Label
 var counters_label: Label
 var toasts: VBoxContainer
-var spec_input: LineEdit
 var status_label: RichTextLabel
 var log_title: Label
 var log_view: RichTextLabel
@@ -101,6 +103,14 @@ var _intake_tick := 0.0
 var bin_view: BinView
 var stats_view: StatsView
 var stats_button: Button
+var accounts_view: AccountsView
+var accounts_button: Button
+var approvals_view: ApprovalsView  # the holding bay: every crate waiting for you, in one list
+var inbox_button: Button  # top bar: "N waiting for you", opens it
+var _approvals_tick := 0.0
+var dashboard_view: DashboardView  # everything at a glance, with controls, over the floor
+var dashboard_button: Button
+var crate_times := {}  # item_id -> when it was made (unix seconds), for the dashboard
 var _bin_tick := 0.0
 var viewed_bin := ""  # station key ("<pipeline>:scrap" or ":dock") whose crate list is open
 
@@ -172,21 +182,7 @@ func _build_ui() -> void:
 	var row := HBoxContainer.new()
 	top.add_child(row)
 
-	spec_input = LineEdit.new()
-	spec_input.placeholder_text = "Describe a change and press Enter"
-	spec_input.custom_minimum_size = Vector2(260, 0)
-	spec_input.text_submitted.connect(func(_t: String) -> void: _submit())
-	row.add_child(spec_input)
-
-	var button := Button.new()
-	button.icon = load("res://assets/ui/icon_add.svg")
-	button.theme_type_variation = &"ButtonPrimary"
-	button.tooltip_text = "Add: put this spec on the intake as a new crate (Enter)"
-	button.pressed.connect(_submit)
-	button.disabled = true
-	spec_input.text_changed.connect(func(t: String) -> void: button.disabled = t.strip_edges().is_empty())
-	row.add_child(button)
-
+	# Changes are described in a Custom storage's window (or the intake's), not up here.
 	var spacer := Control.new()
 	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(spacer)
@@ -195,6 +191,15 @@ func _build_ui() -> void:
 	counters_label.theme_type_variation = &"LabelMuted"
 	counters_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	row.add_child(counters_label)
+
+	# Every crate waiting for you, from every line, in one list (the holding bay).
+	inbox_button = Button.new()
+	inbox_button.icon = load("res://assets/ui/icon_human_approval.svg")
+	inbox_button.theme_type_variation = &"ButtonGhost"
+	inbox_button.focus_mode = Control.FOCUS_NONE
+	inbox_button.tooltip_text = "Waiting for you: every crate waiting for your approval (or held at a machine), to approve or send back, one at a time or together"
+	inbox_button.pressed.connect(func() -> void: _view_approvals(not approvals_view.visible))
+	row.add_child(inbox_button)
 
 	# Only the connection lives here; everything else is a pop-up.
 	status_label = RichTextLabel.new()
@@ -214,6 +219,14 @@ func _build_ui() -> void:
 		_send_pause("factory", "", not bool(pauses.get("factory", false))))
 	row.add_child(pause_button)
 
+	dashboard_button = Button.new()  # an icon too
+	dashboard_button.icon = load("res://assets/ui/icon_dashboard.svg")
+	dashboard_button.theme_type_variation = &"ButtonGhost"
+	dashboard_button.focus_mode = Control.FOCUS_NONE
+	dashboard_button.tooltip_text = "Dashboard: the whole factory at a glance, with tables, charts and controls"
+	dashboard_button.pressed.connect(func() -> void: _view_dashboard(not dashboard_view.visible))
+	row.add_child(dashboard_button)
+
 	stats_button = Button.new()  # an icon too
 	stats_button.icon = load("res://assets/ui/icon_stats.svg")
 	stats_button.theme_type_variation = &"ButtonGhost"
@@ -221,6 +234,14 @@ func _build_ui() -> void:
 	stats_button.tooltip_text = "Factory stats: crates shipped, time, failures and Claude cost"
 	stats_button.pressed.connect(func() -> void: _view_stats(not stats_view.visible))
 	row.add_child(stats_button)
+
+	accounts_button = Button.new()  # an icon too
+	accounts_button.icon = load("res://assets/ui/icon_settings.svg")
+	accounts_button.theme_type_variation = &"ButtonGhost"
+	accounts_button.focus_mode = Control.FOCUS_NONE
+	accounts_button.tooltip_text = "Settings: the GitHub and Jira accounts the factory works as, and worktree cleanup"
+	accounts_button.pressed.connect(func() -> void: _view_accounts(not accounts_view.visible))
+	row.add_child(accounts_button)
 
 	build_button = Button.new()
 	build_button.set_pressed_no_signal(false)
@@ -350,6 +371,7 @@ func _build_ui() -> void:
 	intake_view.closed.connect(func() -> void: _view_intake(""))
 	intake_view.open_crate.connect(func(item_id: int) -> void: _select(item_id))
 	intake_view.pause_toggled.connect(func(pid: String, on: bool) -> void: _send_pause("line", pid, on))
+	intake_view.storage_toggled.connect(_set_storage_enabled)
 	intake_view.pull.connect(func(source: String, ref: String, storage: String) -> void:
 		if not client.send({"type": "intake_pull", "pipeline": viewed_intake, "source": source, "ref": ref,
 				"storage": storage}):
@@ -357,6 +379,22 @@ func _build_ui() -> void:
 			_toast("Not connected. Is the backend running?", Color("E5484D")))
 	intake_view.check.connect(func(source: String, storage: String) -> void:
 		client.send({"type": "intake_check", "pipeline": viewed_intake, "source": source, "storage": storage}))
+	intake_view.describe.connect(describe_change)
+	intake_view.queue_change.connect(func(pid: String, msg: Dictionary) -> void:
+		if not msg.is_empty() and not client.send(msg):
+			_toast("Not connected. Is the backend running?", Color("E5484D"))
+			return
+		client.send({"type": "intake_list", "pipeline": pid}))
+	# Closing issues and PRs in a storage (it asked you first): see intake_close in protocol/README.md.
+	intake_view.close_options.connect(func(source: String, storage: String, refs: Array) -> void:
+		client.send({"type": "intake_close_options", "pipeline": viewed_intake, "source": source, "storage": storage,
+				"refs": refs}))
+	intake_view.close_items.connect(func(source: String, storage: String, refs: Array, comment: String, reason: String,
+			transition: String) -> void:
+		if not client.send({"type": "intake_close", "pipeline": viewed_intake, "source": source, "storage": storage,
+				"refs": refs, "comment": comment, "reason": reason, "transition": transition}):
+			intake_view.pull_failed()
+			_toast("Not connected. Is the backend running?", Color("E5484D")))
 	intake_view.submit.connect(func(pid: String, text: String) -> void:
 		if client.send({"type": "submit_work", "text": text, "pipeline": pid}):
 			_toast("PRD added to the %s" % _pipeline_name(pid), Color("5ABF66"))
@@ -374,6 +412,19 @@ func _build_ui() -> void:
 		if not client.send({"type": "retry", "item_id": item_id, "note": ""}):
 			_toast("Not connected. Is the backend running?", Color("E5484D")))
 
+	# The holding bay: every crate waiting for you (left dock).
+	approvals_view = ApprovalsView.new()
+	ui.add_child(approvals_view)
+	approvals_view.position = Vector2(0, TOP_BAR)
+	approvals_view.visible = false
+	approvals_view.closed.connect(func() -> void: _view_approvals(false))
+	approvals_view.open_crate.connect(func(item_id: int) -> void: _select(item_id))
+	approvals_view.open_pr.connect(func(item_id: int) -> void:
+		var url := str(pr_urls.get(item_id, ""))
+		if not url.is_empty():
+			OS.shell_open(url))
+	approvals_view.decide.connect(_decide_many)
+
 	# Throughput, failures and cost (left dock).
 	stats_view = StatsView.new()
 	ui.add_child(stats_view)
@@ -381,6 +432,54 @@ func _build_ui() -> void:
 	stats_view.visible = false
 	stats_view.closed.connect(func() -> void: _view_stats(false))
 	stats_view.refresh.connect(func(days: int) -> void: client.send({"type": "stats", "days": days}))
+
+	# The factory's own GitHub / Jira accounts (left dock).
+	accounts_view = AccountsView.new()
+	ui.add_child(accounts_view)
+	accounts_view.position = Vector2(0, TOP_BAR)
+	accounts_view.visible = false
+	accounts_view.closed.connect(func() -> void: _view_accounts(false))
+	accounts_view.save_account.connect(func(service: String, account: Dictionary) -> void:
+		if not client.send({"type": "save_account", "service": service, "account": account}):
+			_toast("Not connected. Is the backend running?", Color("E5484D")))
+	accounts_view.remove_account.connect(func(service: String, id: String) -> void:
+		client.send({"type": "remove_account", "service": service, "id": id}))
+	accounts_view.set_default.connect(func(service: String, id: String) -> void:
+		client.send({"type": "set_default_account", "service": service, "id": id}))
+	accounts_view.check.connect(func() -> void: client.send({"type": "check_accounts"}))
+	accounts_view.agent_defaults_changed.connect(func(model: String, effort: String) -> void:
+		if not client.send({"type": "agent_defaults", "model": model, "effort": effort}):
+			_toast("Not connected. Is the backend running?", Color("E5484D")))
+	accounts_view.force_delete_changed.connect(func(on: bool) -> void:
+		if not client.send({"type": "force_delete", "on": on}):
+			_toast("Not connected. Is the backend running?", Color("E5484D")))
+	accounts_view.branch_pattern_changed.connect(func(pattern: String) -> void:
+		if not client.send({"type": "branch_pattern", "pattern": pattern}):
+			_toast("Not connected. Is the backend running?", Color("E5484D")))
+	accounts_view.repos_changed.connect(func(repos: Array) -> void:
+		if not client.send({"type": "set_repos", "repos": repos}):
+			_toast("Not connected. Is the backend running?", Color("E5484D")))
+
+	# The dashboard: everything at a glance, with controls (over the floor, under the top bar).
+	dashboard_view = DashboardView.new()
+	dashboard_view.main = self
+	ui.add_child(dashboard_view)
+	dashboard_view.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	dashboard_view.offset_top = TOP_BAR
+	dashboard_view.visible = false
+	dashboard_view.closed.connect(func() -> void: _view_dashboard(false))
+	dashboard_view.show_crate.connect(func(item_id: int) -> void:
+		_view_dashboard(false)
+		_select(item_id))
+	dashboard_view.inspect_machine.connect(func(machine_id: String) -> void:
+		_view_dashboard(false)
+		_inspect(machine_id))
+	dashboard_view.open_storage.connect(func(pid: String, store_key: String) -> void:
+		_view_dashboard(false)
+		_view_intake(pid, store_key))
+	dashboard_view.show_on_floor.connect(func(key: String) -> void:
+		_view_dashboard(false)
+		_show_on_floor(key))
 
 	# Pop-ups for crates that need you, ship or are scrapped (top right, under the top bar).
 	toasts = VBoxContainer.new()
@@ -545,8 +644,10 @@ func _toggle_build() -> void:
 		return
 	_inspect("")
 	_view_stats(false)
+	_view_accounts(false)
 	_view_intake("")
 	_view_bin("")
+	_view_approvals(false)
 	building = true
 	pending_save = false
 	build_button.tooltip_text = "Close build: leave build mode"
@@ -584,6 +685,8 @@ func _view_stats(show: bool) -> void:
 		_inspect("")
 		_view_intake("")
 		_view_bin("")
+		_view_accounts(false)
+		_view_approvals(false)
 		stats_view.open()
 	else:
 		stats_view.visible = false
@@ -591,8 +694,38 @@ func _view_stats(show: bool) -> void:
 	_layout_docks()
 
 
+## The factory's repo list (snapshot or "repos" message): the gear's Repos section and the
+## build panel's repo pickers.
+func _set_repos(repos) -> void:
+	var list: Array = repos if repos is Array else []
+	last_layout["repos"] = list
+	accounts_view.show_repos(list)
+	build_panel.set_known_repos(list)
+
+
+## Open or close the Accounts window (one left dock at a time).
+func _view_accounts(show: bool) -> void:
+	if show == accounts_view.visible:
+		return
+	if show:
+		if building:
+			return
+		_inspect("")
+		_view_intake("")
+		_view_bin("")
+		_view_stats(false)
+		_view_approvals(false)
+		accounts_view.open()
+		client.send({"type": "get_accounts"})
+	else:
+		accounts_view.visible = false
+	accounts_button.modulate = Color("5AB0FF") if show else Color.WHITE
+	_layout_docks()
+
+
 func _left_dock_open() -> bool:
-	return inspector.visible or intake_view.visible or bin_view.visible or stats_view.visible or \
+	return inspector.visible or intake_view.visible or bin_view.visible or stats_view.visible or accounts_view.visible or \
+			approvals_view.visible or \
 			(building and build_panel.settings_window != null and build_panel.settings_window.visible)
 
 
@@ -600,7 +733,7 @@ func _left_dock_open() -> bool:
 ## and the banner start at its right edge.
 func _layout_docks() -> void:
 	var view := get_viewport_rect().size
-	for dock in [inspector, intake_view, bin_view, stats_view]:
+	for dock in [inspector, intake_view, bin_view, stats_view, accounts_view, approvals_view]:
 		if dock.visible:
 			dock.position = Vector2(0, TOP_BAR)
 			dock.size = Vector2(LEFT_DOCK, view.y - TOP_BAR)
@@ -620,6 +753,40 @@ func _place_toasts() -> void:
 
 
 ## Slide the floor right if the thing you clicked is hidden under the settings window.
+## A change you describe becomes a crate on that line (storage: a Custom storage's id, whose
+## queue it joins; "" puts it on the intake). The Custom storage window and the dashboard use it.
+func describe_change(pid: String, text: String, storage: String) -> bool:
+	var msg := {"type": "submit_work", "text": text, "pipeline": pid}
+	if not storage.is_empty():
+		msg["storage"] = storage
+	if client.send(msg):
+		_toast(("Change queued for the %s" if not storage.is_empty() else "Change added to the %s") % _pipeline_name(pid),
+				Color("5ABF66"))
+		client.send({"type": "intake_list", "pipeline": pid})
+		return true
+	_toast("Not connected. Is the backend running?", Color("E5484D"))
+	return false
+
+
+## Switch a storage on or off (the storage window's and the dashboard's Turn on / Turn off).
+func _set_storage_enabled(pid: String, storage: String, on: bool) -> void:
+	if not client.send({"type": "storage_enabled", "pipeline": pid, "storage": storage, "enabled": on}):
+		_toast("Not connected. Is the backend running?", Color("E5484D"))
+	client.send({"type": "intake_list", "pipeline": pid})
+
+
+## Pan to something on the floor ("<pid>:store_1", a machine id...) and highlight it.
+func _show_on_floor(key: String) -> void:
+	if not factory_floor.footprints.has(key):
+		_toast("It isn't on the floor", Color("F5A524"))
+		return
+	manual_camera = true
+	var world := (Vector2(factory_floor.footprints[key]) + Vector2.ONE) * FactoryFloor.CELL
+	var tween := create_tween()
+	tween.tween_property(camera, "position", world, 0.3)
+	factory_floor.set_highlight(key)
+
+
 func _keep_clear_of_settings(world: Vector2) -> void:
 	var view := get_viewport_rect().size
 	var screen_x := (world.x - camera.position.x) * camera.zoom.x + view.x / 2.0
@@ -711,6 +878,8 @@ func _view_bin(key: String) -> void:
 		_inspect("")
 		_view_intake("")
 		_view_stats(false)
+		_view_accounts(false)
+		_view_approvals(false)
 	viewed_bin = key if factory_floor.footprints.has(key) and not building else ""
 	bin_view.visible = not viewed_bin.is_empty()
 	if viewed_bin.is_empty():
@@ -740,6 +909,90 @@ func _refresh_bin() -> void:
 	bin_view.show_crates(viewed_bin, "%s %s" % [name, "scrap bin" if scrap else "shipping dock"], rows,
 			"Nothing in the scrap bin." if scrap else "Nothing shipped yet.")
 	_layout_docks()
+
+
+## Open or close the dashboard. It covers the floor, so it closes the left docks (and closes
+## itself when one opens, or build mode starts).
+func _view_dashboard(show: bool) -> void:
+	if show == dashboard_view.visible:
+		return
+	if show:
+		if building:
+			return
+		_inspect("")
+		_view_intake("")
+		_view_bin("")
+		_view_stats(false)
+		_view_accounts(false)
+		_view_approvals(false)
+		dashboard_view.open()
+	else:
+		dashboard_view.visible = false
+	dashboard_button.modulate = Color("5AB0FF") if show else Color.WHITE
+
+
+## Open or close the holding bay: every crate waiting for you (one left dock at a time).
+func _view_approvals(show: bool) -> void:
+	if show == approvals_view.visible:
+		return
+	if show:
+		if building:
+			return
+		_inspect("")
+		_view_intake("")
+		_view_bin("")
+		_view_stats(false)
+		_view_accounts(false)
+		approvals_view.open()
+		_refresh_approvals()
+	else:
+		approvals_view.visible = false
+	_refresh_counters()
+	_layout_docks()
+
+
+## Rebuild the holding bay's list from the crates (the view only redraws on a change).
+func _refresh_approvals() -> void:
+	var rows := []
+	for crate in crates.values():
+		if crate.state != "awaiting_approval" and crate.state != "held":
+			continue
+		var red := factory_floor.on_fail(crate.location)
+		var machine := _layout_machine(crate.location)
+		rows.append({"id": crate.item_id, "title": crate.text.get_slice("\n", 0).left(100), "state": crate.state,
+				"at": _place_name(crate.location), "line": _line_name_of(crate.location), "source": crate.source,
+				"risk": crate.risk, "has_pr": str(pr_urls.get(crate.item_id, "")) != "",
+				"sends_back": (not red.is_empty() and not FactoryFloor.is_bin(red)) or bool(machine.get("rework_here", false)),
+				"held_why": _scrap_reason(crate.item_id) if crate.state == "held" else ""})
+	rows.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return int(a["id"]) < int(b["id"]))
+	approvals_view.show_crates(rows)
+	_layout_docks()
+
+
+## The name of the line a machine is on ("" if there's only one line).
+func _line_name_of(machine_id: String) -> String:
+	var lines: Array = last_layout.get("pipelines", [])
+	if lines.size() < 2:
+		return ""
+	for p in lines:
+		for m in p.get("machines", []):
+			if str(m.get("id", "")) == machine_id:
+				return str(p.get("name", p.get("id", "")))
+	return ""
+
+
+## Decisions from the holding bay: one command per crate, each with the same note.
+func _decide_many(item_ids: Array, kind: String, note: String) -> void:
+	var sent := 0
+	for id in item_ids:
+		if client.send({"type": kind, "item_id": int(id), "note": note}):
+			sent += 1
+	if sent == 0:
+		_toast("Not connected. Is the backend running?", Color("E5484D"))
+		return
+	var words := {"approve": "Approved", "reject": "Sent back", "retry": "Running again", "scrap": "Scrapped"}
+	_toast("%s %s" % [words.get(kind, kind), ("crate #%d" % int(item_ids[0])) if sent == 1 else ("%d crates" % sent)],
+			Color(0.8, 0.82, 0.86))
 
 
 ## Why a crate was scrapped, from its log: the failed step, a rejection, or running out of reworks.
@@ -840,6 +1093,8 @@ func _view_intake(pid: String, store_key := "") -> void:
 		_inspect("")
 		_view_bin("")
 		_view_stats(false)
+		_view_accounts(false)
+		_view_approvals(false)
 	var key := store_key if not store_key.is_empty() else "%s:intake" % pid
 	viewed_intake = pid if factory_floor.footprints.has(key) and not building else ""
 	viewed_store = store_key if not viewed_intake.is_empty() else ""
@@ -916,6 +1171,10 @@ func _inspect(id: String) -> void:
 		_view_bin("")
 	if not id.is_empty() and stats_view.visible:
 		_view_stats(false)
+	if not id.is_empty() and accounts_view.visible:
+		_view_accounts(false)
+	if not id.is_empty() and approvals_view.visible:
+		_view_approvals(false)
 	inspected = id if factory_floor.machines.has(id) and not building else ""
 	inspector.visible = not inspected.is_empty()
 	if opening and not inspected.is_empty():
@@ -1060,16 +1319,6 @@ func _set_status(text: String) -> void:
 	status_label.text = text
 
 
-func _submit() -> void:
-	var text := spec_input.text.strip_edges()
-	if text.is_empty():
-		return
-	if client.send({"type": "submit_work", "text": text}):
-		spec_input.clear()
-	else:
-		_toast("Not connected. Is the backend running?", Color("E5484D"))
-
-
 func _input(event: InputEvent) -> void:
 	# Space is for panning: don't let it press whichever button was clicked last.
 	var key := event as InputEventKey
@@ -1087,8 +1336,20 @@ func _unhandled_input(event: InputEvent) -> void:
 			get_viewport().set_input_as_handled()
 		return
 	var esc := event as InputEventKey
+	if esc and esc.pressed and esc.keycode == KEY_ESCAPE and dashboard_view.visible:
+		_view_dashboard(false)
+		get_viewport().set_input_as_handled()
+		return
 	if esc and esc.pressed and esc.keycode == KEY_ESCAPE and stats_view.visible:
 		_view_stats(false)
+		get_viewport().set_input_as_handled()
+		return
+	if esc and esc.pressed and esc.keycode == KEY_ESCAPE and accounts_view.visible:
+		_view_accounts(false)
+		get_viewport().set_input_as_handled()
+		return
+	if esc and esc.pressed and esc.keycode == KEY_ESCAPE and approvals_view.visible:
+		_view_approvals(false)
 		get_viewport().set_input_as_handled()
 		return
 	if esc and esc.pressed and esc.keycode == KEY_ESCAPE and not viewed_bin.is_empty():
@@ -1286,6 +1547,7 @@ func _mouse_world_at(screen: Vector2) -> Vector2:
 
 func _on_connected() -> void:
 	_set_status("[color=#5ABF66]●[/color] Connected")
+	client.send({"type": "get_accounts"})  # the build panel's account pickers need them
 
 
 func _on_disconnected() -> void:
@@ -1294,6 +1556,8 @@ func _on_disconnected() -> void:
 
 func _on_message(msg: Dictionary) -> void:
 	var kind: String = msg.get("type", "")
+	if dashboard_view:
+		dashboard_view.on_message(msg)
 	if kind == "snapshot":
 		_apply_snapshot(msg)
 		return
@@ -1309,11 +1573,30 @@ func _on_message(msg: Dictionary) -> void:
 	if kind == "belt_speed":
 		_set_belt_speed(float(msg.get("speed", 1.5)))
 		return
+	if kind == "agent_defaults":
+		accounts_view.show_agent_defaults(msg)
+		build_panel.set_agent_settings(msg)
+		return
+	if kind == "force_delete":
+		accounts_view.show_force_delete(bool(msg.get("on", false)))
+		return
+	if kind == "branch_pattern":
+		accounts_view.show_branch_pattern(str(msg.get("pattern", "")))
+		build_panel.factory_branch_pattern = str(msg.get("pattern", ""))
+		_toast("Branch naming saved: new crates' branches look like %s" % AccountsView.branch_preview(str(msg.get("pattern", ""))), Color("5ABF66"))
+		return
+	if kind == "repos":
+		_set_repos(msg.get("repos", []))
+		return
 	if kind == "repo_check":
 		build_panel.show_repo_check(msg)
 		return
 	if kind == "stats":
 		stats_view.show_stats(msg)
+		return
+	if kind == "accounts":
+		accounts_view.show_accounts(msg)
+		build_panel.set_accounts(msg)  # for the account pickers in build mode
 		return
 	if kind == "item_log":
 		_got_full_log(int(msg.get("item_id", -1)), msg.get("log", []))
@@ -1323,6 +1606,21 @@ func _on_message(msg: Dictionary) -> void:
 		if str(msg.get("pipeline", "")) == viewed_intake and intake_view.visible:
 			intake_view.show_listing(msg, _pipeline_name(viewed_intake))
 			_layout_intake_view()
+		return
+	if kind == "intake_closed":
+		intake_view.close_done(msg)
+		var shut: Array = msg.get("closed", [])
+		var failed: Array = msg.get("failed", [])
+		if not shut.is_empty():
+			_toast("Closed %s" % ", ".join(PackedStringArray(shut.map(func(r) -> String: return _short_ref(str(r))))),
+					Color("5ABF66"))
+		for f in failed:
+			_toast("Couldn't close %s: %s" % [_short_ref(str(f.get("ref", ""))), str(f.get("error", ""))], Color("E5484D"))
+		return
+	if kind == "intake_close_options":
+		intake_view.show_close_options(msg)
+		if (msg.get("transitions", []) as Array).is_empty():
+			_toast("That Jira issue can't move anywhere right now", Color("E5484D"))
 		return
 	if kind == "error":
 		if intake_view.visible:
@@ -1343,6 +1641,7 @@ func _on_message(msg: Dictionary) -> void:
 	match kind:
 		"item_created":
 			_add_item(msg["item"])
+			_ride_from_storage(msg["item"])
 			if intake_view.visible:
 				_intake_tick = INTAKE_REFRESH - 1.5  # show it as a crate soon
 		"item_moved":
@@ -1353,7 +1652,6 @@ func _on_message(msg: Dictionary) -> void:
 			machine_runs[str(msg.get("machine", ""))] = {"item_id": int(msg["item_id"]), "started": now,
 					"step": "", "step_started": now, "progress": 0.0, "failed": false, "finished": false}
 			machine_output[str(msg.get("machine", ""))] = []
-			_select(int(msg["item_id"]))
 		"job_log":
 			_append_log(int(msg["item_id"]), str(msg.get("line", "")))
 			var lines: Array = machine_output.get(str(msg.get("machine", "")), [])
@@ -1438,6 +1736,14 @@ func _apply_snapshot(snap: Dictionary) -> void:
 	_set_pauses(snap.get("pauses", {}))
 	if layout.has("belt_speed"):
 		_set_belt_speed(float(layout["belt_speed"]))
+	accounts_view.show_force_delete(bool(layout.get("force_delete", false)))
+	accounts_view.show_branch_pattern(str(layout.get("branch_pattern", "")))
+	build_panel.factory_branch_pattern = str(layout.get("branch_pattern", ""))
+	var agent_defaults: Dictionary = layout.get("agent_defaults", {}) if layout.get("agent_defaults") is Dictionary else {}
+	var agent_choices: Dictionary = layout.get("agent_choices", {}) if layout.get("agent_choices") is Dictionary else {}
+	accounts_view.show_agent_defaults(agent_defaults, agent_choices)
+	build_panel.set_agent_settings(agent_defaults, agent_choices)
+	_set_repos(layout.get("repos", []))
 	_store_tick = STORE_REFRESH - 1.0  # the storages' counts, in a moment
 	_set_agent(snap.get("agent", {}), true)
 	_set_tools(snap.get("tools", []), true)
@@ -1481,6 +1787,7 @@ func _add_item(item: Dictionary) -> void:
 		pr_states[id] = str(item["pr_state"])
 	crates_layer.add_child(crate)
 	crates[id] = crate
+	crate_times[id] = float(item.get("created_at", 0.0))
 	var lines: Array = []
 	for line in item.get("log", []):
 		lines.append(str(line))
@@ -1490,6 +1797,31 @@ func _add_item(item: Dictionary) -> void:
 	else:
 		logs_partial.erase(id)
 	costs[id] = float(item.get("cost_usd", 0.0))
+
+
+## A new crate out of a storage rides its belt from the storage to the intake, at the belt's
+## own speed, instead of appearing there (moves that come in meanwhile wait their turn).
+func _ride_from_storage(item: Dictionary) -> void:
+	var id := int(item["id"])
+	var storage := str(item.get("storage", ""))
+	if storage.is_empty() or not crates.has(id):
+		return
+	var crate: Crate = crates[id]
+	if not crate.location.ends_with(":intake") or not crate.visible:
+		return
+	var path: Array = factory_floor.storage_path(crate.location.get_slice(":", 0), storage)
+	if path.size() < 2:
+		return
+	var target := crate.position
+	crate.position = path[0]
+	path = path.slice(1)
+	path.append(target)
+	var length := 0.0
+	var at := crate.position
+	for p in path:
+		length += at.distance_to(p)
+		at = p
+	crate.move_path(path, length / maxf(factory_floor.belt_fps * 2.0, 1.0))
 
 
 func _on_item_moved(msg: Dictionary) -> void:
@@ -1562,6 +1894,15 @@ func _toast_for_move(crate: Crate, msg: Dictionary) -> void:
 			_toast("%s went to the scrap bin" % name, Color("E5484D"))
 
 
+## A PR url as owner/name#n, for toasts; issue numbers and Jira keys as they are.
+func _short_ref(ref: String) -> String:
+	if ref.begins_with("https://github.com/"):
+		var bits := ref.trim_prefix("https://github.com/").split("/")
+		if bits.size() >= 4:
+			return "%s/%s#%s" % [bits[0], bits[1], bits[3]]
+	return ("#" + ref) if ref.is_valid_int() else ref
+
+
 func _toast(text: String, col: Color) -> void:
 	var panel := PanelContainer.new()
 	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -1621,7 +1962,7 @@ const STATE_WORDS := {
 func _update_hover() -> void:
 	var p := get_global_mouse_position()
 	var found: Crate = null
-	if not building:
+	if not building and not dashboard_view.visible:
 		for crate in crates.values():
 			if crate.visible and crate.hit(p):
 				found = crate
@@ -1663,8 +2004,11 @@ func _refresh_counters() -> void:
 				counts["waiting"] += 1
 			_:
 				counts["line"] += 1
-	counters_label.text = "%d in line  ·  %d waiting for you  ·  %d shipped  ·  %d scrapped" % [
-			counts["line"], counts["waiting"], counts["shipped"], counts["scrapped"]]
+	counters_label.text = "%d in line  ·  %d shipped  ·  %d scrapped" % [
+			counts["line"], counts["shipped"], counts["scrapped"]]
+	var waiting := int(counts["waiting"])
+	inbox_button.text = "%d waiting for you" % waiting
+	inbox_button.modulate = Color("5AB0FF") if approvals_view.visible else (Color("F2B84C") if waiting > 0 else Color.WHITE)
 
 
 ## Keep the belts running while crates are in the line, and the return belt while one rides it.
@@ -1681,6 +2025,11 @@ func _process(delta: float) -> void:
 	if inspector.visible and _inspect_tick >= 0.5:
 		_inspect_tick = 0.0
 		_refresh_inspector()
+	if approvals_view.visible:
+		_approvals_tick += delta
+		if _approvals_tick >= 0.5:
+			_approvals_tick = 0.0
+			_refresh_approvals()
 	if bin_view.visible:
 		_bin_tick += delta
 		if _bin_tick >= 0.5:

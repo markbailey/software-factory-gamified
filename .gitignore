@@ -22,3 +22,9 @@ backend/accounts.tmp
 dist/
 _sf_tmp_to_delete/
 *.tgz
+
+# PyInstaller (backend/build_exe.py)
+backend/build/
+
+# Notion pages synced for the machines (backend/docs.toml) and from Notion storages
+backend/docs_cache/

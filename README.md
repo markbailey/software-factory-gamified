@@ -250,6 +250,37 @@ Settings are under `[intake.prd]` in `backend/factory.toml`: `enabled` (on whene
 intake is), `label` ("prd") and `poll_seconds`. It uses the repo and labels from
 `[intake.github]`. GitHub only for now.
 
+### Notion: PRDs and reference docs
+
+The factory reads pages from Notion (more documentation systems can be added behind the same
+interface in `backend/factory/docs.py`; Confluence is next).
+
+**Set up a Notion integration** (once):
+1. Go to <https://www.notion.so/profile/integrations>, press **New integration**, pick your
+   workspace, type: **Internal**. Under **Capabilities** tick *Read content*, and *Insert
+   comments* / *Read comments* if you want the factory to comment on PRD pages. Save, and copy
+   the **Internal Integration Secret** (`ntn_...`).
+2. In the game: **Accounts** (the gear in the top bar) > **Notion accounts** > **+**, paste it
+   as the integration secret, and press **Check** (or set the `NOTION_TOKEN` variable for
+   this machine's own sign-in). It goes into `backend/accounts.toml`, which git ignores.
+3. Share each page or database with it: open it in Notion, **...** menu > **Connections** >
+   your integration. Sharing a page shares its sub-pages too.
+
+**PRDs from Notion:** in build mode, place a storage, set it to **Notion pages (PRDs)** and
+belt it into the Planning line's intake. Its filter is one or more page or database links: a
+page is one PRD; a database is one PRD per page, and `where Status = Ready` (any property)
+takes only some of them. Each page comes in once, as Markdown, and goes to the Planner like a
+PRD issue; the Issue maker links the page in the plan, and the page gets a comment when it is
+picked up, handed back and finished. A handed-back page comes in again once you edit it.
+
+**Reference docs for the machines:** list pages such as coding guidelines in
+`backend/docs.toml` (`[[library]]` entries, examples in the file). The backend syncs them into
+`backend/docs_cache/` as Markdown at start and every `sync_minutes` (only changed pages), or now
+with `python -m factory.docs sync`. An entry's `machines = ["coder", "reviewer"]` gives it to
+every machine of those types; a machine's **Reference docs** setting (every agent machine has
+one) names the entries it reads instead, or `none`. The docs go into the machine's prompt
+(about 40,000 characters at most; longer ones are listed by path).
+
 ### Merging when the branch needs an approval
 
 The Merger waits until GitHub lets the pull request merge, then squash-merges it. While
@@ -276,6 +307,28 @@ keep going. A Claude step that failed because Claude went away runs again, inste
 crate failing. When a check passes the banner goes and everything carries on by itself.
 **Check now** in the banner checks again straight away. Settings are under `[health]` in
 `backend/factory.toml`.
+
+### Other agents: Gemini CLI, Antigravity CLI and GitHub Copilot CLI
+
+Machines run Claude Code by default. Under the gear (Factory settings, **Agents**) you can pick
+another agent for the whole factory, and in build mode each machine can pick its own (Agent,
+then Model and Effort level). The CLI must be installed and signed in on this computer:
+
+| Agent | Command | Model | Effort | Reports |
+|---|---|---|---|---|
+| Claude Code | `claude` | yes | yes | cost (USD), turns |
+| Gemini CLI | `gemini` | yes (`auto`, `pro`, `flash`, ...) | no | tokens |
+| Antigravity CLI | `agy` | yes (from `agy models`) | yes | tokens, turns |
+| GitHub Copilot CLI | `copilot` | yes (from `copilot --help`) | no (its settings.json) | tokens if it reports them |
+
+The steps in `machines.toml` stay written for `claude`; the backend turns each into the other
+CLI's headless command with the same permissions (read-only steps stay read-only, edit steps
+may edit, and only the listed shell commands run). Antigravity takes tool permissions only from
+its own settings (`permissions.allow` in `~/.gemini/antigravity-cli/settings.json`), so its edit
+steps need rules there, or `"antigravity_skip_permissions": true` in `backend/agents.json`
+(which lets it run anything). The dashboard's agent chart shows runs by agent, model and effort;
+only Claude reports a cost. The availability check above asks Claude, so it pauses only
+machines on Claude.
 
 ### Risk analyser and approving low-risk changes by themselves
 

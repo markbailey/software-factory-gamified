@@ -28,11 +28,18 @@ You need Python 3.10+.
    (If you use [uv](https://docs.astral.sh/uv/), `uv run python -m factory` does all of this in one step.)
    It listens on `ws://127.0.0.1:8765/ws` and prepares `workspace/test-project` (see below).
 2. Open `game/project.godot` in Godot and press Play (F5).
-3. Type a spec in the top bar and press Enter, for example "Add a greet(name) function".
+3. Click a **Custom** storage belted into an intake (place one in build mode: Storage, What it
+   holds: Custom), describe a change in its window and press **Add** (or Ctrl+Enter), for example
+   "Add a greet(name) function". An intake with typed specs ticked has the same box in its window.
    The crate travels down the line:
    - **Coder** fetches, makes branch `crate/<n>` in its own worktree under
      `workspace/worktrees/crate-<n>`, runs `claude -p` on the spec (it can read and edit
      files, but not run commands), and commits.
+     Its **Mode** setting picks how: *Implement* (the default) writes implementation code only, no tests (a changed test file
+     fails the crate);
+     *TDD* writes the tests first (only test files allowed), commits them, runs them and
+     requires them to fail, then writes the code, running the tests itself until they pass;
+     *Test writer only* writes tests and no code (any other file changed fails the crate).
    - **Tester** installs dependencies and runs the project's tests
      (`backend/scripts/run_tests.py`: `pnpm test` / npm / yarn, plus unittest or pytest), then
      commits the lockfile if the install changed it. No tests counts as a pass.
@@ -43,6 +50,10 @@ You need Python 3.10+.
    - **Risk analyser** has Claude rate the change low, medium or high risk and stamps the crate.
    - **Reviewer** has Claude review the diff and posts the review on the PR. It only reviews and
      comments: a review asking for changes leaves by its red port.
+     Each review type's instructions live in `backend/prompts/reviewer/<type>.md` (general,
+     security, intent, tests, breaking, performance, custom). Edit one and the next review uses it,
+     no restart needed; keep its `{placeholders}`, which are filled from the Reviewer's settings.
+     A missing or empty file falls back to the built-in text in `backend/factory/review_types.py`.
    - **Approver** **waits for you** (or for a review on GitHub, or lets low-risk changes through
      by itself). The machine shows how many crates are waiting; they line up underneath it in yellow.
    - **CI** waits for the PR's checks to pass (it passes after 30s if there are none).
@@ -87,10 +98,47 @@ belt laid after they were held, and that parallel crates don't clash in git.
 
 ## First-time setup for GitHub
 
-- `gh auth login`, then `gh auth setup-git` so `git push` uses the same sign-in.
-- The test project is `workspace/test-project`, connected to the `remote` in
-  `backend/factory.toml` (markbailey/test-project). On start the backend clones it, or connects
-  an existing local copy and pushes `main` if GitHub's is empty.
+- `gh auth login`, then `gh auth setup-git` so `git push` uses the same sign-in. Or give the
+  factory an account of its own (below), and it doesn't use your sign-in at all.
+- There's no default repo: each line picks its repo in build mode (the intake's settings), from
+  the repo list under the gear. A line with none is paused with "pick a repo for this line".
+- Lines that pick the repo named by `remote` in `backend/factory.toml` (markbailey/test-project)
+  use its clone in `workspace/test-project`. On start the backend clones it, or connects an
+  existing local copy and pushes `main` if GitHub's is empty.
+
+### The factory's own accounts (bots for GitHub and Jira)
+
+By default the factory works as whoever is signed in on this machine (`gh`, git's credential
+manager, `JIRA_API_TOKEN`). You can give it as many accounts of its own as you like: press the
+**gear icon** in the top bar (**Accounts**), press **+** next to *GitHub accounts* or *Jira
+accounts*, fill in the form and press **Add**. It takes effect at once, no restart, and the check
+button shows who each account (and this machine's sign-in) is signed in as.
+
+- **GitHub account:** a name, and a token of that GitHub account (a second account you made for
+  the factory, added as a collaborator on its repos). A fine-grained token with *Contents*,
+  *Issues* and *Pull requests* set to read and write on those repos does it; add *Workflows* if
+  it edits GitHub Actions files. Optional: the commit author name and email.
+- **Jira account:** a name, the site (`https://your-site.atlassian.net`), the email of that
+  Atlassian account and an API token for it (id.atlassian.com, Security, API tokens).
+
+**Choosing which account does what:**
+- Each service has a **Default** (top of its list in Accounts). The first account you add
+  becomes it; *This machine's sign-in* is always a choice.
+- A **line** can pick its own in build mode (the intake's settings, *Accounts this line works
+  as*): its machines (pushes, PRs, issue comments, Claude's `gh` calls) and its storages work as
+  that GitHub account, and talk to Jira as that Jira account.
+- A **storage** can pick its own too (*Account it works as*): a Jira storage a Jira account, a
+  GitHub storage a GitHub account. Crates from that storage are then worked on as that account.
+- Remove an account and whatever picked it goes back to the default.
+
+`reviewer = "@me"` in `[intake.review_requests]` means whichever GitHub account that storage
+works as: put your own login there to keep reviewing your requests with a bot account.
+
+The accounts are kept in `backend/accounts.toml`, which `.gitignore` keeps out of git, and the
+game never gets a token back (a saved one shows as "token saved"; editing an account with the
+token box left empty keeps it). `backend/accounts.example.toml` shows the file's shape. Claude's
+steps run with the account's token in their environment, so give each bot only the access it
+needs.
 
 ### Work from issue trackers
 
@@ -98,10 +146,12 @@ belt laid after they were held, and that parallel crates don't clash in git.
   Within a minute it becomes a crate (marked with a blue dot). The factory assigns the issue
   to you and labels it `in progress`. Its PR says "Closes #n", and the factory comments on the
   issue when the PR opens or the crate is scrapped.
-- **Jira:** set `enabled = true` under `[intake.jira]` in `backend/factory.toml`, fill in
-  `base_url`, `email` and `jql`, and set the `JIRA_API_TOKEN` environment variable to an API
-  token before starting the backend. Picked-up issues are assigned to you and moved to
-  In Progress; shipped ones to Done.
+- **Jira:** add a Jira account in **Accounts** (above). Then, in build mode, place a
+  Storage, set *What it holds* to *Jira issues*, give it a JQL filter (blank: the `jql` in
+  `[intake.jira]`) and optionally the GitHub repo its crates are coded in, and belt it into an
+  intake. Its window lists what the JQL finds, and they come in by themselves. Picked-up issues
+  are assigned to the Jira account and moved to In Progress; shipped ones to Done. (Or, without
+  storages, set `enabled = true` under `[intake.jira]` in `backend/factory.toml`.)
 
 ### Why a crate was scrapped, and what happens to its issue
 
@@ -138,6 +188,13 @@ issue in, removed on hand-back so the JQL should include `labels = factory`) and
 Waiting and shipped crates are off the floor too: a machine waiting for you shows how many in
 its corner (click it for the list), and the shipping dock shows how many have shipped (click it
 for the list).
+
+The **N waiting for you** button in the top bar opens the holding bay: every crate waiting for
+your approval (at any Approver, on any line) or held at a machine, in one list, oldest first.
+Approve or send back each one, open its PR or log, or tick several and decide them together with
+one note. An Approver holds any number of crates, and crates waiting for you don't count toward
+a line's "most crates on the line", so the rest of the factory keeps running while they wait.
+They survive a backend restart.
 
 ### Review pull requests that are waiting for you
 
@@ -363,6 +420,10 @@ several lines (pipelines), each with its own intake, shipping dock and scrap bin
   the floor (Esc stops).
 - **Move** anything (machines, the intake, dock and scrap bin) by dragging it. Shift+drag
   moves its whole line.
+- **Turn** anything a quarter turn with **R** (Shift+R the other way): while placing it, while
+  dragging it, or once it's picked (the machine settings have a **Turn** button too). Its inputs
+  and outputs move round with it, so belts can come in from any side; its belts are routed
+  again to the new sides. The turn is saved with the layout (`"rot"`: quarter turns clockwise).
 - **Pick several:** Shift+click machines (again to take one out), or hold Shift and drag a box
   on empty floor. A box also picks the room blocks inside it (walls, windows, doors, belt ports,
   floor, signs, footbridges and worker doors). Picked things are outlined in blue; drag any of
@@ -387,7 +448,9 @@ several lines (pipelines), each with its own intake, shipping dock and scrap bin
   that doesn't run from an output into an input stays where you laid it as a free conveyor; bring
   it back round to the cell you started on (4 cells or more) to close a loop. Drag on from a free
   conveyor's end to make it longer; once one run goes from an output into an input it becomes a
-  link and crates ride it. Free conveyors run with the other belts but carry no crates. Click one
+  link and crates ride it. Pieces laid end to end (starting on, or next to, another's end) join
+  up the same way, so a run from an output's belt to an input's belt links them. Free conveyors run
+  with the other belts but carry no crates. Click one
   and press Delete to take it up.
 - **Place first, link later:** machines, docks and bins can go down before there's any line. They
   sit on a line with no intake (saved, paused until it has one). Place an Intake while that line

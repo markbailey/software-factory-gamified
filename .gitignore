@@ -7,7 +7,7 @@ game/android/
 __pycache__/
 *.pyc
 backend/.venv/
-backend/factory.db
+backend/factory.db*
 backend/uv.lock
 
 # The throwaway test project machines run in

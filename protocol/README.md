@@ -7,14 +7,23 @@ The backend owns the truth: the game only draws what events tell it and sends co
 
 | type | fields | meaning |
 | --- | --- | --- |
-| `submit_work` | `text` (string, max 20000 chars), `pipeline`? | Put a new spec crate on the intake of the line that takes typed specs (or the named pipeline) |
+| `submit_work` | `text` (string, max 20000 chars), `pipeline`?, `storage`? | Put a new spec crate on the intake of the line that takes typed specs (or the named pipeline). With `storage` (the id of a Custom storage belted into that pipeline's intake), it joins the end of that storage's queue instead: the queue (kept across restarts) goes onto the line one crate at a time, each once the line isn't paused or full and the last one from that storage has left the intake. Each crate comes from that storage, is worked on in its repo and as its account. The queue is in that storage's `intake_list` entry: rows with `queue_id`, `queue_pos`, `queue_len` and the full `text`, next first |
+| `custom_queue_edit` / `custom_queue_remove` / `custom_queue_move` | `id` (a row's `queue_id`), `text` (edit), `delta` (move: -1 up, 1 down) | Change a Custom storage's queue before the line takes the change. An `error` if it has already gone onto the line |
+| `get_accounts` | | Answered by `accounts` |
+| `save_account` | `service` ("github" or "jira"), `account` `{id?, name, token?, git_name?, git_email?}` / `{id?, name, base_url, email, token?}` | Add an account (no `id`) or change one. A token left out is kept, `""` clears it. Answered by `accounts` with `saved` (its id) and `check` |
+| `remove_account` | `service`, `id` | Remove one; lines and storages that picked it use the default. Answered by `accounts` |
+| `set_default_account` | `service`, `id` (`"@machine"` for this machine's sign-in) | The account the service uses unless a line or storage picks another. Answered by `accounts` |
+| `check_accounts` | | Check who each account and this machine's sign-in is; answered by `accounts` with `check` |
 | `approve` | `item_id` | Let a crate waiting at a gate machine carry on |
 | `reject` | `item_id`, `note`? | At a machine with a fail belt, send the crate back for rework with the note; otherwise close its PR and scrap it |
 | `scrap` | `item_id`, `note`? | Close the PR of a crate waiting at a gate and scrap it |
 | `retry` | `item_id`, `note`? | Send a scrapped crate back to the Coder, with the note for Claude |
 | `intake_list` | `pipeline` | What the pipeline's intake sources have (answered by `intake_list`, to this game only) |
 | `intake_pull` | `pipeline`, `source`, `ref` | Make one issue a crate now (GitHub issues only; `ref` is the issue number). Answered by `item_created` and a fresh `intake_list`, or `error` |
+| `storage_enabled` | `pipeline`, `storage`, `enabled` | Switch a storage on or off, saved with the layout (as `"enabled": false` on that storage in `pipelines.json`; build mode's storage settings have the same tick). A storage switched off stays belted in but isn't polled and brings nothing in (a Custom storage's queue waits); its `intake_list` entry has `disabled: true`. Answered by a fresh `snapshot`, or `error` |
 | `intake_check` | `pipeline`, `source`? | Poll the source (or all of the pipeline's sources) now, then answer with `intake_list` |
+| `intake_close` | `pipeline`, `source`, `storage`, `refs[]`, `comment`?, `reason`?, `transition`? | Close issues or PRs sitting in a storage (`refs` are row `ref`s from `intake_list`: issue/PR numbers, PR urls for `pr_review`, Jira keys), as the account that storage works as. `comment` is posted first. GitHub issues: `reason` `completed` or `not planned`. Open PRs and PRs to review are closed (branch kept). Jira: moved through `transition` (its name or target status), or by default the transition into a done-category status (Done/Closed/Resolved first). Answered by `intake_closed` and a fresh `intake_list` without them, or `error`. Closing is outward-facing: the game confirms first |
+| `intake_close_options` | `pipeline`, `source`, `storage`, `refs[]` | How `intake_close` would close these: answered by `intake_close_options` |
 | `check_agent` | | Check now whether Claude is available (answered by `agent_status`) |
 | `check_tools` | | Check the broken tools again now (answered by `tool_status`). A problem no check can see (a crashed factory script) is taken as fixed, and its step runs again |
 | `save_pipelines` | `pipelines[]` (see Pipeline) | Replace every pipeline (build mode). Refused with an `error` if one is invalid or crates are still in the factory; on success every game gets a new `snapshot` |
@@ -28,6 +37,7 @@ The game ignores any event whose `seq` is not greater than the last one it appli
 | type | fields | meaning |
 | --- | --- | --- |
 | `snapshot` | `seq`, `layout`, `items[]` | Full state, sent on connect and after the pipelines are saved. `seq` is the last event already included. `layout.pipelines` lists the pipelines (machines merged with their catalogue fields, plus `order`: machine ids in travel order), `layout.catalog` the machine types you can add, `layout.sources` the intake sources |
+| `accounts` | `github[] {id, name, token_set, git_name, git_email}`, `jira[] {id, name, token_set, base_url, email}`, `defaults {github, jira}`, `machine {jira_site, jira_email, jira_ready}`, `file`, `saved`?, `check`? `{github: {<id or @machine>: {ok, message, login?}}, jira: {...}}`, `error`? | The factory's accounts, to this game only. Tokens are never sent. Pipelines choose with `accounts {github?, jira?}` and a storage with `account`: an id, `"@machine"`, or none for the default (the line's, for a storage) |
 | `item_created` | `item` | A new crate at its pipeline's intake |
 | `item_moved` | `item_id`, `to`, `duration`, `state`? | Crate starts moving to location `to`, arriving after `duration` seconds |
 | `job_started` | `item_id`, `machine`, `command[]` | Machine started; `command` lists its step names |
@@ -38,7 +48,9 @@ The game ignores any event whose `seq` is not greater than the last one it appli
 | `pr_opened` | `item_id`, `url` | A machine's output contained a GitHub pull request URL |
 | `job_failed` | `item_id`, `machine`, `exit_code`, `step` | Command failed or was refused; the crate goes to `scrap` |
 | `error` | `message` | The last command was rejected |
-| `intake_list` | `pipeline`, `sources[]` | Reply to `intake_list`/`intake_pull`/`intake_check` (no `seq`). Each source: `source`, `enabled`, `about`, `poll_seconds`, `last_poll`, `next_poll` (unix seconds), `poll_error`, `error`, and `items[]` of `{ref, label, title, url, by, tags[], auto, can_pull, item_id, item_state}`. `auto` means it comes in by itself on the next poll; `item_id` is its crate, or null |
+| `intake_list` | `pipeline`, `sources[]` | Reply to `intake_list`/`intake_pull`/`intake_check` (no `seq`). Each source: `source`, `enabled`, `about`, `poll_seconds`, `last_poll`, `next_poll` (unix seconds), `poll_error`, `error`, `can_close` (its items can be closed with `intake_close`), `account` (who it works as, e.g. "the work account"), `disabled` (true: the storage is switched off), and `items[]` of `{ref, label, title, url, by, tags[], auto, can_pull, item_id, item_state}`. `auto` means it comes in by itself on the next poll; `item_id` is its crate, or null |
+| `intake_closed` | `pipeline`, `source`, `storage`, `account`, `closed[]`, `failed[]` | Reply to `intake_close` (no `seq`): the refs closed, and `{ref, error}` for each that wasn't |
+| `intake_close_options` | `pipeline`, `source`, `storage`, `refs[]`, `account`, `transitions[]`, `default` | Reply to `intake_close_options`. Jira: `transitions[]` of `{id, name, to, done}` for the first ref, done ones first, and `default` the name `intake_close` uses with no `transition`. Empty for GitHub |
 | `agent_status` | `available`, `reason`, `detail`, `since`, `checked_at`, `next_check_at`, `enabled` | Whether Claude is available (no `seq`; also in the snapshot as `agent`). While it isn't, machines with `uses_agent` hold their crates and a Claude step that failed runs again when it's back |
 | `tool_status` | `outages[]` of `{key, label, reason, detail, since, can_check}` | The factory's own tooling that is broken: `gh` signed out, `git` can't sign in, `network`, a missing command, or `scripts` (one of the factory's scripts crashed). No `seq`; also in the snapshot as `tools`. A crate whose step failed this way waits at its machine and the step runs again once a check passes (every 30 seconds, or on `check_tools`); machines whose steps use that tool hold their crates meanwhile. `can_check` false means only `check_tools` clears it |
 | `item_held` | `item_id`, `machine`, `kind`, `reason` | The crate is held at the machine (see `held` below); `kind` is the scrap reason it would have had |
@@ -101,7 +113,10 @@ fail belt.
             {"from": "tester", "port": "fail", "to": "coder"}] }
 ```
 
-`pos` is the top-left cell of a 2x2 footprint on a grid of 64px cells. A belt leaves `intake`
+`pos` is the top-left cell of a 2x2 footprint on a grid of 64px cells. `rot` (optional, on a machine,
+station, bin, dock or storage) is how many quarter turns clockwise it's turned: 0 or missing
+takes belts in on the west side and sends them out on the east, 1 in from the north and out
+south, 2 in from the east, 3 in from the south. A belt leaves `intake`
 from `out`, or a machine from `pass` or `fail`, and goes to a machine or `dock`. Following
 `pass` belts from the intake must reach the dock through every machine once; a `fail` belt goes
 back to an earlier machine (rework). `path` is the belt's cells as the game laid them out; the

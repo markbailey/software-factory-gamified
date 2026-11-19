@@ -50,7 +50,7 @@ const SCRAP_WORDS := {"needs_info": "Needs info", "already_done": "Already done"
 const RISK_WORDS := {"low": "Low", "medium": "Medium", "high": "High"}
 const RISK_COLORS := {"low": C_GREEN, "medium": C_YELLOW, "high": C_RED}
 const SOURCE_TITLES := {"custom": "Changes you describe", "github": "GitHub issues", "jira": "Jira issues",
-		"pr_review": "Pull requests to review", "prd": "PRDs", "github_pr": "Open PRs"}
+		"pr_review": "Pull requests to review", "prd": "PRDs", "github_pr": "Open PRs", "notion": "Notion pages"}
 const CLOSABLE := ["github", "github_pr", "pr_review", "jira", "prd"]  # if a listing doesn't say (can_close)
 const CRATE_COLUMNS := ["#", "Title", "Source", "Line", "Where", "State", "Age", "Reworks", "Risk", "Claude", "PR", ""]
 const CRATE_SORT_KEYS := ["id", "title", "source", "line", "at", "state_rank", "created", "loops", "risk_rank", "cost", "pr", ""]
@@ -241,6 +241,10 @@ func _ready() -> void:
 func open() -> void:
 	visible = true
 	_ask_stats()
+	# Shipped crates whose PR was still open: the backend checks GitHub again (batched, and at
+	# most every 30s) and sends pr_state for any now merged or closed.
+	if main:
+		main.client.send({"type": "refresh_pr_states"})
 	_ask_storages()
 	_refresh_live()
 	if _tabs.current_tab == TAB_WORKTREES:
@@ -418,7 +422,7 @@ func _build_overview() -> Control:
 	_chart_scrap = _card(grid, "Why crates were scrapped", "In the time chosen above.")
 	_chart_machines = _card(grid, "Machine runs", "Green: passed. Red: failed. Hover for timings and cost.")
 	_chart_lines = _card(grid, "Lines", "Crates shipped and scrapped per line, with Claude cost.")
-	_chart_agents = _card(grid, "Claude by model and effort", "Machine runs per model and effort, with cost and time.")
+	_chart_agents = _card(grid, "Agents by model and effort", "Machine runs per agent, model and effort, with cost (Claude only), tokens and time.")
 
 	var card := _card_panel()
 	col.add_child(card)
@@ -622,15 +626,17 @@ func _refresh_stats() -> void:
 	for a in s.get("agents", []):
 		var runs := int(a.get("runs", 0))
 		var failed := int(a.get("failed", 0))
-		var label := _agent_label(str(a.get("model", "")), str(a.get("effort", "")))
+		var label := _agent_label(str(a.get("model", "")), str(a.get("effort", "")), str(a.get("agent", "")))
 		var cost_text := _usd(float(a.get("cost_usd", 0.0)))
+		if str(a.get("agent", "claude")) not in ["", "claude"]:
+			cost_text = "%s tokens" % _count(int(a.get("tokens", 0)))
 		agent_rows.append({"label": label,
 				"parts": [[float(runs - failed), Color(C_GREEN)], [float(failed), Color(C_RED)]],
 				"text": "%d · %s · %s" % [runs, cost_text, _seconds(float(a.get("seconds", 0.0)))],
 				"tip": "%s: %d run%s (%d failed), %s, %s in all, %s each, %d turns" % [label, runs,
 						"" if runs == 1 else "s", failed, cost_text, _seconds(float(a.get("seconds", 0.0))),
 						_seconds(float(a.get("avg_seconds", 0.0))), int(a.get("turns", 0))]})
-	_chart_agents.set_bars(agent_rows, "No machine ran Claude in this time.")
+	_chart_agents.set_bars(agent_rows, "No machine ran an agent in this time.")
 
 
 func _refresh_state_chart() -> void:
@@ -965,7 +971,7 @@ func _build_crates() -> Control:
 	_act_buttons["approve"].tooltip_text = "Approve the ticked crates waiting for your approval"
 	_act_buttons["reject"].tooltip_text = "Send back (or reject) the ticked crates waiting for your approval, with your note"
 	_act_buttons["retry"].tooltip_text = "Run again: held crates run their machine again; scrapped ones go back to the start of the line"
-	_act_buttons["scrap"].tooltip_text = "Scrap the ticked crates that are held, or waiting where they could be sent back"
+	_act_buttons["scrap"].tooltip_text = "Scrap the ticked crates (ones on a belt or in a machine stop their work first)"
 	_sync_actions()
 	return col
 
@@ -988,6 +994,8 @@ func _actionable() -> Dictionary:
 			out["scrap"].append(id)
 		elif state == "scrapped":
 			out["retry"].append(id)
+		elif state != "shipped":
+			out["scrap"].append(id)  # Scrap now: on a belt or in a machine
 	return out
 
 
@@ -2005,16 +2013,30 @@ func _button(item: TreeItem, column: int, icon: String, id: int, tip: String) ->
 
 ## "claude-opus-5-5", "high" -> "Opus 5.5 · high". "default" is the claude CLI's own choice;
 ## "unknown" marks runs from before the dashboard recorded the model.
-static func _agent_label(model: String, effort: String) -> String:
+## Other agents are named first: "gemini", "flash" -> "Gemini · flash · default effort".
+static func _agent_label(model: String, effort: String, agent: String = "") -> String:
 	if model == "unknown":
 		return "Not recorded (older runs)"
 	var name := "CLI default model"
-	if model != "default" and not model.is_empty():
+	if agent not in ["", "claude"]:
+		var agent_names := {"gemini": "Gemini", "antigravity": "Antigravity", "copilot": "Copilot"}
+		name = "%s · %s" % [agent_names.get(agent, agent.capitalize()),
+				model if model != "default" and not model.is_empty() else "default model"]
+	elif model != "default" and not model.is_empty():
 		var parts := model.trim_prefix("claude-").split("-")
 		name = parts[0].capitalize()
 		if parts.size() > 1:
 			name += " " + ".".join(parts.slice(1))
 	return "%s · %s" % [name, "default effort" if effort in ["default", ""] else effort]
+
+
+## 1234567 -> "1.2M", 45200 -> "45.2k".
+static func _count(n: int) -> String:
+	if n >= 1000000:
+		return "%.1fM" % (n / 1000000.0)
+	if n >= 1000:
+		return "%.1fk" % (n / 1000.0)
+	return str(n)
 
 
 static func _usd(v: float) -> String:

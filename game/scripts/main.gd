@@ -447,8 +447,8 @@ func _build_ui() -> void:
 	accounts_view.set_default.connect(func(service: String, id: String) -> void:
 		client.send({"type": "set_default_account", "service": service, "id": id}))
 	accounts_view.check.connect(func() -> void: client.send({"type": "check_accounts"}))
-	accounts_view.agent_defaults_changed.connect(func(model: String, effort: String) -> void:
-		if not client.send({"type": "agent_defaults", "model": model, "effort": effort}):
+	accounts_view.agent_defaults_changed.connect(func(model: String, effort: String, agent: String) -> void:
+		if not client.send({"type": "agent_defaults", "model": model, "effort": effort, "agent": agent}):
 			_toast("Not connected. Is the backend running?", Color("E5484D")))
 	accounts_view.force_delete_changed.connect(func(on: bool) -> void:
 		if not client.send({"type": "force_delete", "on": on}):
@@ -548,7 +548,11 @@ func _refresh_actions() -> void:
 	reject_button.tooltip_text = ("Send back: send it back to the Coder with your note" if sends_back
 			else "Send back: have it done again, with your note" if redo_here
 			else "Reject: close the PR and scrap the crate")
-	scrap_button.visible = (waiting and (sends_back or redo_here)) or held
+	# Scrap now: any crate still on the floor (on a belt, in a machine) can be thrown away too.
+	var active := state != "" and not (state in ["shipped", "scrapped", "awaiting_approval", "held"])
+	scrap_button.visible = (waiting and (sends_back or redo_here)) or held or active
+	scrap_button.tooltip_text = ("Scrap now: stop its work and throw the crate in the scrap bin" if active
+			else "Scrap: throw the crate in the scrap bin")
 	note_input.placeholder_text = ("Notes for the %s (optional)" % str(_layout_machine(crates[selected_id].location).get("name", "machine"))
 			if redo_here else "Notes for the Coder (optional)")
 	if held:
@@ -558,7 +562,7 @@ func _refresh_actions() -> void:
 	retry_button.tooltip_text = ("Run again: run this machine again on the crate, with your note" if held
 			else "Retry: send the crate back to the start of the line")
 	note_input.visible = state == "awaiting_approval" or state == "scrapped" or held
-	gate_row.visible = note_input.visible
+	gate_row.visible = note_input.visible or active
 	pr_button.visible = str(pr_urls.get(selected_id, "")) != ""
 	bottom_panel.offset_top = -(BOTTOM_PANEL + (GATE_ROW if gate_row.visible else 0.0))
 
@@ -1548,6 +1552,8 @@ func _mouse_world_at(screen: Vector2) -> Vector2:
 func _on_connected() -> void:
 	_set_status("[color=#5ABF66]●[/color] Connected")
 	client.send({"type": "get_accounts"})  # the build panel's account pickers need them
+	# Say when crates get where they were sent, so machines wait for a crate still on the belt.
+	client.send({"type": "crate_arrivals", "on": true})
 
 
 func _on_disconnected() -> void:
@@ -1760,6 +1766,7 @@ func _apply_snapshot(snap: Dictionary) -> void:
 
 	for item in snap.get("items", []):
 		_add_item(item)
+		_on_crate_settled(crates[int(item["id"])])  # it is already where it waits
 		if str(item.get("state", "")) == "running":
 			factory_floor.set_machine_state(str(item.get("location", "")), "running", 0.0)
 	_select(selected_id if crates.has(selected_id) else -1)
@@ -1787,6 +1794,7 @@ func _add_item(item: Dictionary) -> void:
 		pr_states[id] = str(item["pr_state"])
 	crates_layer.add_child(crate)
 	crates[id] = crate
+	crate.settled.connect(_on_crate_settled)
 	crate_times[id] = float(item.get("created_at", 0.0))
 	var lines: Array = []
 	for line in item.get("log", []):
@@ -1824,6 +1832,25 @@ func _ride_from_storage(item: Dictionary) -> void:
 	crate.move_path(path, length / maxf(factory_floor.belt_fps * 2.0, 1.0))
 
 
+## A crate stopped riding: tell the backend, whose machine may be waiting for it to arrive.
+func _on_crate_settled(crate: Crate) -> void:
+	if crates.get(crate.item_id) != crate:
+		return  # an old crate from before a fresh snapshot
+	client.send({"type": "crate_arrived", "item_id": crate.item_id, "location": crate.location})
+
+
+## A crate scrapped while a machine was working on it (Scrap now): that machine stops showing
+## it as working, even if the backend's "job_failed" was missed.
+func _stop_machines_for(id: int) -> void:
+	for mid in machine_runs:
+		var run: Dictionary = machine_runs[mid]
+		if int(run.get("item_id", -1)) == id and not bool(run.get("finished", false)) \
+				and not bool(run.get("failed", false)):
+			run["failed"] = true
+			if factory_floor.machine_state(str(mid)) == "running":
+				factory_floor.set_machine_state(str(mid), "failed", factory_floor.machine_progress(str(mid)), "Scrapped")
+
+
 func _on_item_moved(msg: Dictionary) -> void:
 	var id := int(msg["item_id"])
 	if not crates.has(id):
@@ -1849,6 +1876,7 @@ func _on_item_moved(msg: Dictionary) -> void:
 		# Scrapped where it stood (you pressed Scrap): it drops out of sight, and the bin shows
 		# it landing.
 		crate.vanish()
+		_stop_machines_for(id)
 	elif bool(msg.get("carried", false)):
 		# Not this machine's work: a worker carries it straight across to the right machine.
 		crate.move_path([path[-1]], float(msg.get("duration", 0.0)))
@@ -2182,4 +2210,6 @@ func _source_label(item: Dictionary) -> String:
 			return "PRD #" + ref if not ref.is_empty() else "PRD"
 		"github_pr":
 			return "PR #" + ref
+		"notion":
+			return "Notion PRD"
 	return ""

@@ -14,13 +14,13 @@ signal closed
 signal force_delete_changed(on: bool)  # the Cleanup section's tick box; applies at once
 signal branch_pattern_changed(pattern: String)  # the Branch naming section's Save
 signal repos_changed(repos: Array)  # the Repos section: the whole list of names it saves
-signal agent_defaults_changed(model: String, effort: String)  # the Claude section; applies at once
+signal agent_defaults_changed(model: String, effort: String, agent: String)  # the Agents section; applies at once
 
 const MACHINE := "@machine"
 const C_QUIET := "9AA1AD"
 const C_RED := "E5484D"
 const C_GREEN := "5ABF66"
-const SERVICES := {"github": "GitHub", "jira": "Jira"}
+const SERVICES := {"github": "GitHub", "jira": "Jira", "notion": "Notion"}
 const FIELDS := {
 	"github": [["name", "Name", "e.g. Factory bot", false],
 		["token", "Token", "github_pat_... (Contents, Issues, Pull requests: read and write)", true],
@@ -30,6 +30,8 @@ const FIELDS := {
 		["base_url", "Jira site", "https://your-site.atlassian.net", false],
 		["email", "Email of the Atlassian account", "factory-bot@example.com", false],
 		["token", "API token", "from id.atlassian.com, Security, API tokens", true]],
+	"notion": [["name", "Name", "e.g. Docs bot", false],
+		["token", "Integration secret", "ntn_... from notion.so/profile/integrations (share pages with it)", true]],
 }
 
 var _content: VBoxContainer
@@ -41,8 +43,8 @@ var _force_delete := false  # as the backend last said
 var _branch_pattern := "crate/{id}"  # as the backend last said
 var _repos: Array = []  # [{github, saved, in_use, default}] as the backend last said
 var _repo_input: LineEdit
-var _agent_defaults := {"model": "", "effort": ""}  # as the backend last said ("" = the CLI's own)
-var _agent_choices := {"models": [], "efforts": []}
+var _agent_defaults := {"agent": "claude", "model": "", "effort": ""}  # as the backend last said ("" = the CLI's own)
+var _agent_choices := {"models": [], "efforts": [], "agents": []}
 
 
 func _ready() -> void:
@@ -122,7 +124,8 @@ static func branch_preview(pattern: String) -> String:
 ## The factory-wide Claude model and effort (snapshot or "agent_defaults" message), and what
 ## the pickers list (snapshot's agent_choices; empty keeps the last).
 func show_agent_defaults(defaults: Dictionary, choices: Dictionary = {}) -> void:
-	var d := {"model": str(defaults.get("model", "")), "effort": str(defaults.get("effort", ""))}
+	var d := {"agent": str(defaults.get("agent", "claude")), "model": str(defaults.get("model", "")),
+			"effort": str(defaults.get("effort", ""))}
 	if d == _agent_defaults and (choices.is_empty() or choices == _agent_choices):
 		return
 	_agent_defaults = d
@@ -237,14 +240,49 @@ func _add_repo() -> void:
 	repos_changed.emit(names)
 
 
-## Claude: the model and effort level every Claude machine uses unless its own settings pick one.
+## Agents: the agent, model and effort level every agent machine uses unless its own settings pick one.
 func _agent_section() -> void:
 	var label := Label.new()
-	label.text = "Claude"
+	label.text = "Agents"
 	label.theme_type_variation = &"LabelHeading"
 	_content.add_child(label)
-	_content.add_child(_text("[color=#%s]The model and effort level machines that run Claude use (Coder, Reviewer, Planner, Document writer and the rest). A machine can pick its own in build mode; one left on Default uses these. Changes straight away, from the next step a machine starts.[/color]" % C_QUIET))
+	_content.add_child(_text("[color=#%s]The coding agent machines run (Coder, Reviewer, Planner, Document writer and the rest), and its model and effort level: Claude Code, Gemini CLI, Antigravity CLI or GitHub Copilot CLI, installed and signed in on this computer. A machine can pick its own in build mode; one left on Default uses these. Changes straight away, from the next step a machine starts. Only Claude reports a cost; the others report tokens.[/color]" % C_QUIET))
+	var agent_id := str(_agent_defaults.get("agent", "claude"))
+	var info := {"label": "Claude Code", "models": _agent_choices.get("models", []), "efforts": _agent_choices.get("efforts", [])}
+	for a in _agent_choices.get("agents", []):
+		if a is Dictionary and str(a.get("id", "")) == agent_id:
+			info = a
+	var agent_row := HBoxContainer.new()
+	_content.add_child(agent_row)
+	var agent_caption := Label.new()
+	agent_caption.text = "Agent"
+	agent_caption.custom_minimum_size = Vector2(70, 0)
+	agent_row.add_child(agent_caption)
+	var agent_pick := OptionButton.new()
+	agent_pick.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	agent_pick.clip_text = true
+	agent_pick.add_item("Claude Code")
+	agent_pick.set_item_metadata(0, "claude")
+	for a in _agent_choices.get("agents", []):
+		if a is Dictionary and str(a.get("id", "")) != "claude":
+			agent_pick.add_item(str(a.get("label", a.get("id", ""))))
+			agent_pick.set_item_metadata(agent_pick.item_count - 1, str(a.get("id", "")))
+	for i in agent_pick.item_count:
+		if str(agent_pick.get_item_metadata(i)) == agent_id:
+			agent_pick.select(i)
+	agent_pick.item_selected.connect(func(i: int) -> void:
+		var picked := str(agent_pick.get_item_metadata(i))
+		if picked == str(_agent_defaults["agent"]):
+			return
+		# Another agent: its own model and effort until you pick some.
+		_agent_defaults = {"agent": picked, "model": "", "effort": ""}
+		agent_defaults_changed.emit("", "", picked)
+		_render.call_deferred())
+	agent_row.add_child(agent_pick)
 	for field in ["model", "effort"]:
+		var values: Array = info.get("models" if field == "model" else "efforts", [])
+		if field == "effort" and values.is_empty():
+			continue  # Gemini and Copilot have no effort setting
 		var row := HBoxContainer.new()
 		_content.add_child(row)
 		var caption := Label.new()
@@ -254,9 +292,8 @@ func _agent_section() -> void:
 		var pick := OptionButton.new()
 		pick.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		pick.clip_text = true
-		pick.add_item("Claude Code's default")
+		pick.add_item("%s's default" % str(info.get("label", "The agent")))
 		pick.set_item_metadata(0, "")
-		var values: Array = _agent_choices.get("models" if field == "model" else "efforts", [])
 		var current := str(_agent_defaults.get(field, ""))
 		if not current.is_empty() and not values.has(current):
 			values = values + [current]  # one typed into agents.json by hand
@@ -267,7 +304,8 @@ func _agent_section() -> void:
 				pick.select(pick.item_count - 1)
 		pick.item_selected.connect(func(i: int) -> void:
 			_agent_defaults[field] = str(pick.get_item_metadata(i))
-			agent_defaults_changed.emit(str(_agent_defaults["model"]), str(_agent_defaults["effort"])))
+			agent_defaults_changed.emit(str(_agent_defaults["model"]), str(_agent_defaults["effort"]),
+					str(_agent_defaults["agent"])))
 		row.add_child(pick)
 
 
@@ -369,6 +407,9 @@ func _section(service: String) -> void:
 	var machine_words := "gh auth login and git's credential manager" if service == "github" else \
 			("JIRA_API_TOKEN, with factory.toml's site" if bool((_last.get("machine", {}) as Dictionary).get("jira_ready", false))
 			else "not set up (no JIRA_API_TOKEN or site in factory.toml)")
+	if service == "notion":
+		machine_words = "the NOTION_TOKEN variable" if bool((_last.get("machine", {}) as Dictionary).get("notion_ready", false)) \
+				else "not set up (no NOTION_TOKEN variable)"
 	_content.add_child(_text("[b]This machine's sign-in[/b]  [color=#%s]%s[/color]%s"
 			% [C_QUIET, machine_words, _status(checked.get(MACHINE, {}))]))
 	if accounts.is_empty():

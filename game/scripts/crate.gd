@@ -1,6 +1,9 @@
 extends Node2D
 ## One work item. It only moves when the backend says so.
 
+## It finished every move it was given and sits where the backend last sent it (location).
+signal settled(crate)
+
 const SIZE := 32.0
 const AMBER := Color("F2B84C")
 const STAMP := 14.0  # size of the risk stamp in the bottom-left corner
@@ -71,6 +74,7 @@ func vanish() -> void:
 ## Scrapped crates aren't drawn on the floor: they ride into the bin, then vanish into it.
 func _settle() -> void:
 	visible = not state in OFF_FLOOR
+	settled.emit(self)
 
 
 func move_to(target: Vector2, duration: float) -> void:

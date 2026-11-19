@@ -110,12 +110,12 @@ static func bins_of(p: Dictionary) -> Array:
 			out.append(str(b.get("id", "")))
 	return out
 const STORAGE_NAMES := {"custom": "Custom", "github": "GitHub issues", "jira": "Jira issues", "github_pr": "Open PRs",
-		"pr_review": "PRs to review", "prd": "PRDs"}
+		"pr_review": "PRs to review", "prd": "PRDs", "notion": "Notion pages"}
 const STORAGE_ICONS := {"custom": "icon_crate", "github": "icon_github", "jira": "icon_jira", "github_pr": "icon_pr",
-		"pr_review": "icon_review_request", "prd": "icon_prd"}
+		"pr_review": "icon_review_request", "prd": "icon_prd", "notion": "icon_prd"}
 const STORAGE_DEFAULT_FILTERS := {"custom": "click to describe a change", "github": "labelled factory", "jira": "the factory's JQL",
-		"github_pr": "author:@me", "pr_review": "waiting for my review", "prd": "labelled prd"}
-const SOURCE_SHORT := {"custom": "Custom", "game": "Typed", "github": "GitHub", "jira": "Jira", "pr_review": "PR reviews", "prd": "PRDs", "github_pr": "Open PRs"}
+		"github_pr": "author:@me", "pr_review": "waiting for my review", "prd": "labelled prd", "notion": "click to paste page links"}
+const SOURCE_SHORT := {"custom": "Custom", "game": "Typed", "github": "GitHub", "jira": "Jira", "pr_review": "PR reviews", "prd": "PRDs", "github_pr": "Open PRs", "notion": "Notion"}
 const ROUTE_MARGIN := 5  # how far outside the machines a belt may wander
 const BRIDGE_COST := 4  # a belt bridges over another only when going round costs more
 
@@ -1552,6 +1552,12 @@ func machine_progress(id: String) -> float:
 	if not machines.has(id):
 		return 0.0
 	return float(machines[id]["progress"])
+
+
+func machine_state(id: String) -> String:
+	if not machines.has(id):
+		return ""
+	return str(machines[id].get("state", "idle"))
 
 
 func _redraw() -> void:

@@ -27,9 +27,9 @@ const C_GREEN := "5ABF66"
 const C_RED := "E5484D"
 const C_AMBER := "F2B84C"
 const SOURCE_TITLES := {"custom": "Changes you describe", "game": "Typed in the game", "github": "GitHub issues", "jira": "Jira issues",
-		"pr_review": "Pull requests to review", "prd": "PRDs", "github_pr": "Open PRs"}
+		"pr_review": "Pull requests to review", "prd": "PRDs", "github_pr": "Open PRs", "notion": "Notion pages"}
 const SOURCE_ICONS := {"custom": "icon_crate", "game": "icon_crate", "github": "icon_github", "jira": "icon_jira", "pr_review": "icon_pr",
-		"prd": "icon_prd", "github_pr": "icon_pr"}
+		"prd": "icon_prd", "github_pr": "icon_pr", "notion": "icon_prd"}
 const STATE_WORDS := {"queued": "at the intake", "waiting": "on the line", "running": "on the line",
 		"moving": "on the line", "awaiting_approval": "waiting for you", "held": "held at a machine for you", "shipped": "shipped",
 		"scrapped": "in the scrap bin"}
@@ -319,11 +319,17 @@ func _add_row(source: String, item: Dictionary, storage := "", can_close := fals
 		open.tooltip_text = "Log: show this crate's log"
 		open.pressed.connect(func() -> void: open_crate.emit(int(item_id)))
 		buttons.add_child(open)
-	elif bool(item.get("can_pull", false)):
+	if bool(item.get("can_pull", false)) and (item_id == null or (source == "github_pr" and \
+			str(item.get("item_state", "")) in ["shipped", "scrapped"])):
+		# Not taken yet, or its crate has finished (an open PR that shipped to the dock without
+		# merging): pull it in (again) as a new crate.
 		var take := Button.new()
 		take.icon = load("res://assets/ui/icon_pull_in.svg")
 		take.disabled = _pending.has(key)
-		take.tooltip_text = "Pulling in..." if _pending.has(key) else "Pull in: make it a crate on this line now"
+		var again := item_id != null
+		take.tooltip_text = "Pulling in..." if _pending.has(key) else (
+				"Pull in again: its last crate has finished; make a new crate for it on this line now" if again
+				else "Pull in: make it a crate on this line now")
 		take.pressed.connect(func() -> void:
 			_pending[key] = true
 			take.tooltip_text = "Pulling in..."

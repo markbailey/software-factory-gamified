@@ -41,17 +41,20 @@ const SOURCE_NAMES := {
 	"pr_review": "PRs waiting for my review",
 	"prd": "PRDs (GitHub issues labelled prd)",
 	"github_pr": "Open PRs (mine, or the ones a search finds)",
+	"notion": "Notion pages (PRDs)",
 }
 # What a storage can hold, and its filter (blank: the default in STORE_FILTERS' second item).
-const STORE_SOURCES := ["custom", "jira", "github", "github_pr", "pr_review", "prd"]
+const STORE_SOURCES := ["custom", "jira", "github", "github_pr", "pr_review", "prd", "notion"]
 const STORE_WORDS := {"custom": "Custom (changes you describe)", "jira": "Jira issues", "github": "GitHub issues", "github_pr": "Open PRs",
-		"pr_review": "PRs waiting for my review", "prd": "PRDs (GitHub issues labelled prd)"}
+		"pr_review": "PRs waiting for my review", "prd": "PRDs (GitHub issues labelled prd)", "notion": "Notion pages (PRDs)"}
 const STORE_FILTERS := {
 	"jira": ["JQL", "e.g. project = APP AND status = Backlog", "Blank: the JQL in factory.toml."],
 	"github": ["GitHub issue search", "e.g. is:open label:backlog", "Blank: open issues labelled factory."],
 	"github_pr": ["GitHub PR search", "e.g. author:app/dependabot", "Blank: author:@me (your own open PRs)."],
 	"pr_review": ["Extra search terms", "e.g. org:my-company -repo:owner/noisy", "Blank: every open PR waiting for your review."],
 	"prd": ["", "", "Issues labelled prd in the line's repo. No filter."],
+	"notion": ["Notion page or database links", "e.g. https://www.notion.so/acme/PRDs-0123... where Status = Ready",
+			"Each page (or each page of a database) becomes a crate. Share them with your Notion integration first."],
 	"custom": ["", "", "Click it while the factory runs and describe a change: it becomes a crate on the line it feeds."],
 }
 # Stations you can place from the list: "@intake" starts a new line there (just its intake);
@@ -80,6 +83,10 @@ const RULE_WORDS := {"": "No rule (not used)", "risk": "Risk is", "source": "Cam
 		"repo": "Repo is", "result": "Arrived as (passed / failed)",
 		"text": "Spec mentions", "files": "Changes files", "size": "Changes at least (lines)",
 		"otherwise": "Everything else"}
+# A machine's filter (any type that can be switched off): the sorter's rule kinds but
+# "everything else". "" takes the rule away.
+const FILTER_KINDS := ["", "risk", "source", "repo", "result", "text", "files", "size"]
+const MAX_FILTER_RULES := 6
 const RISK_CHOICES := ["low", "medium", "high", "medium+"]
 const RISK_WORDS := {"low": "Low", "medium": "Medium", "high": "High", "medium+": "Medium or high"}
 const SETTINGS_WIDTH := 360.0  # the left dock
@@ -188,14 +195,16 @@ var _timeout_label: Label
 var _retries_input: SpinBox
 var _retries_label: Label
 var _retries_hint: Label
-var _agent_box: VBoxContainer  # Claude model and effort, for machines that run Claude
+var _agent_box: VBoxContainer  # agent, model and effort, for machines that run an agent
+var _agent_picker: OptionButton
 var _model_picker: OptionButton
 var _effort_picker: OptionButton
+var _effort_label: Label
 var _agent_hint: Label
 # What the pickers list, and the factory-wide default under the gear (set_agent_settings).
 var agent_choices := {"models": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"],
-		"efforts": ["low", "medium", "high", "xhigh", "max"]}
-var agent_defaults := {"model": "", "effort": ""}
+		"efforts": ["low", "medium", "high", "xhigh", "max"], "agents": []}
+var agent_defaults := {"agent": "claude", "model": "", "effort": ""}
 var _steps_label: Label
 var _fail_label: Label
 var _auto_box: VBoxContainer
@@ -208,10 +217,12 @@ var _options_box: VBoxContainer  # the machine type's own tick boxes (machines.t
 var _option_rows: Array = []
 var _option_specs: Array = []
 var _rules_box: VBoxContainer  # a sorter's rule for each output
+var _filter_box: VBoxContainer  # which crates a pass-through machine works on (the rest pass)
 var _scrap_checks := {}  # kind -> CheckBox
 var _prompt_label: Label
 var _prompt_input: TextEdit
 var _prompt_note: Label  # in place of the prompt while the machine's settings don't use it
+var _step_list: Array = []  # the selected machine's steps, [{"name", "when"}] (see _refresh_steps)
 var _prompt_base := {}  # the selected machine's catalogue entry (its prompt_when and notes)
 var _belt_box: VBoxContainer
 var _belt_label: Label
@@ -541,6 +552,8 @@ func _build_settings_window() -> void:
 	_switch_box.tooltip_text = "Untick to switch this machine off: it stays on the floor but runs nothing, and crates go straight out of its green output (with a note in their log) until you tick it again."
 	_switch_box.toggled.connect(_on_switch_toggled)
 	_machine_box.add_child(_switch_box)
+	_filter_box = VBoxContainer.new()
+	_machine_box.add_child(_filter_box)
 	# Reviewers: let a good review of a low-risk change through without asking.
 	_auto_box = VBoxContainer.new()
 	_machine_box.add_child(_auto_box)
@@ -591,17 +604,22 @@ func _build_settings_window() -> void:
 	_machine_box.add_child(_retries_input)
 	_agent_box = VBoxContainer.new()
 	_machine_box.add_child(_agent_box)
-	_field_label(_agent_box, "Claude model")
+	_field_label(_agent_box, "Agent")
+	_agent_picker = OptionButton.new()
+	_agent_picker.clip_text = true
+	_agent_picker.item_selected.connect(func(i: int) -> void: _on_agent_picked("agent", _agent_picker, i))
+	_agent_box.add_child(_agent_picker)
+	_field_label(_agent_box, "Model")
 	_model_picker = OptionButton.new()
 	_model_picker.clip_text = true
 	_model_picker.item_selected.connect(func(i: int) -> void: _on_agent_picked("model", _model_picker, i))
 	_agent_box.add_child(_model_picker)
-	_field_label(_agent_box, "Effort level")
+	_effort_label = _field_label(_agent_box, "Effort level")
 	_effort_picker = OptionButton.new()
 	_effort_picker.clip_text = true
 	_effort_picker.item_selected.connect(func(i: int) -> void: _on_agent_picked("effort", _effort_picker, i))
 	_agent_box.add_child(_effort_picker)
-	_agent_hint = _hint(_agent_box, "Default follows the factory's choice under the gear (Factory settings, Claude). Higher effort thinks longer and costs more.")
+	_agent_hint = _hint(_agent_box, "Default follows the factory's choice under the gear (Factory settings, Agents). Claude Code, Gemini CLI, Antigravity CLI or GitHub Copilot CLI, each signed in on this computer. Higher effort thinks longer and costs more.")
 	_steps_label = _hint(_machine_box, "")
 	_prompt_label = _field_label(_machine_box, "Prompt for Claude")
 	_prompt_input = TextEdit.new()
@@ -1162,6 +1180,9 @@ func _refresh_ui() -> void:
 		_gate_box.button_pressed = FactoryFloor.gated(machine, base)
 		_switch_box.visible = bool(base.get("can_switch_off", false))
 		_switch_box.set_pressed_no_signal(machine.get("enabled", true) != false)
+		_filter_box.visible = bool(base.get("can_filter", false)) and machine.get("enabled", true) != false
+		if _filter_box.visible:
+			_fill_filter(machine)
 		var auto := str(machine.get("auto_approve", ""))
 		_auto_box.visible = bool(base.get("can_auto_approve", false)) and FactoryFloor.gated(machine, base)
 		_auto_picker.select(maxi(0, AUTO_APPROVE_LEVELS.find(auto)))
@@ -1172,13 +1193,10 @@ func _refresh_ui() -> void:
 		_retries_input.set_value_no_signal(float(int(machine.get("retries", 0) if machine.get("retries", 0) != null else 0)))
 		_agent_box.visible = bool(base.get("uses_agent", false))
 		if _agent_box.visible:
-			_fill_agent_picker(_model_picker, "model", machine)
-			_fill_agent_picker(_effort_picker, "effort", machine)
-		var steps: Array = base.get("steps", [])
-		var names := PackedStringArray()
-		for s in steps:
-			names.append(str(s))
-		_steps_label.text = ("Steps: " + ", ".join(names)) if not names.is_empty() else ""
+			_fill_agent_pickers(machine)
+		_step_list = base.get("step_list", [])
+		var opts = machine.get("options", {})
+		_refresh_steps(opts if opts is Dictionary else {})
 		var has_prompt := bool(base.get("has_prompt", false))
 		_prompt_base = base if has_prompt else {}
 		_prompt_label.text = str(base.get("prompt_label", "")) if not str(base.get("prompt_label", "")).is_empty() \
@@ -1434,9 +1452,9 @@ func _on_line_account_picked(service: String, index: int) -> void:
 		p["accounts"] = raw
 
 
-## The service a storage's account is on: Jira for Jira issues, none for Custom, else GitHub.
+## The service a storage's account is on: Jira for Jira issues, Notion for Notion pages, none for Custom, else GitHub.
 static func _store_service(source: String) -> String:
-	return "jira" if source == "jira" else ("" if source == "custom" else "github")
+	return source if source in ["jira", "notion"] else ("" if source == "custom" else "github")
 
 
 func _on_store_account_picked(index: int) -> void:
@@ -1576,8 +1594,8 @@ func _fill_storage(st: Dictionary) -> void:
 			into = str(p.get("name", p.get("id", "")))
 			var r: Dictionary = p.get("repo", {}) if p.get("repo") is Dictionary else {}
 			line_repo = str(r.get("github", ""))
-	var reads_repo := source in ["github", "github_pr", "prd", "jira", "custom"]
-	_store_repo_label.text = "Repo its crates are worked on" if source in ["jira", "custom"] \
+	var reads_repo := source in ["github", "github_pr", "prd", "jira", "custom", "notion"]
+	_store_repo_label.text = "Repo its crates are worked on" if source in ["jira", "custom", "notion"] \
 			else "GitHub repo it reads"
 	_store_repo_label.visible = reads_repo
 	_store_repo.visible = reads_repo
@@ -3431,23 +3449,63 @@ func _on_retries_changed(value: float) -> void:
 
 ## The factory-wide Claude default and the pickers' lists (snapshot or "agent_defaults" message).
 func set_agent_settings(defaults: Dictionary, choices: Dictionary = {}) -> void:
-	agent_defaults = {"model": str(defaults.get("model", "")), "effort": str(defaults.get("effort", ""))}
+	agent_defaults = {"agent": str(defaults.get("agent", "claude")), "model": str(defaults.get("model", "")),
+			"effort": str(defaults.get("effort", ""))}
 	if not choices.is_empty():
 		agent_choices = choices.duplicate(true)
 	if _agent_box != null and _agent_box.visible and not _machine(_sel_key).is_empty():
 		_loading = true
-		_fill_agent_picker(_model_picker, "model", _machine(_sel_key))
-		_fill_agent_picker(_effort_picker, "effort", _machine(_sel_key))
+		_fill_agent_pickers(_machine(_sel_key))
 		_loading = false
 
 
-## A machine's model or effort picker: Default (and what that is now), then each choice.
+## The agent a machine runs: its own pick, else the factory default.
+func _agent_of(machine: Dictionary) -> String:
+	var own := str(machine.get("agent", "")) if machine.get("agent") != null else ""
+	return own if not own.is_empty() else str(agent_defaults.get("agent", "claude"))
+
+
+## An agent's name and the models and efforts it offers (Claude's from the older lists).
+func _agent_info(id: String) -> Dictionary:
+	for a in agent_choices.get("agents", []):
+		if a is Dictionary and str(a.get("id", "")) == id:
+			return a
+	if id == "claude":
+		return {"id": "claude", "label": "Claude Code", "models": agent_choices.get("models", []),
+				"efforts": agent_choices.get("efforts", [])}
+	return {"id": id, "label": id.capitalize(), "models": [], "efforts": []}
+
+
+## A machine's agent, model and effort pickers. Effort is hidden for agents without one.
+func _fill_agent_pickers(machine: Dictionary) -> void:
+	_agent_picker.clear()
+	_agent_picker.add_item("Default (%s)" % str(_agent_info(str(agent_defaults.get("agent", "claude"))).get("label", "")))
+	_agent_picker.set_item_metadata(0, "")
+	_agent_picker.select(0)
+	var own := str(machine.get("agent", "")) if machine.get("agent") != null else ""
+	for a in agent_choices.get("agents", []):
+		if not a is Dictionary:
+			continue
+		_agent_picker.add_item(str(a.get("label", a.get("id", ""))))
+		_agent_picker.set_item_metadata(_agent_picker.item_count - 1, str(a.get("id", "")))
+		if str(a.get("id", "")) == own:
+			_agent_picker.select(_agent_picker.item_count - 1)
+	_fill_agent_picker(_model_picker, "model", machine)
+	_fill_agent_picker(_effort_picker, "effort", machine)
+	var has_effort: bool = not (_agent_info(_agent_of(machine)).get("efforts", []) as Array).is_empty()
+	_effort_label.visible = has_effort
+	_effort_picker.visible = has_effort
+
+
+## A machine's model or effort picker: Default (and what that is now), then each choice its agent has.
 func _fill_agent_picker(pick: OptionButton, field: String, machine: Dictionary) -> void:
 	pick.clear()
-	var fallback := str(agent_defaults.get(field, ""))
-	pick.add_item("Default (%s)" % (fallback if not fallback.is_empty() else "Claude Code's own"))
+	var agent := _agent_of(machine)
+	var info := _agent_info(agent)
+	var fallback := str(agent_defaults.get(field, "")) if agent == str(agent_defaults.get("agent", "claude")) else ""
+	pick.add_item("Default (%s)" % (fallback if not fallback.is_empty() else "%s's own" % str(info.get("label", agent))))
 	pick.set_item_metadata(0, "")
-	var values: Array = agent_choices.get("models" if field == "model" else "efforts", [])
+	var values: Array = info.get("models" if field == "model" else "efforts", [])
 	var current := str(machine.get(field, "")) if machine.get(field) != null else ""
 	if not current.is_empty() and not values.has(current):
 		values = values + [current]  # kept from an older list
@@ -3464,10 +3522,18 @@ func _on_agent_picked(field: String, pick: OptionButton, index: int) -> void:
 		return
 	var m := _machine(_sel_key)
 	var value := str(pick.get_item_metadata(index))
+	var agent_before := _agent_of(m)
 	if value.is_empty():
 		m.erase(field)
 	else:
 		m[field] = value
+	if field == "agent" and _agent_of(m) != agent_before:
+		# Another agent's models and efforts: start from its defaults.
+		m.erase("model")
+		m.erase("effort")
+		_loading = true
+		_fill_agent_pickers(m)
+		_loading = false
 
 
 func _on_prompt_changed() -> void:
@@ -3527,59 +3593,68 @@ func _fill_rules(machine: Dictionary) -> void:
 			pick.add_item(str(RULE_WORDS[k]))
 		pick.select(maxi(0, RULE_KINDS.find(kind)))
 		pick.item_selected.connect(func(index: int) -> void:
-			var value := ""
-			match str(RULE_KINDS[index]):
-				"risk":
-					value = "high"
-				"source":
-					value = "game"
-				"size":
-					value = "200"
-				"result":
-					value = "fail"
-				"repo":
-					var names := _known_repo_names()
-					value = str(names[0]) if not names.is_empty() else ""
-			_set_rule(port, str(RULE_KINDS[index]), value)
+			_set_rule(port, str(RULE_KINDS[index]), _rule_default(str(RULE_KINDS[index])))
 			_fill_rules.call_deferred(_machine(_sel_key)))
 		row.add_child(pick)
-		var value := str(rule.get("value", ""))
-		match kind:
-			"risk", "source":
-				var choices: Array = RISK_CHOICES if kind == "risk" else sources
-				var values := OptionButton.new()
-				values.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-				for i in choices.size():
-					var c := str(choices[i])
-					values.add_item(str(RISK_WORDS.get(c, c)) if kind == "risk" else str(SOURCE_NAMES.get(c, c)))
-					if c == value:
-						values.select(i)
-				values.item_selected.connect(func(index: int) -> void: _set_rule(port, kind, str(choices[index])))
-				_rules_box.add_child(values)
-			"repo":
-				_fill_repo_ticks(port, value)
-			"result":
-				_fill_result_rule(port, value)
-			"text", "files":
-				var edit := LineEdit.new()
-				edit.text = value
-				edit.placeholder_text = "words, separated by commas" if kind == "text" else "e.g. docs/, *.md, src/api/*"
-				edit.text_changed.connect(func(text: String) -> void: _set_rule(port, kind, text.strip_edges()))
-				_rules_box.add_child(edit)
-			"size":
-				var lines := SpinBox.new()
-				lines.min_value = 1
-				lines.max_value = 100000
-				lines.step = 10
-				lines.value = float(value) if value.is_valid_int() else 200.0
-				lines.value_changed.connect(func(n: float) -> void: _set_rule(port, kind, str(int(n))))
-				_rules_box.add_child(lines)
+		_rule_value_editor(_rules_box, kind, str(rule.get("value", "")),
+				func(v: String) -> void: _set_rule(port, kind, v))
 	_fit_settings_window.call_deferred()
+
+
+## The value half of a sorter or filter rule, added to parent; save gets each new value.
+func _rule_value_editor(parent: Control, kind: String, value: String, save: Callable) -> void:
+	match kind:
+		"risk", "source":
+			var choices: Array = RISK_CHOICES if kind == "risk" else sources
+			var values := OptionButton.new()
+			values.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			for i in choices.size():
+				var c := str(choices[i])
+				values.add_item(str(RISK_WORDS.get(c, c)) if kind == "risk" else str(SOURCE_NAMES.get(c, c)))
+				if c == value:
+					values.select(i)
+			values.item_selected.connect(func(index: int) -> void: save.call(str(choices[index])))
+			parent.add_child(values)
+		"repo":
+			_fill_repo_ticks(parent, value, save)
+		"result":
+			_fill_result_rule(parent, value, save)
+		"text", "files":
+			var edit := LineEdit.new()
+			edit.text = value
+			edit.placeholder_text = "words, separated by commas" if kind == "text" else "e.g. docs/, *.md, src/api/*"
+			edit.text_changed.connect(func(text: String) -> void: save.call(text.strip_edges()))
+			parent.add_child(edit)
+		"size":
+			var lines := SpinBox.new()
+			lines.min_value = 1
+			lines.max_value = 100000
+			lines.step = 10
+			lines.value = float(value) if value.is_valid_int() else 200.0
+			lines.value_changed.connect(func(n: float) -> void: save.call(str(int(n))))
+			parent.add_child(lines)
+
+
+## The value a new rule of this kind starts with.
+func _rule_default(kind: String) -> String:
+	match kind:
+		"risk":
+			return "high"
+		"source":
+			return "game"
+		"size":
+			return "200"
+		"result":
+			return "fail"
+		"repo":
+			var names := _known_repo_names()
+			return str(names[0]) if not names.is_empty() else ""
+	return ""
 
 
 ## A sorter's "Arrived as" rule: passed (it came off a green belt) or failed (a red belt), and
 ## for failed, optionally which machines it failed at. Saved as "pass", "fail" or "fail:Tester, Coder".
-func _fill_result_rule(port: String, value: String) -> void:
+func _fill_result_rule(parent: Control, value: String, save_value: Callable) -> void:
 	var parts := value.split(":", true, 1)
 	var failed := parts[0].strip_edges() == "fail"
 	var at := parts[1].strip_edges() if parts.size() > 1 else ""
@@ -3588,17 +3663,17 @@ func _fill_result_rule(port: String, value: String) -> void:
 	pick.add_item("Passed (green belt)")
 	pick.add_item("Failed (red belt)")
 	pick.select(1 if failed else 0)
-	_rules_box.add_child(pick)
+	parent.add_child(pick)
 	var edit := LineEdit.new()
 	edit.text = at
 	edit.placeholder_text = "failed at (optional): e.g. Tester, Reviewer"
 	edit.visible = failed
-	_rules_box.add_child(edit)
+	parent.add_child(edit)
 	var save := func() -> void:
 		var v := "fail" if pick.selected == 1 else "pass"
 		if pick.selected == 1 and not edit.text.strip_edges().is_empty():
 			v += ":" + edit.text.strip_edges()
-		_set_rule(port, "result", v)
+		save_value.call(v)
 	pick.item_selected.connect(func(index: int) -> void:
 		edit.visible = index == 1
 		save.call()
@@ -3608,7 +3683,7 @@ func _fill_result_rule(port: String, value: String) -> void:
 
 ## A sorter's "Repo is" rule: a tick box for each repo on the factory's list (any ticked one
 ## matches). Repos the rule names that aren't on the list any more still show, ticked.
-func _fill_repo_ticks(port: String, value: String) -> void:
+func _fill_repo_ticks(parent: Control, value: String, save_value: Callable) -> void:
 	var ticked: Array = []
 	for w in value.split(","):
 		if not w.strip_edges().is_empty():
@@ -3618,10 +3693,10 @@ func _fill_repo_ticks(port: String, value: String) -> void:
 		if not names.any(func(n) -> bool: return github_name(str(n)) == github_name(str(t))):
 			names.append(t)
 	if names.is_empty():
-		_hint(_rules_box, "No repos yet: add them under the gear (Factory settings, Repos).")
+		_hint(parent, "No repos yet: add them under the gear (Factory settings, Repos).")
 		return
 	var box := VBoxContainer.new()
-	_rules_box.add_child(box)
+	parent.add_child(box)
 	for repo_name in names:
 		var tick := CheckBox.new()
 		tick.text = str(repo_name)
@@ -3631,7 +3706,7 @@ func _fill_repo_ticks(port: String, value: String) -> void:
 			for child in box.get_children():
 				if child is CheckBox and child.button_pressed:
 					chosen.append(child.text)
-			_set_rule(port, "repo", ", ".join(chosen)))
+			save_value.call(", ".join(chosen)))
 		box.add_child(tick)
 
 
@@ -3645,6 +3720,78 @@ func _set_rule(port: String, kind: String, value: String) -> void:
 		rules.append({"port": port, "when": kind, "value": value})
 	rules.sort_custom(func(a, b) -> bool: return str(a["port"]) < str(b["port"]))
 	m["rules"] = rules
+
+
+## A pass-through machine's filter: the crates it works on. The rest go straight out of its
+## green output with a note in their log. No rules: it works on every crate.
+func _fill_filter(machine: Dictionary) -> void:
+	for child in _filter_box.get_children():
+		child.queue_free()
+	var f = machine.get("filter", {})
+	var rules: Array = (f.get("rules", []) as Array) if f is Dictionary and f.get("rules") is Array else []
+	_field_label(_filter_box, "Only work on crates that match")
+	if rules.is_empty():
+		_hint(_filter_box, "No filter: it works on every crate. Add a rule to work only on some; the rest pass straight through its green output.")
+	else:
+		_hint(_filter_box, "Crates that don't match pass straight through its green output, with a note in their log.")
+	if rules.size() > 1:
+		var every := OptionButton.new()
+		every.add_item("Any of these rules")
+		every.add_item("All of these rules")
+		every.select(1 if str(f.get("match", "any")) == "all" else 0)
+		every.item_selected.connect(func(index: int) -> void: _set_filter_match("all" if index == 1 else "any"))
+		_filter_box.add_child(every)
+	for i in rules.size():
+		var rule: Dictionary = rules[i] if rules[i] is Dictionary else {}
+		var kind := str(rule.get("when", ""))
+		var pick := OptionButton.new()
+		pick.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		for k in FILTER_KINDS:
+			pick.add_item("Remove this rule" if k == "" else str(RULE_WORDS[k]))
+		pick.select(maxi(0, FILTER_KINDS.find(kind)))
+		pick.item_selected.connect(func(index: int) -> void:
+			var k := str(FILTER_KINDS[index])
+			_set_filter_rule(i, k, _rule_default(k))
+			_fill_filter.call_deferred(_machine(_sel_key)))
+		_filter_box.add_child(pick)
+		_rule_value_editor(_filter_box, kind, str(rule.get("value", "")),
+				func(v: String) -> void: _set_filter_rule(i, kind, v))
+	if rules.size() < MAX_FILTER_RULES:
+		var add := _button(_filter_box, "Add a filter rule", func() -> void:
+			_set_filter_rule(rules.size(), "text", "")
+			_fill_filter.call_deferred(_machine(_sel_key)), "icon_add")
+		add.theme_type_variation = &"ButtonGhost"
+	_fit_settings_window.call_deferred()
+
+
+## Set rule i of the selected machine's filter (kind "" takes it away; i past the end adds one).
+func _set_filter_rule(i: int, kind: String, value: String) -> void:
+	if _loading or _sel_key.is_empty():
+		return
+	var m := _machine(_sel_key)
+	var f: Dictionary = m.get("filter", {}) if m.get("filter") is Dictionary else {}
+	var rules: Array = (f.get("rules", []) as Array).duplicate() if f.get("rules") is Array else []
+	if kind.is_empty():
+		if i < rules.size():
+			rules.remove_at(i)
+	elif i < rules.size():
+		rules[i] = {"when": kind, "value": value}
+	else:
+		rules.append({"when": kind, "value": value})
+	if rules.is_empty():
+		m.erase("filter")
+	else:
+		f["rules"] = rules
+		f["match"] = str(f.get("match", "any"))
+		m["filter"] = f
+
+
+func _set_filter_match(match_how: String) -> void:
+	if _loading or _sel_key.is_empty():
+		return
+	var m := _machine(_sel_key)
+	if m.get("filter") is Dictionary:
+		m["filter"]["match"] = match_how
 
 
 func _fill_options(machine: Dictionary, base: Dictionary) -> void:
@@ -3681,6 +3828,46 @@ func _refresh_option_rows(values: Dictionary) -> void:
 			if is_instance_valid(node):
 				node.visible = shown
 	_refresh_prompt(values)
+	_refresh_steps(values)
+
+
+## "Steps: ..." under the description, less those the settings turn off (a Coder in TDD mode
+## doesn't list "Write code"). Mirrors config.step_on_for: only terms naming a setting count.
+func _refresh_steps(values: Dictionary) -> void:
+	var names := PackedStringArray()
+	for step in _step_list:
+		if _step_on(str(step.get("when", "")), values):
+			names.append(str(step.get("name", "")))
+	_steps_label.text = ("Steps: " + ", ".join(names)) if not names.is_empty() else ""
+
+
+func _step_on(when: String, values: Dictionary) -> bool:
+	for raw in when.split(","):
+		var term := raw.strip_edges()
+		if term.is_empty():
+			continue
+		var negate := term.begins_with("!")
+		var key := term.lstrip("!")
+		var wanted := ""
+		var has_wanted := key.contains("=")
+		if has_wanted:
+			wanted = key.get_slice("=", 1)
+			key = key.get_slice("=", 0).strip_edges()
+		var spec := {}
+		for s in _option_specs:
+			if str(s.get("id", "")) == key:
+				spec = s
+		if spec.is_empty():
+			continue
+		var current = values.get(key, spec.get("default", ""))
+		var on: bool
+		if has_wanted:
+			on = str(current).strip_edges() in Array(wanted.split("|")).map(func(w): return str(w).strip_edges())
+		else:
+			on = bool(current)
+		if on == negate:
+			return false
+	return true
 
 
 ## A prompt only some settings use (prompt_when, e.g. the Document writer's "Document to
